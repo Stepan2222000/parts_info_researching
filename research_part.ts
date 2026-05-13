@@ -12,21 +12,12 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const tools = ["web_search_exa"].join(",");
 const exaUrl = new URL(`https://mcp.exa.ai/mcp?tools=${tools}`);
 
-const exaClient = new Client({
-  name: "part-research-agent",
-  version: "1.0.0",
-});
-
-const exaTransport = new StreamableHTTPClientTransport(exaUrl, {
-  requestInit: {
-    headers: {
-      "x-api-key": EXA_API_KEY,
-    },
-  },
-});
-
 function buildExaQuery(partNumber: string) {
   return `Найди всю доступную информацию по артикулу ${partNumber}: точное название детали, бренд производитель OEM (ни в коем случае не aftermarket), старые номера old part number, новые номера new part number, superseded by, replaces, replacement, cross reference, interchange, применяемость fitment application к моделям годам двигателям, состав комплекта kit contents если это набор, вес weight, схемы exploded diagram parts catalog, официальные каталоги, магазины, PDF, объявления; важно найти источники где артикул ${partNumber} встречается явно в тексте страницы`;
+}
+
+function buildLowConfidenceQuery(partNumber: string, articles: string[]) {
+  return `Проверь, являются ли артикулы ${articles.join(", ")} OEM кросс-номерами, superseded by, replaces, replacement, cross reference или interchange для исходного артикула ${partNumber}. Нужны только OEM связи, aftermarket не нужен. Важно найти источники, где одновременно явно встречаются ${partNumber} и проверяемые артикулы, либо где прямо написана связь между ними. По каждому проверяемому артикулу найди доказательство, что это тот же OEM товар, или доказательство, что связь не подтверждена / это другой товар.`;
 }
 
 function buildCodexPrompt(params: {
@@ -147,6 +138,41 @@ function buildCodexPrompt(params: {
 `.trim();
 }
 
+function buildLowConfidencePrompt(params: {
+  partNumber: string;
+  outputJsonPath: string;
+  lowConfidenceExaJsonPath: string;
+  articles: string[];
+}) {
+  return `
+Продолжи работу с уже созданным JSON по OEM-запчасти.
+
+Входной артикул задачи: ${params.partNumber}
+Текущий структурированный JSON: ${params.outputJsonPath}
+Файл с дополнительным Exa research по сомнительным артикулам: ${params.lowConfidenceExaJsonPath}
+Проверяемые article_low_confidence: ${params.articles.join(", ")}
+
+Задача:
+- Прочитай текущий структурированный JSON.
+- Прочитай дополнительный Exa JSON.
+- Обнови тот же файл: ${params.outputJsonPath}
+
+Правила обновления:
+- Используй только текущий JSON и дополнительный Exa JSON. В интернет не ходи. Никаких fetch, web search, MCP, браузера.
+- Если дополнительный Exa research явно подтвердил OEM-связь проверяемого артикула с ${params.partNumber}, перенеси его из numbers.article_low_confidence в numbers.article.
+- Если дополнительный Exa research не подтвердил связь, оставь артикул в numbers.article_low_confidence и обнови evidence / why_low_confidence.
+- Если дополнительный Exa research доказал, что артикул не относится к искомой OEM-детали или является aftermarket/другим товаром, перенеси его в numbers.irrelevant.
+- Один и тот же артикул не должен одновременно находиться в нескольких массивах.
+- Если в дополнительном Exa research найден новый OEM-артикул с явной связью superseded/replaces/interchange/cross reference, добавь его в numbers.article. Если связь слабая, добавь в numbers.article_low_confidence.
+- numbers.article отсортируй так: сначала самые новые/актуальные OEM-артикулы, потом более старые.
+- Не добавляй верхнее поле sources.
+- Не добавляй поле aftermarket.
+- Не добавляй type/confidence у артикулов.
+- Итоговый JSON должен остаться на русском языке и соответствовать той же схеме.
+- Запиши обновленный JSON в тот же файл: ${params.outputJsonPath}
+`.trim();
+}
+
 function assertObject(value: unknown, name: string): asserts value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error(`${name} must be an object`);
@@ -171,7 +197,7 @@ function assertRequiredKeys(
   }
 }
 
-function assertString(value: unknown, name: string) {
+function assertString(value: unknown, name: string): asserts value is string {
   if (typeof value !== "string" || value.trim() === "") {
     throw new Error(`${name} must be a non-empty string`);
   }
@@ -309,6 +335,19 @@ function validateStructuredResult(value: unknown) {
 }
 
 async function callExaSearch(query: string) {
+  const exaClient = new Client({
+    name: "part-research-agent",
+    version: "1.0.0",
+  });
+
+  const exaTransport = new StreamableHTTPClientTransport(exaUrl, {
+    requestInit: {
+      headers: {
+        "x-api-key": EXA_API_KEY,
+      },
+    },
+  });
+
   await exaClient.connect(exaTransport);
   try {
     return await exaClient.callTool({
@@ -323,6 +362,20 @@ async function callExaSearch(query: string) {
   }
 }
 
+function getLowConfidenceArticles(value: unknown): string[] {
+  validateStructuredResult(value);
+  assertObject(value, "codex result");
+  assertObject(value.numbers, "numbers");
+  assertArray(value.numbers.article_low_confidence, "numbers.article_low_confidence");
+
+  return value.numbers.article_low_confidence.map((item, index) => {
+    assertObject(item, `numbers.article_low_confidence[${index}]`);
+    const article = item.article;
+    assertString(article, `numbers.article_low_confidence[${index}].article`);
+    return article;
+  });
+}
+
 async function main() {
   if (!EXA_API_KEY) {
     throw new Error("EXA_API_KEY is empty");
@@ -331,6 +384,7 @@ async function main() {
   const exaDir = resolve(SCRIPT_DIR, "exa_results");
   const codexDir = resolve(SCRIPT_DIR, "codex_results");
   const exaJsonPath = resolve(exaDir, `${PART_NUMBER}.json`);
+  const lowConfidenceExaJsonPath = resolve(exaDir, `${PART_NUMBER}_low_confidence_check.json`);
   const outputJsonPath = resolve(codexDir, `${PART_NUMBER}.json`);
 
   await mkdir(exaDir, { recursive: true });
@@ -377,8 +431,49 @@ async function main() {
   const structuredResult = JSON.parse(structuredText) as unknown;
   validateStructuredResult(structuredResult);
 
+  const lowConfidenceArticles = getLowConfidenceArticles(structuredResult);
+
+  if (lowConfidenceArticles.length > 0) {
+    const lowConfidenceQuery = buildLowConfidenceQuery(PART_NUMBER, lowConfidenceArticles);
+    const lowConfidenceExaResult = await callExaSearch(lowConfidenceQuery);
+
+    await writeFile(
+      lowConfidenceExaJsonPath,
+      JSON.stringify(
+        {
+          task_part_number: PART_NUMBER,
+          tool: "web_search_exa",
+          num_results: NUM_RESULTS,
+          query: lowConfidenceQuery,
+          checked_articles: lowConfidenceArticles,
+          raw_exa_result: lowConfidenceExaResult,
+        },
+        null,
+        2,
+      ),
+    );
+
+    await thread.run(
+      buildLowConfidencePrompt({
+        partNumber: PART_NUMBER,
+        outputJsonPath,
+        lowConfidenceExaJsonPath,
+        articles: lowConfidenceArticles,
+      }),
+    );
+
+    const updatedStructuredText = await readFile(outputJsonPath, "utf8");
+    const updatedStructuredResult = JSON.parse(updatedStructuredText) as unknown;
+    validateStructuredResult(updatedStructuredResult);
+  }
+
   console.log(`PART_NUMBER: ${PART_NUMBER}`);
   console.log(`Exa raw saved: ${exaJsonPath}`);
+  if (lowConfidenceArticles.length > 0) {
+    console.log(`Low confidence Exa raw saved: ${lowConfidenceExaJsonPath}`);
+  } else {
+    console.log("No low confidence articles to verify.");
+  }
   console.log(`Codex JSON saved: ${outputJsonPath}`);
 }
 
