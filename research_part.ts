@@ -22,16 +22,6 @@ function buildExaQuery(partNumber: string) {
 Только OEM. Aftermarket-артикулы не нужны, но если aftermarket-страница явно пишет OEM replacement number "${partNumber}" или другой OEM-номер, можно использовать только OEM-номер.`;
 }
 
-function buildKitContentsExaQuery(partNumber: string) {
-  return `Найди состав набора / kit contents только для точного артикула "${partNumber}".
-
-Жесткое условие: в каждом полезном источнике строка "${partNumber}" должна явно встречаться в тексте страницы, title, highlights или description.
-
-Нужны источники, где прямо написано, что "${partNumber}" является kit, set, комплект, набор, sealing ring kit, repair kit, tune-up kit, anode kit или похожим набором, и перечислен состав: номера компонентов, названия компонентов, quantity, contains, includes, kit content.
-
-Только OEM-состав. Aftermarket/compatible/replacement наборы можно использовать только как подсказку, но их внутренние SKU не считать OEM-компонентами.`;
-}
-
 function buildLowConfidenceQuery(partNumber: string, articles: string[]) {
   return `Проверь, являются ли артикулы ${articles.join(", ")} OEM кросс-номерами, superseded by, replaces, replacement, cross reference или interchange для исходного артикула ${partNumber}. Нужны только OEM связи, aftermarket не нужен. Важно найти источники, где одновременно явно встречаются ${partNumber} и проверяемые артикулы, либо где прямо написана связь между ними. По каждому проверяемому артикулу найди доказательство, что это тот же OEM товар, или доказательство, что связь не подтверждена / это другой товар.`;
 }
@@ -48,8 +38,6 @@ function buildCodexPrompt(params: {
 Входной артикул задачи: ${params.partNumber}
 Файл с сохраненным сырым ответом Exa: ${params.exaJsonPath}
 Файл, который ты обязан создать: ${params.outputJsonPath}
-
-Файл Exa JSON содержит основной поиск и отдельный поиск по составу набора. Используй оба блока.
 
 Жесткие правила:
 ${params.codexRules}
@@ -414,9 +402,7 @@ async function main() {
   const codexRules = await readFile(codexRulesPath, "utf8");
 
   const query = buildExaQuery(PART_NUMBER);
-  const kitContentsQuery = buildKitContentsExaQuery(PART_NUMBER);
   const exaResult = await callExaSearch(query);
-  const kitContentsExaResult = await callExaSearch(kitContentsQuery);
 
   await writeFile(
     exaJsonPath,
@@ -426,16 +412,13 @@ async function main() {
         tool: "web_search_exa",
         num_results: NUM_RESULTS,
         query,
-        kit_contents_query: kitContentsQuery,
         raw_exa_result: exaResult,
-        raw_kit_contents_exa_result: kitContentsExaResult,
       },
       null,
       2,
     ),
   );
   assertExaResultHasExactPartNumber(exaResult, PART_NUMBER, exaJsonPath);
-  assertExaResultHasExactPartNumber(kitContentsExaResult, PART_NUMBER, exaJsonPath);
 
   const prompt = buildCodexPrompt({
     partNumber: PART_NUMBER,
