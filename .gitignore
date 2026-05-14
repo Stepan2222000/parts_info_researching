@@ -1,5 +1,6 @@
 node_modules/
 .env
+.txt
 
 exa_results/
 codex_results/

@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const PART_NUMBER = process.argv[2] ?? "24061426";
+const PART_NUMBER = process.argv[2] ?? "76868A04";
 const NUM_RESULTS = 10;
 const EXA_API_KEY = process.env.EXA_API_KEY ?? "";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -24,6 +24,10 @@ function buildExaQuery(partNumber: string) {
 
 function buildLowConfidenceQuery(partNumber: string, articles: string[]) {
   return `Проверь, являются ли артикулы ${articles.join(", ")} OEM кросс-номерами, superseded by, replaces, replacement, cross reference или interchange для исходного артикула ${partNumber}. Нужны только OEM связи, aftermarket не нужен. Важно найти источники, где одновременно явно встречаются ${partNumber} и проверяемые артикулы, либо где прямо написана связь между ними. По каждому проверяемому артикулу найди доказательство, что это тот же OEM товар, или доказательство, что связь не подтверждена / это другой товар.`;
+}
+
+function buildKitContentsQuery(partNumber: string, articles: string[]) {
+  return `Найди точный состав OEM набора по исходному артикулу "${partNumber}" и подтвержденным OEM-номерам этого же набора в порядке актуальности: ${articles.join(", ")}. Ищи kit contents, includes, components, component part numbers, quantity, contents list, parts included, exploded diagram, parts catalog, PDF. Жесткое условие: в каждом полезном источнике должен явно встречаться хотя бы один из этих OEM-номеров набора: ${articles.join(", ")}. Нужны артикулы компонентов, названия компонентов, количество каждого компонента и источник, который подтверждает, что компонент входит именно в этот OEM-набор. Aftermarket не нужен.`;
 }
 
 function buildCodexPrompt(params: {
@@ -50,6 +54,7 @@ ${params.codexRules}
   "description": null,
   "weight": null,
   "models": null,
+  "is_kit": false,
   "kit_contents": {},
   "part_of_kits": [],
   "numbers": {
@@ -101,7 +106,7 @@ ${params.codexRules}
 Формат kit_contents:
 {
   "123456": {
-    "article": "123456",
+    "article": "123456 или null",
     "name": "Название компонента",
     "quantity": 1,
     "description": "Что это за запчасть",
@@ -120,14 +125,52 @@ ${params.codexRules}
   }
 ]
 
+Поле is_kit:
+- true, если входной артикул сам является набором/комплектом.
+- false, если входной артикул одиночная деталь или только входит в чужой набор.
+- Если is_kit = false, kit_contents должен быть пустым объектом.
+
 Перед записью проверь:
 - JSON валидный.
 - Обязательные верхние ключи есть по схеме.
 - Нет поля aftermarket.
 - Нет type/confidence у артикулов.
 - task_part_number равен "${params.partNumber}".
+- numbers.article содержит task_part_number "${params.partNumber}" с источником и evidence.
 
 Запиши итоговый JSON в файл: ${params.outputJsonPath}
+`.trim();
+}
+
+function buildKitContentsPrompt(params: {
+  partNumber: string;
+  outputJsonPath: string;
+  kitContentsExaJsonPath: string;
+  codexRules: string;
+}) {
+  return `
+Продолжи работу с уже созданным JSON по OEM-набору.
+
+Входной артикул задачи: ${params.partNumber}
+Текущий структурированный JSON: ${params.outputJsonPath}
+Файл с дополнительным Exa research по составу набора: ${params.kitContentsExaJsonPath}
+
+Задача:
+- Прочитай текущий структурированный JSON.
+- Прочитай дополнительный Exa JSON по составу набора.
+- Обнови kit_contents в том же файле: ${params.outputJsonPath}
+
+Правила обновления:
+${params.codexRules}
+- Это дополнительный проход только по составу набора. Не добавляй компоненты набора в numbers.article.
+- Если найден артикул компонента, используй его ключом kit_contents. Если артикул компонента неизвестен, используй unknown_1, unknown_2 и ставь article: null.
+- По каждому компоненту заполни article, name, quantity, description, source_url, evidence.
+- Никогда не ставь пустую строку "" в article компонента.
+- Если количество не найдено, quantity = null.
+- Если дополнительный Exa research не дал нового состава, оставь kit_contents как есть.
+- is_kit должен остаться true.
+- Не делай новых запросов.
+- Запиши обновленный JSON в тот же файл: ${params.outputJsonPath}
 `.trim();
 }
 
@@ -193,6 +236,10 @@ function samePartNumber(left: string, right: string) {
   return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
+function findMatchingPartNumber(value: string, partNumbers: string[]) {
+  return partNumbers.find((partNumber) => samePartNumber(value, partNumber)) ?? null;
+}
+
 function validateArticleArray(
   value: unknown[],
   name: "numbers.article" | "numbers.article_low_confidence" | "numbers.irrelevant",
@@ -215,11 +262,14 @@ function validateArticleArray(
   }
 }
 
-function validateKitContents(value: Record<string, unknown>) {
+function validateKitContents(value: Record<string, unknown>, ownPartNumbers: string[]) {
   for (const [key, item] of Object.entries(value)) {
     const itemName = `kit_contents.${key}`;
-    if (samePartNumber(key, PART_NUMBER)) {
-      throw new Error(`${itemName} must not use task_part_number as its own kit component`);
+    const matchingKeyArticle = findMatchingPartNumber(key, ownPartNumbers);
+    if (matchingKeyArticle !== null) {
+      throw new Error(
+        `${itemName} must not use own part article ${matchingKeyArticle} as a kit component`,
+      );
     }
     assertObject(item, itemName);
     assertRequiredKeys(
@@ -230,8 +280,11 @@ function validateKitContents(value: Record<string, unknown>) {
 
     if (item.article !== null) {
       assertString(item.article, `${itemName}.article`);
-      if (samePartNumber(item.article, PART_NUMBER)) {
-        throw new Error(`${itemName}.article must not equal task_part_number`);
+      const matchingItemArticle = findMatchingPartNumber(item.article, ownPartNumbers);
+      if (matchingItemArticle !== null) {
+        throw new Error(
+          `${itemName}.article must not equal own part article ${matchingItemArticle}`,
+        );
       }
     }
     if (item.name !== null) {
@@ -273,6 +326,7 @@ function validateStructuredResult(value: unknown) {
     "description",
     "weight",
     "models",
+    "is_kit",
     "kit_contents",
     "part_of_kits",
     "numbers",
@@ -289,7 +343,15 @@ function validateStructuredResult(value: unknown) {
   assertObject(value.kit_contents, "kit_contents");
   assertArray(value.part_of_kits, "part_of_kits");
   assertObject(value.numbers, "numbers");
-  validateKitContents(value.kit_contents);
+
+  if (typeof value.is_kit !== "boolean") {
+    throw new Error("is_kit must be a boolean");
+  }
+
+  if (value.is_kit === false && Object.keys(value.kit_contents).length > 0) {
+    throw new Error("kit_contents must be empty when is_kit is false");
+  }
+
   validatePartOfKits(value.part_of_kits);
 
   if (value.models !== null) {
@@ -330,6 +392,21 @@ function validateStructuredResult(value: unknown) {
   validateArticleArray(numbers.article, "numbers.article");
   validateArticleArray(numbers.article_low_confidence, "numbers.article_low_confidence");
   validateArticleArray(numbers.irrelevant, "numbers.irrelevant");
+
+  const ownPartNumbers = numbers.article.map((item, index) => {
+    assertObject(item, `numbers.article[${index}]`);
+    const article = item.article;
+    assertString(article, `numbers.article[${index}].article`);
+    return article;
+  });
+
+  const hasTaskPartNumber = ownPartNumbers.some((article) => samePartNumber(article, PART_NUMBER));
+
+  if (!hasTaskPartNumber) {
+    throw new Error(`numbers.article must include task_part_number ${PART_NUMBER}`);
+  }
+
+  validateKitContents(value.kit_contents, ownPartNumbers);
 }
 
 async function callExaSearch(query: string) {
@@ -385,6 +462,30 @@ function getLowConfidenceArticles(value: unknown): string[] {
   return [...new Set(articles)];
 }
 
+function getIsKit(value: unknown): boolean {
+  validateStructuredResult(value);
+  assertObject(value, "codex result");
+  const isKit = value.is_kit;
+  if (typeof isKit !== "boolean") {
+    throw new Error("is_kit must be a boolean");
+  }
+  return isKit;
+}
+
+function getConfirmedArticles(value: unknown): string[] {
+  validateStructuredResult(value);
+  assertObject(value, "codex result");
+  assertObject(value.numbers, "numbers");
+  assertArray(value.numbers.article, "numbers.article");
+
+  return value.numbers.article.map((item, index) => {
+    assertObject(item, `numbers.article[${index}]`);
+    const article = item.article;
+    assertString(article, `numbers.article[${index}].article`);
+    return article;
+  });
+}
+
 async function main() {
   if (!EXA_API_KEY) {
     throw new Error("EXA_API_KEY is empty");
@@ -395,6 +496,7 @@ async function main() {
   const codexRulesPath = resolve(SCRIPT_DIR, "codex_rules.md");
   const exaJsonPath = resolve(exaDir, `${PART_NUMBER}.json`);
   const lowConfidenceExaJsonPath = resolve(exaDir, `${PART_NUMBER}_low_confidence_check.json`);
+  const kitContentsExaJsonPath = resolve(exaDir, `${PART_NUMBER}_kit_contents_check.json`);
   const outputJsonPath = resolve(codexDir, `${PART_NUMBER}.json`);
 
   await mkdir(exaDir, { recursive: true });
@@ -441,7 +543,7 @@ async function main() {
   await thread.run(prompt);
 
   const structuredText = await readFile(outputJsonPath, "utf8");
-  const structuredResult = JSON.parse(structuredText) as unknown;
+  let structuredResult = JSON.parse(structuredText) as unknown;
   validateStructuredResult(structuredResult);
 
   const lowConfidenceArticles = getLowConfidenceArticles(structuredResult);
@@ -477,8 +579,45 @@ async function main() {
     );
 
     const updatedStructuredText = await readFile(outputJsonPath, "utf8");
-    const updatedStructuredResult = JSON.parse(updatedStructuredText) as unknown;
-    validateStructuredResult(updatedStructuredResult);
+    structuredResult = JSON.parse(updatedStructuredText) as unknown;
+    validateStructuredResult(structuredResult);
+  }
+
+  const isKit = getIsKit(structuredResult);
+
+  if (isKit) {
+    const confirmedArticles = getConfirmedArticles(structuredResult);
+    const kitContentsQuery = buildKitContentsQuery(PART_NUMBER, confirmedArticles);
+    const kitContentsExaResult = await callExaSearch(kitContentsQuery);
+
+    await writeFile(
+      kitContentsExaJsonPath,
+      JSON.stringify(
+        {
+          task_part_number: PART_NUMBER,
+          tool: "web_search_exa",
+          num_results: NUM_RESULTS,
+          query: kitContentsQuery,
+          raw_exa_result: kitContentsExaResult,
+        },
+        null,
+        2,
+      ),
+    );
+    assertExaResultHasExactPartNumber(kitContentsExaResult, PART_NUMBER, kitContentsExaJsonPath);
+
+    await thread.run(
+      buildKitContentsPrompt({
+        partNumber: PART_NUMBER,
+        outputJsonPath,
+        kitContentsExaJsonPath,
+        codexRules,
+      }),
+    );
+
+    const updatedStructuredText = await readFile(outputJsonPath, "utf8");
+    structuredResult = JSON.parse(updatedStructuredText) as unknown;
+    validateStructuredResult(structuredResult);
   }
 
   console.log(`PART_NUMBER: ${PART_NUMBER}`);
@@ -487,6 +626,11 @@ async function main() {
     console.log(`Low confidence Exa raw saved: ${lowConfidenceExaJsonPath}`);
   } else {
     console.log("No low confidence articles to verify.");
+  }
+  if (isKit) {
+    console.log(`Kit contents Exa raw saved: ${kitContentsExaJsonPath}`);
+  } else {
+    console.log("Part is not a kit; no kit contents research.");
   }
   console.log(`Codex JSON saved: ${outputJsonPath}`);
 }
