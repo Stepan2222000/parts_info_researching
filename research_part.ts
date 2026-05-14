@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const PART_NUMBER = process.argv[2] ?? "898253T23";
+const PART_NUMBER = process.argv[2] ?? "24061426";
 const NUM_RESULTS = 10;
 const EXA_API_KEY = process.env.EXA_API_KEY ?? "";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
