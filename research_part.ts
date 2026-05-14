@@ -30,6 +30,7 @@ function buildCodexPrompt(params: {
   partNumber: string;
   exaJsonPath: string;
   outputJsonPath: string;
+  codexRules: string;
 }) {
   return `
 Ты отдельный Codex-агент для структурирования результата поиска по OEM-запчасти.
@@ -39,23 +40,7 @@ function buildCodexPrompt(params: {
 Файл, который ты обязан создать: ${params.outputJsonPath}
 
 Жесткие правила:
-- Используй только данные из файла Exa JSON. В интернет не ходи. Никаких fetch, web search, MCP, браузера.
-- Ответ Exa не переводи и не меняй. Он уже сохранен отдельно.
-- Создай только JSON-файл по указанному пути. Никаких markdown-файлов, txt-файлов или дополнительных отчетов.
-- Итоговый JSON должен быть на русском языке.
-- Не придумывай данные. Если поле не подтверждено Exa-сниппетами, ставь null, пустую строку, пустой массив или пустой объект по схеме.
-- Используй только источники, где явно встречается входной артикул задачи или его нормализованный OEM-вариант. Похожие номера без точного совпадения игнорируй полностью.
-- В number-поля попадают только OEM-артикулы. Aftermarket-бренды и магазинные SKU не добавляй ни в article, ни в article_low_confidence, ни в irrelevant; из них можно взять только явно написанный OEM-номер.
-- Для Mercury/MerCruiser/Quicksilver/Mariner считай OEM-брендом "Mercury Marine".
-- Нормализуй варианты записи одного OEM-номера: для Mercury/Quicksilver отбрасывай групповой префикс до дефиса, если справа полный номер (87-892150Q02 -> 892150Q02); суффиксы продавца/бренда тоже не дублируй (24677251-VP -> 24677251).
-- Вес всегда указывай в килограммах. Если вес найден в фунтах/унциях/граммах, переведи в кг. Если вес не найден, weight = null.
-- numbers.article отсортируй так: сначала самые новые/актуальные OEM-артикулы, потом более старые. Не добавляй type/confidence.
-- numbers.article_low_confidence используй только для OEM-кандидатов, где связи не хватает для уверенного вывода.
-- numbers.irrelevant добавляй только если есть реально отброшенные номера; для каждого нужен источник и обоснование.
-- Каждый article, article_low_confidence и irrelevant должен иметь source_url и evidence на русском: что в источнике написано и почему это доказывает или не доказывает связь.
-- models это объект с text/source_urls/evidence: в text перечисли применяемость по моделям с каждой новой строки. Если моделей нет или источники слабые, models = null.
-- kit_contents это объект. Внутри по каждой запчасти комплекта укажи article, name, quantity, description, source_url, evidence. Если артикул компонента неизвестен, ключ "unknown_1", "unknown_2".
-- part_of_kits используй, если искомая запчасть входит в наборы.
+${params.codexRules}
 
 Строгая JSON-схема результата:
 {
@@ -151,6 +136,7 @@ function buildLowConfidencePrompt(params: {
   outputJsonPath: string;
   lowConfidenceExaJsonPath: string;
   articles: string[];
+  codexRules: string;
 }) {
   return `
 Продолжи работу с уже созданным JSON по OEM-запчасти.
@@ -166,9 +152,7 @@ function buildLowConfidencePrompt(params: {
 - Обнови тот же файл: ${params.outputJsonPath}
 
 Правила обновления:
-- Используй только текущий JSON и дополнительный Exa JSON. В интернет не ходи. Никаких fetch, web search, MCP, браузера.
-- В number-полях оставляй только OEM-артикулы. Aftermarket-бренды и магазинные SKU удали из article_low_confidence и не переноси в irrelevant; из них можно взять только явно написанный OEM-номер.
-- Нормализуй варианты записи одного OEM-номера: для Mercury/Quicksilver отбрасывай групповой префикс до дефиса, если справа полный номер (87-892150Q02 -> 892150Q02); суффиксы продавца/бренда тоже не дублируй (24677251-VP -> 24677251).
+${params.codexRules}
 - Если Exa явно подтвердил OEM-связь проверяемого артикула с ${params.partNumber}, перенеси его в numbers.article.
 - Если связь не подтверждена, но это возможный OEM-кандидат, оставь его в numbers.article_low_confidence и обнови evidence / why_low_confidence.
 - Если доказано, что OEM-артикул относится к другой детали, перенеси его в numbers.irrelevant.
@@ -214,6 +198,10 @@ function assertString(value: unknown, name: string): asserts value is string {
   }
 }
 
+function samePartNumber(left: string, right: string) {
+  return left.trim().toLowerCase() === right.trim().toLowerCase();
+}
+
 function validateArticleArray(
   value: unknown[],
   name: "numbers.article" | "numbers.article_low_confidence" | "numbers.irrelevant",
@@ -239,6 +227,9 @@ function validateArticleArray(
 function validateKitContents(value: Record<string, unknown>) {
   for (const [key, item] of Object.entries(value)) {
     const itemName = `kit_contents.${key}`;
+    if (samePartNumber(key, PART_NUMBER)) {
+      throw new Error(`${itemName} must not use task_part_number as its own kit component`);
+    }
     assertObject(item, itemName);
     assertRequiredKeys(
       item,
@@ -248,6 +239,9 @@ function validateKitContents(value: Record<string, unknown>) {
 
     if (item.article !== null) {
       assertString(item.article, `${itemName}.article`);
+      if (samePartNumber(item.article, PART_NUMBER)) {
+        throw new Error(`${itemName}.article must not equal task_part_number`);
+      }
     }
     if (item.name !== null) {
       assertString(item.name, `${itemName}.name`);
@@ -269,7 +263,9 @@ function validatePartOfKits(value: unknown[]) {
     const itemName = `part_of_kits[${index}]`;
     assertObject(item, itemName);
     assertRequiredKeys(item, ["kit_article", "kit_name", "source_url", "evidence"], itemName);
-    assertString(item.kit_article, `${itemName}.kit_article`);
+    if (item.kit_article !== null) {
+      assertString(item.kit_article, `${itemName}.kit_article`);
+    }
     assertString(item.kit_name, `${itemName}.kit_name`);
     assertString(item.source_url, `${itemName}.source_url`);
     assertString(item.evidence, `${itemName}.evidence`);
@@ -405,12 +401,14 @@ async function main() {
 
   const exaDir = resolve(SCRIPT_DIR, "exa_results");
   const codexDir = resolve(SCRIPT_DIR, "codex_results");
+  const codexRulesPath = resolve(SCRIPT_DIR, "codex_rules.md");
   const exaJsonPath = resolve(exaDir, `${PART_NUMBER}.json`);
   const lowConfidenceExaJsonPath = resolve(exaDir, `${PART_NUMBER}_low_confidence_check.json`);
   const outputJsonPath = resolve(codexDir, `${PART_NUMBER}.json`);
 
   await mkdir(exaDir, { recursive: true });
   await mkdir(codexDir, { recursive: true });
+  const codexRules = await readFile(codexRulesPath, "utf8");
 
   const query = buildExaQuery(PART_NUMBER);
   const exaResult = await callExaSearch(query);
@@ -435,6 +433,7 @@ async function main() {
     partNumber: PART_NUMBER,
     exaJsonPath,
     outputJsonPath,
+    codexRules,
   });
 
   const { Codex } = await import("@openai/codex-sdk");
@@ -482,6 +481,7 @@ async function main() {
         outputJsonPath,
         lowConfidenceExaJsonPath,
         articles: lowConfidenceArticles,
+        codexRules,
       }),
     );
 
