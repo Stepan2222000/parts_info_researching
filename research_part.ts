@@ -153,17 +153,8 @@ function buildLowConfidencePrompt(params: {
 
 Правила обновления:
 ${params.codexRules}
-- Если Exa явно подтвердил OEM-связь проверяемого артикула с ${params.partNumber}, перенеси его в numbers.article.
-- Если связь не подтверждена, но это возможный OEM-кандидат, оставь его в numbers.article_low_confidence и обнови evidence / why_low_confidence.
-- Если доказано, что OEM-артикул относится к другой детали, перенеси его в numbers.irrelevant.
 - Один и тот же артикул не должен одновременно находиться в нескольких массивах.
-- Если в дополнительном Exa research найден новый OEM-артикул с явной связью superseded/replaces/interchange/cross reference, добавь его в numbers.article. Если связь слабая, добавь в numbers.article_low_confidence.
-- numbers.article отсортируй так: сначала самые новые/актуальные OEM-артикулы, потом более старые.
 - Это второй и последний проход уточнения: не делай новых запросов, зафиксируй итоговое решение по имеющимся данным.
-- Не добавляй верхнее поле sources.
-- Не добавляй поле aftermarket.
-- Не добавляй type/confidence у артикулов.
-- Итоговый JSON должен остаться на русском языке и соответствовать той же схеме.
 - Запиши обновленный JSON в тот же файл: ${params.outputJsonPath}
 `.trim();
 }
