@@ -202,14 +202,6 @@ function samePartNumber(left: string, right: string) {
   return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
-function textLooksLikeKit(value: unknown) {
-  if (typeof value !== "string") {
-    return false;
-  }
-
-  return /\bkit\b|\bset\b|комплект|набор|repair kit|tune-up kit|anode kit/i.test(value);
-}
-
 function validateArticleArray(
   value: unknown[],
   name: "numbers.article" | "numbers.article_low_confidence" | "numbers.irrelevant",
@@ -306,17 +298,6 @@ function validateStructuredResult(value: unknown) {
   assertObject(value.kit_contents, "kit_contents");
   assertArray(value.part_of_kits, "part_of_kits");
   assertObject(value.numbers, "numbers");
-
-  if (
-    Object.keys(value.kit_contents).length > 0 &&
-    !textLooksLikeKit(value.name) &&
-    !textLooksLikeKit(value.description)
-  ) {
-    throw new Error(
-      "kit_contents must be empty unless name or description clearly says task_part_number is a kit",
-    );
-  }
-
   validateKitContents(value.kit_contents);
   validatePartOfKits(value.part_of_kits);
 
