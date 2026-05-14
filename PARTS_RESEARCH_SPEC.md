@@ -1,81 +1,107 @@
-# Parts Research System Specification
+# Спецификация системы ресерча запчастей
 
-## Purpose
+## Цель
 
-This system researches spare parts by article number, stores all intermediate research data in a dedicated research database, and publishes only clean draft/final catalog records into the Smart database.
+Мы делаем систему, которая принимает артикулы запчастей, глубоко ищет по ним информацию в интернете и дополнительных источниках, сохраняет весь процесс ресерча в отдельной базе, а в Smart записывает только аккуратные каталожные результаты.
 
-The system is built around a simple separation:
+Главная граница такая:
 
-- `parts_research` is the working database. It stores tasks, runs, raw JSON artifacts, parsed draft data, Exa cache, source evidence, agent actions, and plugin-provided context.
-- `smart_test` is the Smart catalog database. It stores only catalog-shaped results: parts, component relations, product types, and draft/final flags.
+- `parts_research` — рабочая база ресерча. Тут хранится все: задачи, запуски, raw JSON, распарсенные draft-данные, Exa-кэш, источники, evidence, действия агентов, SQL-запросы, данные от будущих плагинов.
+- `smart_test` — чистая Smart-база. Тут хранятся только каталожные записи: запчасти, наборы, компоненты, связи между ними, draft/final-флаги.
 
-The agent workflow must be evidence-first. If information is not found, the field remains `null` or empty where the target schema allows it. The system must not invent facts to make the result look complete.
+`parts_research` может содержать спорные, неполные и промежуточные данные. Это нормально, потому что это рабочая база.
 
-The implementation should avoid unnecessary abstractions and fallback logic. Required functionality should be explicit, testable, and easy to inspect through SQL.
+`smart_test` должна оставаться максимально чистой по форме. Там могут быть draft-записи, но они должны быть похожи на реальные каталожные записи, а не на мусор от ресерча.
 
-## Core Workflow
+Система не должна придумывать данные. Если вес, модель, артикул компонента или другой факт не найден, поле остается `null`, пустым или draft, в зависимости от смысла и ограничений схемы.
 
-The normal flow is:
+## Общая логика работы
 
-1. A user submits one or more article numbers as research tasks.
-2. The backend creates a separate research task and research run for each article.
-3. A `research-agent` runs for each article in its own Codex thread.
-4. The `research-agent` uses Exa to search the internet, using the backend Exa wrapper so exact repeated Exa requests are cached.
-5. The research output is saved physically as raw JSON.
-6. The backend parses the saved JSON deterministically into draft tables in `parts_research`.
-7. A `curator/write-agent` can inspect the parsed draft data, source evidence, Smart context through FDW, and external plugin context.
-8. The `curator/write-agent` decides how to write clean draft catalog records into Smart.
-9. The system writes Smart records as drafts and unverified component relations by default.
-10. A human later manually verifies and finalizes records directly in the database by changing draft/unverified flags.
+Обычный поток такой:
 
-The raw JSON and parsed draft data are both important. Raw JSON preserves the full artifact from a run. Parsed draft tables make the data searchable and usable for SQL, views, UI, and curator-agent decisions.
+1. Пользователь добавляет один или несколько артикулов в очередь.
+2. Backend создает задачу ресерча для каждого артикула.
+3. Для каждого артикула запускается отдельный Codex thread.
+4. `research-agent` ищет информацию через Exa и будущие источники.
+5. Все raw-результаты сохраняются физически как JSON.
+6. Итоговый JSON результата тоже сохраняется физически.
+7. Backend детерминированно парсит итоговый JSON в draft-таблицы `parts_research`.
+8. `curator/write-agent` смотрит draft-данные, evidence, Smart через FDW, при необходимости сам вызывает Exa и сам выполняет SQL.
+9. Curator-agent записывает аккуратные draft-результаты в Smart.
+10. Человек позже вручную проверяет записи в БД и меняет draft/unverified-флаги.
 
-## Databases
+Важно: JSON сохраняется не вместо базы, а вместе с базой.
 
-### `parts_research`
+Raw JSON нужен как полная история результата. Draft-таблицы нужны, чтобы агент, SQL, views и UI могли нормально искать, фильтровать и сравнивать данные.
 
-`parts_research` is the main operational database for the research system.
+## Базы данных
 
-It stores:
+## `parts_research`
 
-- research tasks and runs;
-- raw JSON artifacts from Exa and Codex;
-- parsed draft part data;
-- parsed draft component data;
-- source URLs and evidence text;
-- exact Exa request cache;
-- plugin-provided context items;
-- SQL actions executed by agents;
-- UI-facing queue and result state.
+`parts_research` — основная база системы ресерча.
 
-This database is allowed to contain incomplete, uncertain, draft, and conflicting information. It is the working memory of the system.
+В ней должны храниться:
 
-### `smart_test`
+- задачи по артикулам;
+- отдельные запуски задач;
+- Codex thread id для каждого запуска;
+- raw JSON от Exa;
+- raw JSON итоговых Codex-результатов;
+- распарсенные draft-запчасти;
+- распарсенные draft-компоненты;
+- источники и evidence;
+- точный кэш Exa-запросов;
+- данные от будущих source-плагинов;
+- SQL-запросы, которые выполняли агенты;
+- статусы для очереди и UI.
 
-`smart_test` is the clean catalog target.
+Эта база должна быть удобной для анализа. Агент может смотреть ее через SQL и понимать, что уже найдено, что спорное, что записано в Smart, а что еще только draft.
 
-It stores:
+## `smart_test`
+
+`smart_test` — тестовая Smart-база для чистых результатов.
+
+В ней есть:
 
 - `parts`;
 - `part_components`;
 - `product_types`;
-- `parts_with_components` view.
+- `parts_with_components`.
 
-Smart records may still be drafts, but they should be catalog-shaped. Smart should not store raw Exa responses, long source evidence, old research artifacts, or agent logs.
+В Smart не надо хранить raw Exa-ответы, длинные evidence-тексты, логи агента, историю рассуждений и старые research JSON.
 
-### FDW Boundary
+Smart хранит итоговую каталожную форму:
 
-`parts_research` accesses `smart_test` through PostgreSQL `postgres_fdw`.
+- название;
+- артикулы;
+- бренды;
+- описание, если оно есть и относится к обычной записи;
+- тип транспорта;
+- модели/применяемость;
+- вес;
+- компоненты набора;
+- draft-флаги.
 
-The intended setup is:
+## FDW
 
-- install `postgres_fdw` in `parts_research`;
-- create a foreign server pointing to `smart_test`;
-- create a user mapping for the local research DB user;
-- import or define Smart tables in a dedicated schema, preferably `smart`;
-- let agents and backend services query Smart data from `parts_research` with normal SQL.
+`parts_research` должна видеть `smart_test` через PostgreSQL FDW.
 
-Example query shape:
+Это нужно, чтобы агент мог из одной SQL-сессии:
+
+- смотреть research-таблицы;
+- смотреть Smart-таблицы;
+- сравнивать draft с уже записанными Smart-данными;
+- при необходимости писать результат в Smart.
+
+Предварительная форма:
+
+- в `parts_research` ставим `postgres_fdw`;
+- создаем foreign server на `smart_test`;
+- создаем user mapping;
+- импортируем Smart-таблицы в отдельную схему, например `smart`;
+- дальше агент работает обычным SQL.
+
+Пример:
 
 ```sql
 select *
@@ -83,341 +109,461 @@ from smart.parts
 where '807252T5' = any(articles);
 ```
 
-Smart through FDW is also treated as a context source for agents. It can provide confirmed or draft catalog knowledge about existing parts, components, and kit relationships.
+Smart через FDW также считается одним из источников контекста. Это не “сырой ресерч”, а уже подготовленные каталожные данные.
 
-## Smart Data Model Assumptions
+## Smart-схема
 
-The Smart schema contains:
+Текущая Smart-логика находится в:
 
-- `parts.id`: generated Smart ID;
-- `parts.name`: catalog name;
-- `parts.articles`: array of article numbers;
-- `parts.brands`: array of allowed brands;
-- `parts.description`: optional description;
-- `parts.product_type`: product type;
-- `parts.model`: model/application text;
-- `parts.weight_kg`: weight in kilograms;
-- `parts.is_draft`: draft flag;
-- `part_components.parent_id`: kit or parent part;
-- `part_components.child_id`: component part;
-- `part_components.quantity`: component quantity;
-- `part_components.can_be_sold_separately`;
-- `part_components.is_unverified`;
-- `parts_with_components`: view with direct components and computed `is_kit`.
+`/Users/stepan/Desktop/server_data/workspace/central_smart_logic/main.sql`
 
-`description` exists in Smart and should be used for normal parts when the research result contains a useful description. For draft components without article numbers, the system should only write `name` and not force a description.
+Основные сущности:
 
-## Agent Roles
+- `parts` — запчасти и наборы;
+- `part_components` — состав наборов;
+- `product_types` — типы транспорта;
+- `parts_with_components` — view, где видны компоненты и вычисляется `is_kit`.
 
-### Research Agent
+В `parts` важны поля:
 
-The `research-agent` is responsible for the initial deep research of a specific article number.
+- `id`;
+- `name`;
+- `articles`;
+- `brands`;
+- `description`;
+- `product_type`;
+- `model`;
+- `weight_kg`;
+- `is_draft`.
 
-It:
+В `part_components` важны поля:
 
-- runs in its own Codex thread for each article;
-- uses Exa heavily through the backend Exa wrapper;
-- can make additional Exa requests after the required initial searches;
-- produces a structured JSON result;
-- records source-backed evidence for claims;
-- keeps uncertainty explicit instead of overclaiming.
+- `parent_id`;
+- `child_id`;
+- `quantity`;
+- `can_be_sold_separately`;
+- `is_unverified`.
 
-The `research-agent` may receive plugin-provided context. This context is useful but not authoritative. It can include Smart context, Avito-like marketplace data, custom database rows, or other future source plugins.
+`is_kit` не нужно хранить отдельной колонкой в `parts`. Набор определяется по наличию строк в `part_components`, где запчасть является `parent_id`.
 
-The `research-agent` should not receive old research results by default. Old research results may contain stale or bad intermediate conclusions. Exact Exa cache is still used automatically, because it represents the same Exa request returning the same previously stored response.
+## Роли агентов
 
-### Curator / Write Agent
+## `research-agent`
 
-The `curator/write-agent` is a judge and editor for writing data into Smart.
+`research-agent` занимается первичным ресерчем по конкретному артикулу.
 
-It:
+Он:
 
-- reads parsed draft data from `parts_research`;
-- reads source/evidence data when needed;
-- reads Smart context through FDW;
-- can execute SQL through its SQL tool;
-- can call Exa MCP directly when it needs to resolve a conflict or verify a fact;
-- decides how to write clean draft records into Smart;
-- does not delegate exact follow-up research to another agent.
+- запускается в отдельном Codex thread на каждый research run;
+- ищет информацию через Exa;
+- делает обязательные поиски, заложенные программой;
+- может делать дополнительные Exa-запросы после обязательных;
+- сохраняет raw Exa-результаты;
+- формирует итоговый структурированный JSON;
+- фиксирует источники и evidence;
+- явно оставляет неопределенность, если данных не хватает.
 
-The curator-agent should not be overloaded with all evidence up front. Its prompt should tell it to inspect the necessary draft, source, Smart, and plugin context before writing. It can choose what to read through SQL.
+Он может получать дополнительный контекст от плагинов. Например:
 
-## Exa Cache
+- Smart context через FDW;
+- данные Avito;
+- данные другой базы;
+- внутренние выгрузки;
+- другие будущие источники.
 
-Exa caching is exact and intentionally simple.
+Такой контекст считается подсказкой, а не истиной. Агент может учитывать его и использовать как направление для проверки.
 
-If the same Exa tool is called with the exact same arguments, the backend returns the cached response. If any argument differs, the backend performs a new Exa request and stores the response.
+Старые research results не надо заранее передавать `research-agent`. Они могут быть ошибочными или устаревшими и могут плохо повлиять на новый ресерч.
 
-This prevents paying repeatedly for identical Exa searches while avoiding fuzzy cache behavior.
+При этом exact Exa-cache все равно используется автоматически, потому что это не “старый вывод агента”, а сохраненный ответ Exa на ровно такой же запрос.
 
-The cache should store:
+## `curator/write-agent`
 
-- request hash;
-- tool name;
-- full arguments JSON;
-- full response JSON;
-- creation time;
-- last used time;
-- hit count.
+`curator/write-agent` — это судья и редактор перед записью в Smart.
 
-The request hash is based on the tool name and a stable serialization of the full arguments JSON. For example, changing `query`, `numResults`, or any other parameter creates a different cache key.
+Он:
 
-Exa cache and evidence are separate:
+- смотрит draft-данные в `parts_research`;
+- смотрит evidence, если считает нужным;
+- смотрит Smart через FDW;
+- может смотреть данные от плагинов;
+- может выполнять SQL;
+- может сам вызывать Exa MCP;
+- сам решает, как аккуратно записать данные в Smart.
 
-- Exa cache stores technical API responses.
-- Evidence stores the specific source snippets and reasoning that the agent actually used for a draft or Smart write decision.
+Он не просит другого агента “доищи вот это”. Если ему нужно уточнение, он сам делает Exa-поиск.
 
-## Raw JSON And Draft Parsing
+Ему не надо заранее передавать все evidence. В промпте нужно прописать, что перед записью он обязан сам детально изучить данные через доступные инструменты и понять, что именно нужно записывать.
 
-The system physically stores JSON artifacts from research runs.
+## Exa-кэш
 
-Important raw artifacts include:
+Exa-кэш делаем максимально просто.
 
-- initial Exa search responses;
-- additional Exa search responses;
-- low-confidence verification search responses;
-- kit contents search responses;
-- Codex structured result JSON;
-- future direct-source plugin outputs.
+Правило:
 
-After a JSON result is saved, the backend parses it into draft data in `parts_research`.
+```text
+если tool + arguments полностью совпадают, берем старый сохраненный ответ
+если отличается хотя бы один аргумент, делаем новый Exa-запрос
+```
 
-The parsing should be deterministic. The agent may create or update JSON, but the backend should be responsible for mapping JSON into draft database rows. This keeps database writes predictable.
+Не делаем:
 
-Draft data should stay connected to:
+- fuzzy cache;
+- похожие запросы;
+- угадывание, что запрос “почти такой же”;
+- сложные fallback-ветки.
 
-- the original task;
-- the specific run;
-- the raw JSON result;
-- the source/evidence rows used to support it.
+В кэше нужно хранить:
 
-## Draft Data In `parts_research`
+- hash запроса;
+- название Exa tool;
+- полный JSON аргументов;
+- полный JSON ответа;
+- дату создания;
+- дату последнего использования;
+- количество cache hits.
 
-The exact SQL schema can evolve, but the research database should minimally represent these concepts:
+Hash считается от tool name и стабильного JSON аргументов. Если изменился текст query, `numResults` или любой другой параметр, это уже новый запрос.
 
-- tasks: submitted article numbers and current task status;
-- runs: individual attempts, Codex thread IDs, start/end timestamps, and error state;
-- raw artifacts: saved JSON payloads and their type;
-- draft parts: parsed part-shaped data from a result;
-- draft components: parsed kit/component data, including components without article numbers;
-- evidence: source URLs and explanation text connected to draft fields or relations;
-- external context items: plugin-provided hints and data;
-- Exa cache: exact Exa request cache;
-- agent SQL runs: SQL executed by agents and its result/error.
+Exa-cache и evidence — разные вещи.
 
-The purpose is not to build a complicated workflow engine. The purpose is to make research data queryable, inspectable, and publishable into Smart.
+Exa-cache хранит технический ответ Exa.
 
-## Smart Publication Rules
+Evidence хранит то, что агент реально использовал как доказательство для конкретного поля, компонента, кросс-номера или решения.
 
-Publishing to Smart means converting parsed draft research data into Smart-shaped catalog rows.
+## Raw JSON
 
-General rules:
+Каждый важный результат должен сохраняться физически как JSON.
 
-- Smart writes are draft by default.
-- Smart parts are written with `is_draft = true`.
-- Smart component relations are written with `part_components.is_unverified = true`.
-- Human verification happens later in the database.
-- Auto-finalization is not part of the current design.
+Нужно сохранять:
 
-The publisher should map:
+- основные Exa-поиски;
+- дополнительные Exa-поиски;
+- проверки low-confidence артикулов;
+- поиски состава наборов;
+- итоговый Codex JSON;
+- future plugin source payloads.
 
-- `name` to `parts.name`;
-- article numbers to `parts.articles`;
-- OEM brand to `parts.brands`;
-- Russian description to `parts.description` for normal parts;
-- application/model text to `parts.model`;
-- product type to `parts.product_type`;
-- weight to `parts.weight_kg`;
-- kit membership to `part_components`.
+Raw JSON нужен для воспроизводимости и отладки.
 
-If a value is unknown and the Smart column allows `null`, write `null`.
+После сохранения итогового JSON backend парсит его в draft-таблицы `parts_research`.
 
-## Kits And Components
+Парсинг должен быть детерминированным. Агент может создать JSON и объяснить результат, но запись в draft-таблицы лучше делать backend-сервисом, чтобы не зависеть от случайного SQL, который сгенерировал агент.
 
-A part is considered a kit if it has components.
+## Draft-данные
 
-In Smart, `is_kit` is not stored as a direct column. It is computed by the `parts_with_components` view based on whether the part has rows in `part_components` as `parent_id`.
+Draft-данные в `parts_research` должны быть привязаны к:
 
-The system should support:
+- задаче;
+- конкретному запуску;
+- raw JSON;
+- источникам;
+- evidence;
+- будущей Smart-записи, если она была создана.
 
-- parts that are kits;
-- parts that are components of other kits;
-- kits with fully identified components;
-- kits with partially identified components;
-- draft components without known article numbers.
+Минимальные сущности:
 
-### Components With Article Numbers
+- `research_tasks`;
+- `research_runs`;
+- `raw_artifacts`;
+- `draft_parts`;
+- `draft_components`;
+- `draft_evidence`;
+- `exa_cache`;
+- `external_context_items`;
+- `agent_sql_runs`.
 
-If a component has a reliable article number, it can be published as a Smart draft part.
+Это не должен быть тяжелый workflow engine. Это просто нормальные таблицы, чтобы данные были видны, проверяемы и пригодны для SQL.
 
-The system then creates a `part_components` relation from the kit to that component.
+## Запись в Smart
 
-The relation should remain unverified by default.
+Запись в Smart происходит из draft-данных.
 
-### Components Without Article Numbers
+Общие правила:
 
-Draft components without article numbers are allowed.
-
-This exists because real sources sometimes say a kit includes an O-ring, seal, gasket, washer, or similar component without giving a component article number. Losing that information would make the kit composition incomplete.
-
-If Smart is configured to allow draft parts with empty `articles`, then the system may publish a component without article numbers as:
-
-- `parts.name` from the source;
-- `parts.articles = '{}'`;
+- все новые Smart-записи создаются как draft;
 - `parts.is_draft = true`;
+- связи компонентов создаются как unverified;
 - `part_components.is_unverified = true`;
-- no forced `description` for that component.
+- человек позже вручную подтверждает данные в БД;
+- авто-финализацию пока не делаем.
 
-This is acceptable only for draft records. A human should later add a real article number or decide how to handle the component.
+Маппинг:
 
-This design intentionally accepts that Smart can contain incomplete draft data. The draft flags make the incompleteness explicit and prevent treating the data as final.
+- draft `name` -> `smart.parts.name`;
+- draft articles -> `smart.parts.articles`;
+- draft brand -> `smart.parts.brands`;
+- draft description -> `smart.parts.description`, если это обычная запись и описание реально полезно;
+- draft models/application -> `smart.parts.model`;
+- draft product type -> `smart.parts.product_type`;
+- draft weight -> `smart.parts.weight_kg`;
+- draft kit contents -> `smart.part_components`.
 
-## Product Types And Brands
+Если значение неизвестно и Smart-поле допускает `null`, пишем `null`.
 
-The system should use configured Smart product types and brands.
+## Наборы и компоненты
 
-Expected product types include:
+Набор — это обычная запись `parts`, у которой есть строки в `part_components` как у parent.
+
+Компонент — это обычная запись `parts`, которая входит в набор через `part_components.child_id`.
+
+Система должна уметь работать с:
+
+- обычными одиночными запчастями;
+- наборами;
+- компонентами набора;
+- запчастями, которые входят в несколько наборов;
+- наборами с полным составом;
+- наборами с частично известным составом;
+- компонентами без найденного артикула.
+
+## Компоненты с артикулами
+
+Если у компонента найден надежный артикул, его можно записывать в Smart как draft part.
+
+После этого создается связь:
+
+```text
+kit part -> component part
+```
+
+Связь остается `is_unverified = true`, пока человек не проверит ее вручную.
+
+## Компоненты без артикулов
+
+Компоненты без артикула разрешены как draft-данные.
+
+Причина: источники часто пишут, что в набор входят seals, O-rings, gaskets, washers и другие компоненты, но не дают отдельные артикулы. Если это выбрасывать, состав набора будет неполным.
+
+Если Smart-схема разрешает draft-запчасти с пустым `articles`, такой компонент можно записать в Smart как draft.
+
+Для такого компонента:
+
+- пишем `name`;
+- `articles` оставляем пустым;
+- `is_draft = true`;
+- связь с набором `is_unverified = true`;
+- `description` специально не заставляем писать.
+
+Это не идеальная финальная информация, но это допустимая draft-информация. Draft-флаги показывают, что запись неполная и требует ручной проверки.
+
+Когда человек позже найдет артикул или примет решение, он вручную поправит запись в БД.
+
+## Product type и brand
+
+Product type берется из Smart-справочника.
+
+Ожидаемые значения:
 
 - `Для автомобилей`;
 - `Для мототехники`;
 - `Для водного транспорта`.
 
-Expected brands come from Smart configuration. For Mercury, MerCruiser, Quicksilver, and Mariner, the research rules treat the OEM brand as Mercury Marine and map it to the appropriate Smart brand value.
+Brand должен соответствовать Smart-конфигу.
 
-The exact brand mapping should be centralized in backend config rather than redefined in every prompt.
+Для Mercury, MerCruiser, Quicksilver и Mariner в логике ресерча это один OEM-контекст Mercury Marine, но при записи нужно маппить его в допустимый Smart brand.
 
-## Additional Source Plugins
+Маппинг брендов лучше держать в backend config, а не размазывать по промптам.
 
-The system should support additional context sources through plugins.
+## Дополнительные источники и плагины
 
-Examples:
+Система должна поддерживать дополнительные источники через плагины.
 
-- Smart context through FDW;
-- Avito or other marketplace listing data;
-- custom databases;
-- old internal datasets;
-- future direct source connectors.
+Примеры:
 
-Plugin context is not guaranteed truth. It is a hint that the agent can consider. The agent may use it to decide what to verify through Exa or SQL, but it should not blindly publish plugin data as fact.
+- Smart context через FDW;
+- Avito;
+- другая пользовательская база;
+- выгрузки объявлений;
+- старые внутренние датасеты;
+- будущие прямые источники.
 
-Plugin-provided data should be stored in `parts_research` as context connected to the relevant task or run.
+Плагиновые данные — это подсказки, а не гарантированная истина.
 
-The prompt should explain to agents that plugin data is preliminary and should be treated carefully.
+Агент может использовать их для понимания контекста и выбора направления проверки, но не должен верить им на 100 процентов.
 
-## Old Research Results
+Например, если в Avito рядом с искомым артикулом часто указан другой артикул, агент может проверить эту связь через Exa и источники.
 
-Old research results should not be sent to the `research-agent` by default.
+Плагиновые данные должны сохраняться в `parts_research` и быть привязаны к задаче или запуску.
 
-They may contain intermediate errors, old assumptions, or low-confidence conclusions. Passing them up front can bias a new research run.
+## Старые research results
 
-However, old research data remains stored in `parts_research`. The curator-agent may inspect it through SQL if it decides that doing so is useful.
+Старые research results не передаются `research-agent` заранее.
 
-Smart data is different. Smart data is the catalog output and can be used as a context source through FDW.
+Причина: старые результаты могут содержать ошибки, непроверенные выводы или устаревший контекст.
 
-## SQL Tool
+Исключение: curator-agent может сам посмотреть старые research results через SQL, если считает это полезным.
 
-The curator-agent should have a SQL tool that can execute SQL against `parts_research`.
+Smart-данные через FDW можно использовать как контекст, потому что это уже опубликованные каталожные данные, пусть даже часть из них draft.
 
-Through FDW, that same SQL session can also inspect and write Smart tables.
+## SQL tool
 
-The SQL tool is not technically restricted by query type. The agent can run SELECT, INSERT, UPDATE, DELETE, or other SQL when needed.
+У curator/write-agent должен быть SQL tool.
 
-The agent instructions should still tell the agent to be careful, inspect before modifying, and keep destructive actions deliberate. SQL executions should be logged in `parts_research` so they can be audited later.
+Он может выполнять SQL по `parts_research`, а через FDW также читать и писать Smart.
 
-Database backups are assumed to exist, so the design does not require mandatory UI approval for every destructive SQL action.
+Технически SQL tool не ограничиваем по типу запросов.
 
-## UI Expectations
+Агент может выполнять:
 
-The frontend will be built with Next.js.
+- `SELECT`;
+- `INSERT`;
+- `UPDATE`;
+- `DELETE`;
+- другие SQL-команды, если это нужно для задачи.
 
-The chat and agent streaming should use Vercel AI SDK v6 patterns such as `useChat`, `streamText`, tool calls, and streaming UI/data parts.
+При этом в инструкциях агенту нужно прописать:
 
-The UI should show:
+- сначала изучать данные;
+- не делать бессмысленных destructive-действий;
+- объяснять себе, что он меняет;
+- ориентироваться на правила записи в Smart;
+- логировать выполненный SQL.
 
-- task submission sidebar;
-- queue counts: submitted, running, completed, failed;
-- task progress cards by article;
-- modal or detail panel for each task result;
-- errors visible in task detail;
+Обязательное UI-подтверждение для каждого destructive SQL сейчас не делаем. Предполагается, что базы регулярно бэкапятся.
+
+## UI
+
+Frontend будет на Next.js.
+
+Чат и стриминг должны использовать Vercel AI SDK v6:
+
+- `useChat`;
+- `streamText`;
+- tool calls;
+- streaming events;
+- typed tool/data parts.
+
+UI должен показывать:
+
+- боковую панель добавления задач;
+- очередь задач;
+- сколько задач добавлено;
+- сколько в работе;
+- сколько завершено;
+- сколько с ошибкой;
+- карточки прогресса по артикулам;
+- модалку или detail-panel результата;
+- ошибку внутри карточки/модалки;
 - raw/draft/Smart publication status;
-- Exa cache hit/miss when useful;
-- visible agent actions that can later collapse;
-- chat with curator/write-agent;
-- source/evidence inspection;
-- draft completeness and missing article indicators.
+- Exa cache hit/miss, если это полезно;
+- действия агента во время стриминга;
+- свернутую историю действий;
+- чат с curator/write-agent;
+- источники и evidence;
+- неполные компоненты;
+- draft/unverified-состояния.
 
-The visual design should be polished and clear. It should not be a generic dashboard. The interface should help a human quickly understand which parts are researched, which are weak, which are draft-only, and which records have been written to Smart.
+Визуал должен быть красивым, аккуратным и рабочим. Это не должен быть generic dashboard. Интерфейс должен помогать быстро понять:
 
-## Implementation Order
+- что уже найдено;
+- что спорное;
+- что записано в Smart;
+- где не хватает артикула;
+- где нужен человеческий просмотр;
+- где возникла ошибка.
 
-The backend should be implemented before the frontend.
+## Backend-first порядок реализации
 
-Recommended order:
+Сначала делаем backend и проверяем логику без фронта.
 
-1. Configure FDW from `parts_research` to `smart_test`.
-2. Create minimal `parts_research` tables.
-3. Implement exact Exa cache wrapper.
-4. Implement raw JSON storage.
-5. Implement deterministic JSON-to-draft parser.
-6. Import current saved JSON examples into draft tables.
-7. Implement draft-to-Smart publisher.
-8. Implement SQL tool logging.
-9. Connect Codex SDK threads for research runs.
-10. Connect curator/write-agent flow.
-11. Test with existing Mercury examples.
-12. Build the Next.js UI after the backend flow works.
+Рекомендуемый порядок:
 
-The first meaningful backend test is:
+1. Настроить FDW из `parts_research` в `smart_test`.
+2. Создать минимальные таблицы `parts_research`.
+3. Сделать exact Exa-cache wrapper.
+4. Сделать raw JSON storage.
+5. Сделать JSON -> draft parser.
+6. Импортировать текущие `codex_results/*.json` в draft-таблицы.
+7. Сделать draft -> Smart publisher.
+8. Добавить логирование SQL tool.
+9. Подключить Codex SDK threads для research runs.
+10. Подключить curator/write-agent.
+11. Протестировать на текущих Mercury-примерах.
+12. После этого делать Next.js UI.
 
-- ingest `codex_results/76868A04.json`;
-- parse it into `parts_research`;
-- publish a Smart draft part and any publishable component relations;
-- repeat for `codex_results/807252T5.json`;
-- verify Smart rows through FDW.
+Первый полезный тест:
 
-## Fixed Decisions
+1. взять `codex_results/76868A04.json`;
+2. сохранить raw artifact;
+3. распарсить в draft;
+4. записать Smart draft;
+5. проверить через FDW;
+6. повторить для `codex_results/807252T5.json`.
 
-- `parts_research` is the working research database.
-- `smart_test` is the clean catalog target.
-- `parts_research` accesses Smart through PostgreSQL FDW.
-- Full JSON artifacts are physically saved.
-- Saved JSON is parsed into draft tables automatically.
-- Draft data is connected to tasks and runs.
-- Exa cache is exact-match only.
-- Exa cache is based on identical tool arguments.
-- Old research results are not sent to the research-agent by default.
-- Smart context through FDW can be provided as plugin/context.
-- Other source plugins may provide hints, not guaranteed truth.
-- Curator/write-agent can call Exa directly.
-- Curator/write-agent can execute SQL directly.
-- Curator/write-agent does not delegate exact follow-up research to other agents.
-- Research-agent can make additional Exa searches after mandatory searches.
-- Evidence is stored in `parts_research`, not in Smart.
-- Smart stores clean catalog-shaped records.
-- Smart writes are drafts by default.
-- Human finalization happens manually in the database.
-- Components without article numbers may be represented as Smart drafts if Smart permits empty `articles` for draft rows.
-- Draft components without article numbers should use `name`; description is not forced for them.
-- No separate Smart `is_kit` column is needed.
-- Views are useful and should be added where they simplify agent or UI work.
+## Зафиксированные решения
 
-## Explicit Non-Goals
+- `parts_research` — основная рабочая база ресерча.
+- `smart_test` — база чистых Smart-результатов.
+- Smart доступен из `parts_research` через PostgreSQL FDW.
+- JSON сохраняется физически.
+- Итоговый JSON автоматически парсится в draft-таблицы.
+- Draft-данные привязаны к задачам и запускам.
+- Exa-cache работает только по exact-match.
+- Если Exa tool и arguments совпали полностью, используем старый ответ.
+- Если запрос отличается, делаем новый Exa-запрос.
+- Evidence хранится в `parts_research`, не в Smart.
+- Старые research results не передаются research-agent заранее.
+- Curator-agent может сам смотреть старые research results через SQL, если захочет.
+- Smart context через FDW может быть плагином/источником контекста.
+- Другие источники тоже подключаются как плагины.
+- Плагиновые данные не считаются гарантированной истиной.
+- Research-agent может делать дополнительные Exa-запросы.
+- Curator/write-agent может сам вызывать Exa.
+- Curator/write-agent может выполнять SQL.
+- Curator/write-agent не делегирует точечный допоиск другим агентам.
+- Smart-записи создаются draft по умолчанию.
+- Связи компонентов создаются unverified по умолчанию.
+- Человек вручную финализирует записи в БД.
+- Компоненты без артикулов можно записывать как draft, если Smart-схема это разрешает.
+- Для draft-компонентов без артикула пишем `name`, но не заставляем писать `description`.
+- Отдельное поле `is_kit` в Smart не нужно.
+- Views можно и нужно добавлять там, где они упрощают SQL, работу агента или UI.
 
-The current design does not include:
+## Что сейчас не делаем
 
-- fuzzy Exa cache matching;
-- sending old research results to every new research-agent run by default;
-- a complex workflow engine;
-- automatic finalization of Smart records;
-- mandatory approval for every SQL write;
-- storing raw source evidence inside Smart tables;
-- treating marketplace/plugin data as authoritative truth;
-- forcing complete kit composition before publishing a draft kit.
+Сейчас не делаем:
 
-## Summary
+- fuzzy Exa-cache;
+- передачу старых research results каждому новому research-agent;
+- сложный workflow engine;
+- авто-финализацию Smart-записей;
+- обязательное подтверждение каждого SQL write через UI;
+- хранение raw evidence внутри Smart-таблиц;
+- отношение к Avito/плагинам как к гарантированной истине;
+- требование полностью найти все компоненты набора перед draft-публикацией;
+- отдельный Smart-флаг `has_missing_article`;
+- отдельную Smart-колонку `is_kit`.
 
-The system should keep research messy where mess is useful and keep Smart clean where catalog quality matters.
+## Итоговая логика
 
-`parts_research` stores all research context, raw artifacts, draft parsing, evidence, Exa cache, and agent activity. `smart_test` stores only catalog-shaped output through normal Smart tables and draft flags.
+Система должна хранить messy research там, где он полезен, и держать Smart настолько чистым, насколько это возможно для draft-каталога.
 
-The agents should have enough tools to work independently, but the backend should keep deterministic responsibilities such as caching, raw artifact storage, JSON parsing, and Smart publication mapping clear and testable.
+`parts_research` отвечает за все промежуточное:
+
+- поиск;
+- источники;
+- доказательства;
+- raw JSON;
+- draft;
+- Exa cache;
+- плагины;
+- SQL-логи;
+- действия агентов.
+
+`smart_test` отвечает за каталожную форму:
+
+- parts;
+- components;
+- draft/final state;
+- unverified relations.
+
+Агенты должны иметь достаточно инструментов, чтобы работать самостоятельно, но детерминированные части должны оставаться в backend:
+
+- кэширование Exa;
+- сохранение raw artifacts;
+- парсинг JSON в draft;
+- публикация draft в Smart;
+- логирование SQL.
+
+Так система остается простой, проверяемой и расширяемой без лишней архитектуры.
