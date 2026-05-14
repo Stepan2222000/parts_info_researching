@@ -4,8 +4,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const PART_NUMBER = process.argv[2] ?? "21730348";
-const NUM_RESULTS = 13;
+const PART_NUMBER = process.argv[2] ?? "898253T23";
+const NUM_RESULTS = 10;
 const EXA_API_KEY = process.env.EXA_API_KEY ?? "";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -13,7 +13,13 @@ const tools = ["web_search_exa"].join(",");
 const exaUrl = new URL(`https://mcp.exa.ai/mcp?tools=${tools}`);
 
 function buildExaQuery(partNumber: string) {
-  return `Найди всю доступную информацию по артикулу ${partNumber}: точное название детали, бренд производитель OEM (ни в коем случае не aftermarket), старые номера old part number, новые номера new part number, superseded by, replaces, replacement, cross reference, interchange, применяемость fitment application к моделям годам двигателям, состав комплекта kit contents если это набор, вес weight, схемы exploded diagram parts catalog, официальные каталоги, магазины, PDF, объявления; важно найти источники где артикул ${partNumber} встречается явно в тексте страницы`;
+  return `Найди информацию только по точному артикулу "${partNumber}".
+
+Жесткое условие: в каждом полезном источнике строка "${partNumber}" должна явно встречаться в тексте страницы, title, highlights или description. Не используй похожие номера, частичные совпадения, переставленные цифры и номера без буквенного суффикса.
+
+Нужны: точное название детали, OEM-бренд, old/new part number, superseded by, replaces, replacement, cross reference, interchange, fitment/application, kit contents, weight, exploded diagram, parts catalog, PDF, магазины и объявления.
+
+Только OEM. Aftermarket-артикулы не нужны, но если aftermarket-страница явно пишет OEM replacement number "${partNumber}" или другой OEM-номер, можно использовать только OEM-номер.`;
 }
 
 function buildLowConfidenceQuery(partNumber: string, articles: string[]) {
@@ -38,11 +44,13 @@ function buildCodexPrompt(params: {
 - Создай только JSON-файл по указанному пути. Никаких markdown-файлов, txt-файлов или дополнительных отчетов.
 - Итоговый JSON должен быть на русском языке.
 - Не придумывай данные. Если поле не подтверждено Exa-сниппетами, ставь null, пустую строку, пустой массив или пустой объект по схеме.
-- Aftermarket не нужен. Не добавляй поле aftermarket. OEM-артикулы только от производителя/официальной OEM-линейки.
+- Используй только источники, где явно встречается входной артикул задачи или его нормализованный OEM-вариант. Похожие номера без точного совпадения игнорируй полностью.
+- В number-поля попадают только OEM-артикулы. Aftermarket-бренды и магазинные SKU не добавляй ни в article, ни в article_low_confidence, ни в irrelevant; из них можно взять только явно написанный OEM-номер.
 - Для Mercury/MerCruiser/Quicksilver/Mariner считай OEM-брендом "Mercury Marine".
+- Нормализуй варианты записи одного OEM-номера: для Mercury/Quicksilver отбрасывай групповой префикс до дефиса, если справа полный номер (87-892150Q02 -> 892150Q02); суффиксы продавца/бренда тоже не дублируй (24677251-VP -> 24677251).
 - Вес всегда указывай в килограммах. Если вес найден в фунтах/унциях/граммах, переведи в кг. Если вес не найден, weight = null.
 - numbers.article отсортируй так: сначала самые новые/актуальные OEM-артикулы, потом более старые. Не добавляй type/confidence.
-- numbers.article_low_confidence используй для OEM-кандидатов, где связи не хватает для уверенного вывода.
+- numbers.article_low_confidence используй только для OEM-кандидатов, где связи не хватает для уверенного вывода.
 - numbers.irrelevant добавляй только если есть реально отброшенные номера; для каждого нужен источник и обоснование.
 - Каждый article, article_low_confidence и irrelevant должен иметь source_url и evidence на русском: что в источнике написано и почему это доказывает или не доказывает связь.
 - models это объект с text/source_urls/evidence: в text перечисли применяемость по моделям с каждой новой строки. Если моделей нет или источники слабые, models = null.
@@ -159,12 +167,15 @@ function buildLowConfidencePrompt(params: {
 
 Правила обновления:
 - Используй только текущий JSON и дополнительный Exa JSON. В интернет не ходи. Никаких fetch, web search, MCP, браузера.
-- Если дополнительный Exa research явно подтвердил OEM-связь проверяемого артикула с ${params.partNumber}, перенеси его из numbers.article_low_confidence в numbers.article.
-- Если дополнительный Exa research не подтвердил связь, оставь артикул в numbers.article_low_confidence и обнови evidence / why_low_confidence.
-- Если дополнительный Exa research доказал, что артикул не относится к искомой OEM-детали или является aftermarket/другим товаром, перенеси его в numbers.irrelevant.
+- В number-полях оставляй только OEM-артикулы. Aftermarket-бренды и магазинные SKU удали из article_low_confidence и не переноси в irrelevant; из них можно взять только явно написанный OEM-номер.
+- Нормализуй варианты записи одного OEM-номера: для Mercury/Quicksilver отбрасывай групповой префикс до дефиса, если справа полный номер (87-892150Q02 -> 892150Q02); суффиксы продавца/бренда тоже не дублируй (24677251-VP -> 24677251).
+- Если Exa явно подтвердил OEM-связь проверяемого артикула с ${params.partNumber}, перенеси его в numbers.article.
+- Если связь не подтверждена, но это возможный OEM-кандидат, оставь его в numbers.article_low_confidence и обнови evidence / why_low_confidence.
+- Если доказано, что OEM-артикул относится к другой детали, перенеси его в numbers.irrelevant.
 - Один и тот же артикул не должен одновременно находиться в нескольких массивах.
 - Если в дополнительном Exa research найден новый OEM-артикул с явной связью superseded/replaces/interchange/cross reference, добавь его в numbers.article. Если связь слабая, добавь в numbers.article_low_confidence.
 - numbers.article отсортируй так: сначала самые новые/актуальные OEM-артикулы, потом более старые.
+- Это второй и последний проход уточнения: не делай новых запросов, зафиксируй итоговое решение по имеющимся данным.
 - Не добавляй верхнее поле sources.
 - Не добавляй поле aftermarket.
 - Не добавляй type/confidence у артикулов.
@@ -362,18 +373,29 @@ async function callExaSearch(query: string) {
   }
 }
 
+function assertExaResultHasExactPartNumber(exaResult: unknown, partNumber: string, exaJsonPath: string) {
+  const rawText = JSON.stringify(exaResult).toLowerCase();
+  if (!rawText.includes(partNumber.toLowerCase())) {
+    throw new Error(
+      `Exa result does not contain exact part number "${partNumber}". Raw Exa saved: ${exaJsonPath}`,
+    );
+  }
+}
+
 function getLowConfidenceArticles(value: unknown): string[] {
   validateStructuredResult(value);
   assertObject(value, "codex result");
   assertObject(value.numbers, "numbers");
   assertArray(value.numbers.article_low_confidence, "numbers.article_low_confidence");
 
-  return value.numbers.article_low_confidence.map((item, index) => {
+  const articles = value.numbers.article_low_confidence.map((item, index) => {
     assertObject(item, `numbers.article_low_confidence[${index}]`);
     const article = item.article;
     assertString(article, `numbers.article_low_confidence[${index}].article`);
     return article;
   });
+
+  return [...new Set(articles)];
 }
 
 async function main() {
@@ -407,6 +429,7 @@ async function main() {
       2,
     ),
   );
+  assertExaResultHasExactPartNumber(exaResult, PART_NUMBER, exaJsonPath);
 
   const prompt = buildCodexPrompt({
     partNumber: PART_NUMBER,
