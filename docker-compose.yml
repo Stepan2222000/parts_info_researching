@@ -6,6 +6,7 @@ services:
     command: ["npm", "run", "exa-proxy"]
     env_file: .env
     environment:
+      EXA_PROXY_HOST: "0.0.0.0"
       EXA_PROXY_PORT: "8765"
       STORAGE_ROOT: "/storage"
     volumes:
