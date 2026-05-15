@@ -8,6 +8,7 @@
     "submit": "tsx src/cli/submit.ts",
     "worker": "tsx src/cli/worker.ts",
     "exa-proxy": "tsx src/cli/exa-proxy.ts",
+    "curator": "tsx src/cli/curator.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

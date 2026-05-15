@@ -3,9 +3,12 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { getRunId, runCtxStorage } from "./runContext.js";
+import { getCuratorSessionId, getRunId, runCtxStorage } from "./runContext.js";
 import { cachedExaCall } from "./exaCached.js";
 import { writeResultForRun } from "./writeResult.js";
+import { executeSqlForCurator } from "../curator/tools/executeSql.js";
+import { saveToSmart, type SaveOp } from "../curator/tools/saveToSmart.js";
+import { markNeedsReview } from "../curator/tools/markNeedsReview.js";
 
 export type ExaProxyOptions = {
   port: number;
@@ -13,6 +16,8 @@ export type ExaProxyOptions = {
 };
 
 async function handleExaTool(toolName: string, args: Record<string, unknown>): Promise<unknown> {
+  // У research-агента есть runId, у куратора — curatorSessionId. Cache usage
+  // привязываем только к runId; для куратора hit/miss считается, но не пишется в exa_cache_usage.
   return cachedExaCall(toolName, args, getRunId());
 }
 
@@ -93,7 +98,7 @@ function buildMcpServer(): McpServer {
     {
       title: "Write Result",
       description:
-        "Validate and persist the final structured JSON for the current research run. Call this once you have collected all data; backend will validate and store it.",
+        "Research-only. Validate and persist the final structured JSON for the current research run. Call this once you have collected all data; backend will validate and store it.",
       inputSchema: {
         json: z
           .unknown()
@@ -107,7 +112,7 @@ function buildMcpServer(): McpServer {
       const runId = getRunId();
       if (runId === null) {
         return {
-          content: [{ type: "text", text: "ERROR: missing X-Run-Id header on this MCP request." }],
+          content: [{ type: "text", text: "ERROR: write_result is only available for research runs." }],
           isError: true,
         };
       }
@@ -126,6 +131,104 @@ function buildMcpServer(): McpServer {
           },
         ],
       };
+    },
+  );
+
+  server.registerTool(
+    "execute_sql",
+    {
+      title: "Execute SQL (curator)",
+      description:
+        "Curator-only. Run raw SQL on parts_research (+ smart.* and brand_mapping.* via FDW). Returns rows for SELECT or row_count for write ops. Every call is logged in agent_sql_log.",
+      inputSchema: {
+        sql: z.string().describe("Raw SQL. Multiple statements via ';' allowed."),
+      },
+    },
+    async (args) => {
+      const sid = getCuratorSessionId();
+      if (sid === null) {
+        return {
+          content: [{ type: "text", text: "ERROR: execute_sql is only available for curator sessions." }],
+          isError: true,
+        };
+      }
+      const outcome = await executeSqlForCurator(sid, args.sql);
+      if (!outcome.ok) {
+        return { content: [{ type: "text", text: `ERROR: ${outcome.error}` }], isError: true };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { command: outcome.command, row_count: outcome.row_count, rows: outcome.rows },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  server.registerTool(
+    "save_to_smart",
+    {
+      title: "Save to Smart (curator)",
+      description:
+        "Curator-only. Batch-publish operations to smart.* via FDW. Each op is INSERT with a per-row SAVEPOINT; a failed op doesn't break the rest. For every successful op a publications row is also written. Returns per-op {op_index, status, smart_id?, error?}.",
+      inputSchema: {
+        operations: z
+          .array(
+            z.object({
+              table: z.enum(["parts", "part_brands", "part_components"]),
+              action: z.literal("insert"),
+              fields: z.record(z.string(), z.unknown()),
+              run_id: z.number().int(),
+            }),
+          )
+          .min(1),
+      },
+    },
+    async (args) => {
+      const sid = getCuratorSessionId();
+      if (sid === null) {
+        return {
+          content: [{ type: "text", text: "ERROR: save_to_smart is only available for curator sessions." }],
+          isError: true,
+        };
+      }
+      const results = await saveToSmart(sid, args.operations as SaveOp[]);
+      return {
+        content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+      };
+    },
+  );
+
+  server.registerTool(
+    "mark_needs_review",
+    {
+      title: "Mark Needs Review (curator)",
+      description:
+        "Curator-only. Set task_run.status='needs_human_review' with the given reason. Use when data is collected but cannot be auto-published.",
+      inputSchema: {
+        run_id: z.number().int(),
+        reason: z.string().min(1),
+      },
+    },
+    async (args) => {
+      const sid = getCuratorSessionId();
+      if (sid === null) {
+        return {
+          content: [{ type: "text", text: "ERROR: mark_needs_review is only available for curator sessions." }],
+          isError: true,
+        };
+      }
+      const outcome = await markNeedsReview(args.run_id, args.reason);
+      if (!outcome.ok) {
+        return { content: [{ type: "text", text: `ERROR: ${outcome.error}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `OK: run ${args.run_id} marked as needs_human_review.` }] };
     },
   );
 
@@ -164,9 +267,14 @@ export async function startExaProxy(opts: ExaProxyOptions): Promise<{ close: () 
   async function handle(req: IncomingMessage, res: ServerResponse) {
     const sessionId = (req.headers["mcp-session-id"] as string | undefined) ?? undefined;
     const runIdHeader = req.headers["x-run-id"];
+    const curatorHeader = req.headers["x-curator-session-id"];
     const runId =
       typeof runIdHeader === "string" && /^\d+$/.test(runIdHeader)
         ? parseInt(runIdHeader, 10)
+        : null;
+    const curatorSessionId =
+      typeof curatorHeader === "string" && /^\d+$/.test(curatorHeader)
+        ? parseInt(curatorHeader, 10)
         : null;
 
     let body: unknown;
@@ -183,7 +291,7 @@ export async function startExaProxy(opts: ExaProxyOptions): Promise<{ close: () 
     }
 
     const { transport } = await getOrCreateSession(sessionId);
-    await runCtxStorage.run({ runId }, async () => {
+    await runCtxStorage.run({ runId, curatorSessionId }, async () => {
       try {
         await transport.handleRequest(req, res, body);
       } catch (err) {

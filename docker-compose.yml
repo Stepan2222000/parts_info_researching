@@ -1,0 +1,38 @@
+services:
+  exa_proxy:
+    image: ghcr.io/stepan2222000/parts-research:${IMAGE_TAG:-latest}
+    container_name: parts_research_exa_proxy
+    restart: unless-stopped
+    command: ["npm", "run", "exa-proxy"]
+    env_file: .env
+    environment:
+      EXA_PROXY_PORT: "8765"
+      STORAGE_ROOT: "/storage"
+    volumes:
+      - parts_research_storage:/storage
+    networks:
+      - db_default
+
+  worker:
+    image: ghcr.io/stepan2222000/parts-research:${IMAGE_TAG:-latest}
+    container_name: parts_research_worker
+    restart: unless-stopped
+    command: ["npm", "run", "worker"]
+    env_file: .env
+    environment:
+      EXA_PROXY_URL: "http://parts_research_exa_proxy:8765/"
+      STORAGE_ROOT: "/storage"
+    volumes:
+      - parts_research_storage:/storage
+      - /root/parts_research_app/codex:/root/.codex
+    networks:
+      - db_default
+    depends_on:
+      - exa_proxy
+
+volumes:
+  parts_research_storage:
+
+networks:
+  db_default:
+    external: true

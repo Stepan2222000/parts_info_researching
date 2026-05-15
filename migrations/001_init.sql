@@ -9,11 +9,17 @@
 -- На этапе 2: добавлены exa_cache, exa_cache_usage, plugin_payloads;
 -- brand_oem стал массивом; product_type и needs_review_reason появились;
 -- task_runs.started_at стал nullable (queued/running разделены явно).
+-- На этапе 3: добавлены curator_sessions, curator_messages, agent_sql_log,
+-- publications. На smart_fdw включён batch_size=50 для эффективной записи.
 -- ============================================================================
 
 -- ---------------------------------------------------------------------------
 -- Чистый перезапуск (для разработки).
 -- ---------------------------------------------------------------------------
+DROP TABLE IF EXISTS publications        CASCADE;
+DROP TABLE IF EXISTS agent_sql_log       CASCADE;
+DROP TABLE IF EXISTS curator_messages    CASCADE;
+DROP TABLE IF EXISTS curator_sessions    CASCADE;
 DROP TABLE IF EXISTS plugin_payloads     CASCADE;
 DROP TABLE IF EXISTS exa_cache_usage     CASCADE;
 DROP TABLE IF EXISTS exa_cache           CASCADE;
@@ -23,6 +29,8 @@ DROP TABLE IF EXISTS draft_part_articles CASCADE;
 DROP TABLE IF EXISTS draft_parts         CASCADE;
 DROP TABLE IF EXISTS task_runs           CASCADE;
 DROP TABLE IF EXISTS tasks               CASCADE;
+DROP TYPE  IF EXISTS publication_action;
+DROP TYPE  IF EXISTS curator_role;
 DROP TYPE  IF EXISTS article_confidence;
 DROP TYPE  IF EXISTS task_run_status;
 
@@ -44,6 +52,9 @@ CREATE TYPE article_confidence AS ENUM (
     'low_confidence',
     'irrelevant'
 );
+
+CREATE TYPE curator_role AS ENUM ('user', 'assistant', 'tool');
+CREATE TYPE publication_action AS ENUM ('insert', 'update');
 
 -- ---------------------------------------------------------------------------
 -- tasks: одна логическая задача на один артикул.
@@ -204,6 +215,69 @@ CREATE INDEX idx_plugin_payloads_run ON plugin_payloads(run_id);
 COMMENT ON TABLE plugin_payloads IS 'Данные source-плагинов (Smart, в будущем Avito и т.п.).';
 
 -- ---------------------------------------------------------------------------
+-- curator_sessions: одна строка на сессию (CLI REPL или вкладка в UI).
+-- ---------------------------------------------------------------------------
+CREATE TABLE curator_sessions (
+    id              BIGSERIAL PRIMARY KEY,
+    codex_thread_id TEXT,
+    working_dir     TEXT,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at        TIMESTAMPTZ
+);
+
+COMMENT ON TABLE curator_sessions IS 'Сессии куратора. Один thread Codex SDK на сессию.';
+
+-- ---------------------------------------------------------------------------
+-- curator_messages: история чата + tool calls.
+-- ---------------------------------------------------------------------------
+CREATE TABLE curator_messages (
+    id         BIGSERIAL PRIMARY KEY,
+    session_id BIGINT NOT NULL REFERENCES curator_sessions(id) ON DELETE CASCADE,
+    role       curator_role NOT NULL,
+    content    TEXT,
+    tool_call  JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_curator_messages_session ON curator_messages(session_id, id);
+
+COMMENT ON COLUMN curator_messages.content   IS 'Текст user/assistant. Для role=tool — NULL.';
+COMMENT ON COLUMN curator_messages.tool_call IS 'Для role=tool — полный McpToolCallItem (server/tool/arguments/result/error/status).';
+
+-- ---------------------------------------------------------------------------
+-- agent_sql_log: запись логируется ДО выполнения, потом UPDATE результатом.
+-- ---------------------------------------------------------------------------
+CREATE TABLE agent_sql_log (
+    id            BIGSERIAL PRIMARY KEY,
+    session_id    BIGINT NOT NULL REFERENCES curator_sessions(id) ON DELETE CASCADE,
+    sql_text      TEXT NOT NULL,
+    rows_affected INTEGER,
+    error         TEXT,
+    started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at   TIMESTAMPTZ
+);
+
+CREATE INDEX idx_agent_sql_log_session ON agent_sql_log(session_id, id);
+
+-- ---------------------------------------------------------------------------
+-- publications: трассировка run → Smart-запись.
+-- ---------------------------------------------------------------------------
+CREATE TABLE publications (
+    id                 BIGSERIAL PRIMARY KEY,
+    run_id             BIGINT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    curator_session_id BIGINT NOT NULL REFERENCES curator_sessions(id) ON DELETE CASCADE,
+    smart_table        TEXT NOT NULL,
+    smart_id           TEXT NOT NULL,
+    action             publication_action NOT NULL,
+    published_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_publications_run     ON publications(run_id);
+CREATE INDEX idx_publications_session ON publications(curator_session_id);
+
+COMMENT ON COLUMN publications.smart_id IS 'Для parts — id. Для part_brands — part_id. Для part_components — parent_id||"|"||child_id.';
+
+-- ---------------------------------------------------------------------------
 -- FDW: smart_test и brands_mapping.
 -- ---------------------------------------------------------------------------
 CREATE EXTENSION IF NOT EXISTS postgres_fdw;
@@ -211,7 +285,7 @@ CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 DROP SERVER IF EXISTS smart_fdw CASCADE;
 CREATE SERVER smart_fdw
     FOREIGN DATA WRAPPER postgres_fdw
-    OPTIONS (host 'smart_test', port '5432', dbname 'smart_test');
+    OPTIONS (host 'smart_test', port '5432', dbname 'smart_test', batch_size '50');
 
 DROP SERVER IF EXISTS brand_mapping_fdw CASCADE;
 CREATE SERVER brand_mapping_fdw

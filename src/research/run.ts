@@ -1,6 +1,7 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { relative, resolve } from "node:path";
 import { CODEX_RULES_PATH, EXA_PROXY_URL, PROJECT_ROOT, STORAGE_ROOT } from "../config.js";
+import { pool } from "../db/pool.js";
 import { saveDraftResult } from "../db/drafts.js";
 import {
   loadAllowedBrands,
@@ -42,6 +43,7 @@ const ARTICLE_RE = /^[A-Z0-9\-]+$/;
 
 export class NoExactDataError extends Error {}
 export class ValidationError extends Error {}
+export class AlreadyFinalizedError extends Error {}
 
 export type RunResult = {
   taskId: number;
@@ -51,8 +53,18 @@ export type RunResult = {
 };
 
 // Из CLI/submit: создать task + queued-run без выполнения.
+// До создания task проверяем через FDW, что артикул не финализирован в Smart.
 export async function enqueueResearch(rawArticle: string): Promise<{ taskId: number; runId: number; article: string }> {
   const article = normalizeArticle(rawArticle);
+  const { rowCount } = await pool.query(
+    "SELECT 1 FROM smart.parts WHERE $1 = ANY(articles) AND is_draft = false LIMIT 1",
+    [article],
+  );
+  if ((rowCount ?? 0) > 0) {
+    throw new AlreadyFinalizedError(
+      `article ${article} is already finalized in Smart (is_draft=false), research skipped`,
+    );
+  }
   const taskId = await createTask(article);
   const runId = await createQueuedRun(taskId);
   return { taskId, runId, article };

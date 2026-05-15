@@ -1,0 +1,14 @@
+node_modules
+.git
+.github
+.env
+.env.*
+storage
+codex_results
+exa_results
+research_part.ts
+IMPLEMENTATION_PLAN.md
+PARTS_RESEARCH_SPEC.md
+DEPLOY_TEMPLATE.md
+*.md.bak
+.DS_Store
