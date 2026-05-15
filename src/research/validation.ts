@@ -1,5 +1,4 @@
-// Валидация структурного JSON от research-агента.
-// Логика максимально близка к research_part.ts — это перенос без переработки.
+// Валидация структурного JSON от research-агента (этап 2).
 
 export type ArticleItem = {
   article: string;
@@ -32,7 +31,8 @@ export type PartOfKit = {
 export type StructuredResult = {
   task_part_number: string;
   name: string | null;
-  brand_oem: string | null;
+  brand_oem: string[];
+  product_type: string | null;
   description: string | null;
   weight: WeightBlock | null;
   models: ModelsBlock | null;
@@ -46,125 +46,113 @@ export type StructuredResult = {
   };
 };
 
-function assertObject(value: unknown, name: string): asserts value is Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+export type ValidationContext = {
+  expectedPartNumber: string;
+  allowedBrands: string[];
+  allowedProductTypes: string[];
+};
+
+function assertObject(v: unknown, name: string): asserts v is Record<string, unknown> {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) {
     throw new Error(`${name} must be an object`);
   }
 }
 
-function assertArray(value: unknown, name: string): asserts value is unknown[] {
-  if (!Array.isArray(value)) {
-    throw new Error(`${name} must be an array`);
-  }
+function assertArray(v: unknown, name: string): asserts v is unknown[] {
+  if (!Array.isArray(v)) throw new Error(`${name} must be an array`);
 }
 
-function assertString(value: unknown, name: string): asserts value is string {
-  if (typeof value !== "string" || value.trim() === "") {
+function assertString(v: unknown, name: string): asserts v is string {
+  if (typeof v !== "string" || v.trim() === "") {
     throw new Error(`${name} must be a non-empty string`);
   }
 }
 
-function assertRequiredKeys(
-  value: Record<string, unknown>,
-  keys: string[],
-  name: string,
-): void {
-  for (const key of keys) {
-    if (!(key in value)) {
-      throw new Error(`Missing key in ${name}: ${key}`);
-    }
-  }
+function assertRequiredKeys(o: Record<string, unknown>, keys: string[], name: string): void {
+  for (const k of keys) if (!(k in o)) throw new Error(`Missing key in ${name}: ${k}`);
 }
 
 function samePartNumber(a: string, b: string): boolean {
   return a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
-function findMatchingPartNumber(value: string, partNumbers: string[]): string | null {
-  return partNumbers.find((p) => samePartNumber(value, p)) ?? null;
+function findMatching(value: string, list: string[]): string | null {
+  return list.find((p) => samePartNumber(value, p)) ?? null;
 }
 
 function validateArticleList(
-  value: unknown[],
+  list: unknown[],
   name: "numbers.article" | "numbers.article_low_confidence" | "numbers.irrelevant",
 ): void {
-  for (const [i, item] of value.entries()) {
-    const itemName = `${name}[${i}]`;
-    assertObject(item, itemName);
-    assertString(item.article, `${itemName}.article`);
-    assertString(item.source_url, `${itemName}.source_url`);
-    assertString(item.evidence, `${itemName}.evidence`);
-
+  for (const [i, item] of list.entries()) {
+    const n = `${name}[${i}]`;
+    assertObject(item, n);
+    assertString(item.article, `${n}.article`);
+    assertString(item.source_url, `${n}.source_url`);
+    assertString(item.evidence, `${n}.evidence`);
     if (name === "numbers.article_low_confidence") {
-      assertString(item.why_low_confidence, `${itemName}.why_low_confidence`);
+      assertString(item.why_low_confidence, `${n}.why_low_confidence`);
     }
     if (name === "numbers.irrelevant") {
-      assertString(item.why_irrelevant, `${itemName}.why_irrelevant`);
+      assertString(item.why_irrelevant, `${n}.why_irrelevant`);
     }
   }
 }
 
-function validateKitContents(
-  value: Record<string, unknown>,
-  ownPartNumbers: string[],
-): void {
+function validateKitContents(value: Record<string, unknown>, ownPartNumbers: string[]): void {
   for (const [key, item] of Object.entries(value)) {
-    const itemName = `kit_contents.${key}`;
-    const matchingKey = findMatchingPartNumber(key, ownPartNumbers);
-    if (matchingKey !== null) {
-      throw new Error(`${itemName} must not use own part article ${matchingKey} as a kit component`);
+    const n = `kit_contents.${key}`;
+    const conflictKey = findMatching(key, ownPartNumbers);
+    if (conflictKey !== null) {
+      throw new Error(`${n} must not use own part article ${conflictKey} as a kit component`);
     }
-    assertObject(item, itemName);
+    assertObject(item, n);
     assertRequiredKeys(
       item,
       ["article", "name", "quantity", "description", "source_url", "evidence"],
-      itemName,
+      n,
     );
-
     if (item.article !== null) {
-      assertString(item.article, `${itemName}.article`);
-      const matchingArticle = findMatchingPartNumber(item.article, ownPartNumbers);
-      if (matchingArticle !== null) {
-        throw new Error(
-          `${itemName}.article must not equal own part article ${matchingArticle}`,
-        );
+      assertString(item.article, `${n}.article`);
+      const conflictArt = findMatching(item.article, ownPartNumbers);
+      if (conflictArt !== null) {
+        throw new Error(`${n}.article must not equal own part article ${conflictArt}`);
       }
     }
-    if (item.name !== null) assertString(item.name, `${itemName}.name`);
+    if (item.name !== null) assertString(item.name, `${n}.name`);
     if (item.quantity !== null && typeof item.quantity !== "number") {
-      throw new Error(`${itemName}.quantity must be a number or null`);
+      throw new Error(`${n}.quantity must be a number or null`);
     }
-    if (item.description !== null) assertString(item.description, `${itemName}.description`);
-
-    assertString(item.source_url, `${itemName}.source_url`);
-    assertString(item.evidence, `${itemName}.evidence`);
+    if (item.description !== null) assertString(item.description, `${n}.description`);
+    assertString(item.source_url, `${n}.source_url`);
+    assertString(item.evidence, `${n}.evidence`);
   }
 }
 
-function validatePartOfKits(value: unknown[]): void {
-  for (const [i, item] of value.entries()) {
-    const name = `part_of_kits[${i}]`;
-    assertObject(item, name);
-    assertRequiredKeys(item, ["kit_article", "kit_name", "source_url", "evidence"], name);
-    if (item.kit_article !== null) assertString(item.kit_article, `${name}.kit_article`);
-    assertString(item.kit_name, `${name}.kit_name`);
-    assertString(item.source_url, `${name}.source_url`);
-    assertString(item.evidence, `${name}.evidence`);
+function validatePartOfKits(list: unknown[]): void {
+  for (const [i, item] of list.entries()) {
+    const n = `part_of_kits[${i}]`;
+    assertObject(item, n);
+    assertRequiredKeys(item, ["kit_article", "kit_name", "source_url", "evidence"], n);
+    if (item.kit_article !== null) assertString(item.kit_article, `${n}.kit_article`);
+    assertString(item.kit_name, `${n}.kit_name`);
+    assertString(item.source_url, `${n}.source_url`);
+    assertString(item.evidence, `${n}.evidence`);
   }
 }
 
 export function validateStructuredResult(
   value: unknown,
-  expectedPartNumber: string,
+  ctx: ValidationContext,
 ): asserts value is StructuredResult {
   assertObject(value, "codex result");
-
   assertRequiredKeys(
     value,
     [
       "task_part_number",
       "name",
       "brand_oem",
+      "product_type",
       "description",
       "weight",
       "models",
@@ -176,17 +164,38 @@ export function validateStructuredResult(
     "codex result",
   );
 
-  if (value.task_part_number !== expectedPartNumber) {
+  if (value.task_part_number !== ctx.expectedPartNumber) {
     throw new Error(
-      `task_part_number must be ${expectedPartNumber}, got ${String(value.task_part_number)}`,
+      `task_part_number must be ${ctx.expectedPartNumber}, got ${String(value.task_part_number)}`,
     );
   }
 
+  // brand_oem: массив строк, каждая — один из allowedBrands.
+  assertArray(value.brand_oem, "brand_oem");
+  for (const [i, b] of value.brand_oem.entries()) {
+    assertString(b, `brand_oem[${i}]`);
+    if (!ctx.allowedBrands.includes(b)) {
+      throw new Error(
+        `brand_oem[${i}]=${b} is not in Smart brands list. Allowed: ${ctx.allowedBrands.join(", ")}`,
+      );
+    }
+  }
+
+  // product_type: string | null, либо одно из allowedProductTypes.
+  if (value.product_type !== null) {
+    assertString(value.product_type, "product_type");
+    if (!ctx.allowedProductTypes.includes(value.product_type)) {
+      throw new Error(
+        `product_type=${value.product_type} not in Smart product_types: ${ctx.allowedProductTypes.join(" | ")}`,
+      );
+    }
+  }
+
+  if (typeof value.is_kit !== "boolean") throw new Error("is_kit must be a boolean");
   assertObject(value.kit_contents, "kit_contents");
   assertArray(value.part_of_kits, "part_of_kits");
   assertObject(value.numbers, "numbers");
 
-  if (typeof value.is_kit !== "boolean") throw new Error("is_kit must be a boolean");
   if (value.is_kit === false && Object.keys(value.kit_contents).length > 0) {
     throw new Error("kit_contents must be empty when is_kit is false");
   }
@@ -232,9 +241,8 @@ export function validateStructuredResult(
     return a;
   });
 
-  const hasTaskPN = ownPartNumbers.some((a) => samePartNumber(a, expectedPartNumber));
-  if (!hasTaskPN) {
-    throw new Error(`numbers.article must include task_part_number ${expectedPartNumber}`);
+  if (!ownPartNumbers.some((a) => samePartNumber(a, ctx.expectedPartNumber))) {
+    throw new Error(`numbers.article must include task_part_number ${ctx.expectedPartNumber}`);
   }
 
   validateKitContents(value.kit_contents, ownPartNumbers);

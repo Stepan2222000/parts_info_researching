@@ -1,23 +1,41 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { relative, resolve } from "node:path";
-import { CODEX_RULES_PATH, STORAGE_ROOT, PROJECT_ROOT } from "../config.js";
+import { CODEX_RULES_PATH, EXA_PROXY_URL, PROJECT_ROOT, STORAGE_ROOT } from "../config.js";
 import { saveDraftResult } from "../db/drafts.js";
-import { createRun, createTask, finishRun, setRunStorage, setRunThreadId } from "../db/tasks.js";
-import { EXA_NUM_RESULTS, callExaSearch, exaResultContainsArticle } from "./exa.js";
-import { createResearchThread, runTurnStreamed } from "./codex.js";
 import {
-  buildCodexPrompt,
+  loadAllowedBrands,
+  loadAllowedProductTypes,
+  loadBrandAliases,
+} from "../db/context.js";
+import { savePluginPayload } from "../db/plugins.js";
+import {
+  createQueuedRun,
+  createTask,
+  ensureRunRunning,
+  finishRun,
+  setRunStorage,
+  setRunThreadId,
+  type TaskRunStatus,
+} from "../db/tasks.js";
+import { cachedExaCall } from "../exa_proxy/exaCached.js";
+import { fetchSmartContext, formatSmartContextForPrompt } from "../plugins/smart.js";
+import {
   buildExaQuery,
   buildKitContentsPrompt,
   buildKitContentsQuery,
   buildLowConfidencePrompt,
   buildLowConfidenceQuery,
+  buildMainPrompt,
+  type PromptContext,
 } from "./prompts.js";
+import { createResearchThread, runTurnStreamed } from "./codex.js";
+import { EXA_NUM_RESULTS, exaResultContainsArticle } from "./exa.js";
 import {
   getConfirmedArticles,
   getLowConfidenceArticles,
   validateStructuredResult,
   type StructuredResult,
+  type ValidationContext,
 } from "./validation.js";
 
 const ARTICLE_RE = /^[A-Z0-9\-]+$/;
@@ -28,25 +46,34 @@ export class ValidationError extends Error {}
 export type RunResult = {
   taskId: number;
   runId: number;
-  status: "done" | "failed_no_data" | "failed_validation";
+  status: TaskRunStatus;
   storageDir: string;
 };
 
-export async function runResearchTask(rawArticle: string): Promise<RunResult> {
-  const article = rawArticle.trim().toUpperCase();
-  if (!ARTICLE_RE.test(article)) {
-    throw new Error(`Article must match ${ARTICLE_RE}, got "${rawArticle}"`);
-  }
-
+// Из CLI/submit: создать task + queued-run без выполнения.
+export async function enqueueResearch(rawArticle: string): Promise<{ taskId: number; runId: number; article: string }> {
+  const article = normalizeArticle(rawArticle);
   const taskId = await createTask(article);
-  const runId = await createRun(taskId);
+  const runId = await createQueuedRun(taskId);
+  return { taskId, runId, article };
+}
+
+function normalizeArticle(raw: string): string {
+  const article = raw.trim().toUpperCase();
+  if (!ARTICLE_RE.test(article)) {
+    throw new Error(`Article must match ${ARTICLE_RE}, got "${raw}"`);
+  }
+  return article;
+}
+
+// Из worker'а или из одноразового CLI: выполнить уже существующий run.
+export async function executeRun(runId: number, article: string): Promise<RunResult> {
+  await ensureRunRunning(runId);
 
   const storageDirAbs = resolve(STORAGE_ROOT, "runs", String(runId));
   const storageDirRel = relative(PROJECT_ROOT, storageDirAbs);
   await mkdir(storageDirAbs, { recursive: true });
   await setRunStorage(runId, storageDirRel);
-
-  const codexRules = await readFile(CODEX_RULES_PATH, "utf8");
 
   const exaMainPath = resolve(storageDirAbs, "exa_main.json");
   const exaLowConfPath = resolve(storageDirAbs, "exa_low_confidence.json");
@@ -55,66 +82,71 @@ export async function runResearchTask(rawArticle: string): Promise<RunResult> {
   const messagesJsonlPath = resolve(storageDirAbs, "research_messages.jsonl");
 
   try {
-    // 1. Main Exa search.
-    const mainQuery = buildExaQuery(article);
-    const mainExa = await callExaSearch(mainQuery);
-    await writeFile(
-      exaMainPath,
-      JSON.stringify(
-        {
-          task_part_number: article,
-          tool: "web_search_exa",
-          num_results: EXA_NUM_RESULTS,
-          query: mainQuery,
-          raw_exa_result: mainExa,
-        },
-        null,
-        2,
-      ),
-    );
+    const codexRules = await readFile(CODEX_RULES_PATH, "utf8");
+    const [allowedBrands, allowedProductTypes, brandAliases, smartPayload] = await Promise.all([
+      loadAllowedBrands(),
+      loadAllowedProductTypes(),
+      loadBrandAliases(),
+      fetchSmartContext(article),
+    ]);
+    await savePluginPayload(runId, "smart", smartPayload);
 
+    const promptCtx: PromptContext = {
+      allowedBrands,
+      allowedProductTypes,
+      brandAliases,
+      smartContextMarkdown: formatSmartContextForPrompt(smartPayload),
+      codexRules,
+    };
+    const valCtx: ValidationContext = {
+      expectedPartNumber: article,
+      allowedBrands,
+      allowedProductTypes,
+    };
+
+    // 1. Основной Exa-поиск (через кэш).
+    const mainQuery = buildExaQuery(article);
+    const mainExa = await cachedExaCall(
+      "web_search_exa",
+      { query: mainQuery, numResults: EXA_NUM_RESULTS },
+      runId,
+    );
+    await writeExaFile(exaMainPath, article, mainQuery, mainExa);
     if (!exaResultContainsArticle(mainExa, article)) {
-      throw new NoExactDataError(
-        `Exa result does not contain exact part number "${article}"`,
-      );
+      throw new NoExactDataError(`Exa main search did not contain exact article "${article}".`);
     }
 
-    // 2. Codex first turn — основной структурный JSON.
-    const thread = createResearchThread(storageDirAbs);
+    // 2. Запускаем Codex thread с подключённым прокси.
+    const thread = createResearchThread({
+      workingDirectory: storageDirAbs,
+      runId,
+      exaProxyUrl: EXA_PROXY_URL,
+    });
+
     await runTurnStreamed(
       thread,
-      buildCodexPrompt({
+      buildMainPrompt({
         partNumber: article,
         exaJsonPath: exaMainPath,
         outputJsonPath: codexResultPath,
-        codexRules,
+        ctx: promptCtx,
       }),
       messagesJsonlPath,
     );
     if (thread.id) await setRunThreadId(runId, thread.id);
 
-    let result = await readAndValidate(codexResultPath, article);
+    let result = await readAndValidateResult(codexResultPath, valCtx);
 
     // 3. Low-confidence pass.
     const lowConf = getLowConfidenceArticles(result);
     if (lowConf.length > 0) {
       const q = buildLowConfidenceQuery(article, lowConf);
-      const exa = await callExaSearch(q);
-      await writeFile(
-        exaLowConfPath,
-        JSON.stringify(
-          {
-            task_part_number: article,
-            tool: "web_search_exa",
-            num_results: EXA_NUM_RESULTS,
-            query: q,
-            checked_articles: lowConf,
-            raw_exa_result: exa,
-          },
-          null,
-          2,
-        ),
+      const exa = await cachedExaCall(
+        "web_search_exa",
+        { query: q, numResults: EXA_NUM_RESULTS },
+        runId,
       );
+      await writeExaFile(exaLowConfPath, article, q, exa, { checked_articles: lowConf });
       await runTurnStreamed(
         thread,
         buildLowConfidencePrompt({
@@ -122,36 +154,25 @@ export async function runResearchTask(rawArticle: string): Promise<RunResult> {
           outputJsonPath: codexResultPath,
           lowConfidenceExaJsonPath: exaLowConfPath,
           articles: lowConf,
-          codexRules,
+          ctx: promptCtx,
         }),
         messagesJsonlPath,
       );
-      result = await readAndValidate(codexResultPath, article);
+      result = await readAndValidateResult(codexResultPath, valCtx);
     }
 
     // 4. Kit contents pass.
     if (result.is_kit) {
       const confirmed = getConfirmedArticles(result);
       const q = buildKitContentsQuery(article, confirmed);
-      const exa = await callExaSearch(q);
-      await writeFile(
-        exaKitPath,
-        JSON.stringify(
-          {
-            task_part_number: article,
-            tool: "web_search_exa",
-            num_results: EXA_NUM_RESULTS,
-            query: q,
-            raw_exa_result: exa,
-          },
-          null,
-          2,
-        ),
+      const exa = await cachedExaCall(
+        "web_search_exa",
+        { query: q, numResults: EXA_NUM_RESULTS },
+        runId,
       );
+      await writeExaFile(exaKitPath, article, q, exa);
       if (!exaResultContainsArticle(exa, article)) {
-        throw new NoExactDataError(
-          `Exa kit-contents result does not contain exact part number "${article}"`,
-        );
+        throw new NoExactDataError(`Kit contents Exa did not contain exact article "${article}".`);
       }
       await runTurnStreamed(
         thread,
@@ -159,45 +180,98 @@ export async function runResearchTask(rawArticle: string): Promise<RunResult> {
           partNumber: article,
           outputJsonPath: codexResultPath,
           kitContentsExaJsonPath: exaKitPath,
-          codexRules,
+          ctx: promptCtx,
         }),
         messagesJsonlPath,
       );
-      result = await readAndValidate(codexResultPath, article);
+      result = await readAndValidateResult(codexResultPath, valCtx);
     }
 
-    // 5. Parse into draft tables.
-    await saveDraftResult(runId, result);
-    await finishRun(runId, "done");
-    return { taskId, runId, status: "done", storageDir: storageDirRel };
+    // 5. Решаем итоговый статус.
+    const needsReviewReason = detectNeedsReview(result);
+    await saveDraftResult(runId, result, needsReviewReason);
+
+    const status: TaskRunStatus = needsReviewReason === null ? "done" : "needs_human_review";
+    await finishRun(runId, status, needsReviewReason ?? undefined);
+    return { taskId: -1, runId, status, storageDir: storageDirRel };
   } catch (err) {
     if (err instanceof NoExactDataError) {
       await finishRun(runId, "failed_no_data", err.message);
-      return { taskId, runId, status: "failed_no_data", storageDir: storageDirRel };
+      return { taskId: -1, runId, status: "failed_no_data", storageDir: storageDirRel };
     }
     if (err instanceof ValidationError) {
       await finishRun(runId, "failed_validation", err.message);
-      return { taskId, runId, status: "failed_validation", storageDir: storageDirRel };
+      return { taskId: -1, runId, status: "failed_validation", storageDir: storageDirRel };
     }
     await finishRun(runId, "failed_crashed", err instanceof Error ? err.message : String(err));
     throw err;
   }
 }
 
-async function readAndValidate(path: string, article: string): Promise<StructuredResult> {
+// Совмещённый путь для одноразового CLI (npm run research -- ART): enqueue + execute сразу.
+export async function runResearchTask(rawArticle: string): Promise<RunResult> {
+  const { runId, article, taskId } = await enqueueResearch(rawArticle);
+  const r = await executeRun(runId, article);
+  return { ...r, taskId };
+}
+
+function detectNeedsReview(r: StructuredResult): string | null {
+  if (r.is_kit && Object.keys(r.kit_contents).length === 0) {
+    return "kit_without_contents";
+  }
+  if (r.product_type === null) {
+    return "product_type_unknown";
+  }
+  return null;
+}
+
+async function readAndValidateResult(
+  path: string,
+  ctx: ValidationContext,
+): Promise<StructuredResult> {
+  try {
+    await stat(path);
+  } catch {
+    throw new ValidationError("agent did not call write_result for this turn");
+  }
   let parsed: unknown;
   try {
-    const text = await readFile(path, "utf8");
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(await readFile(path, "utf8"));
   } catch (err) {
-    throw new ValidationError(
-      `Failed to read/parse codex result: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    throw new ValidationError(`failed to parse codex result: ${msg(err)}`);
   }
   try {
-    validateStructuredResult(parsed, article);
+    validateStructuredResult(parsed, ctx);
   } catch (err) {
-    throw new ValidationError(err instanceof Error ? err.message : String(err));
+    throw new ValidationError(msg(err));
   }
   return parsed as StructuredResult;
+}
+
+async function writeExaFile(
+  absPath: string,
+  partNumber: string,
+  query: string,
+  rawExaResult: unknown,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  await writeFile(
+    absPath,
+    JSON.stringify(
+      {
+        task_part_number: partNumber,
+        tool: "web_search_exa",
+        num_results: EXA_NUM_RESULTS,
+        query,
+        ...extra,
+        raw_exa_result: rawExaResult,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+function msg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }

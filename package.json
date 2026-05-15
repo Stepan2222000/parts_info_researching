@@ -5,6 +5,9 @@
   "scripts": {
     "research": "tsx src/cli/research.ts",
     "research:legacy": "tsx research_part.ts",
+    "submit": "tsx src/cli/submit.ts",
+    "worker": "tsx src/cli/worker.ts",
+    "exa-proxy": "tsx src/cli/exa-proxy.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -13,7 +16,8 @@
     "@types/pg": "^8.20.0",
     "dotenv": "^17.4.2",
     "pg": "^8.20.0",
-    "tsx": "^4.21.0"
+    "tsx": "^4.21.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^25.7.0",

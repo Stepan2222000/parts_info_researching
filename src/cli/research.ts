@@ -1,3 +1,5 @@
+// Одноразовый прогон артикула без очереди и worker'а. Удобен для отладки.
+// Требует поднятый exa-proxy (npm run exa-proxy).
 import { pool } from "../db/pool.js";
 import { runResearchTask } from "../research/run.js";
 

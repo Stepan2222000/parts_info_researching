@@ -1,4 +1,116 @@
-// Промпты и запросы к Exa/Codex — перенос из research_part.ts один-в-один.
+// Промпты этапа 2: учитывают brand-маппинг, product_types, Smart-контекст,
+// инструмент write_result и общий набор Exa-инструментов.
+
+export type PromptContext = {
+  allowedBrands: string[];
+  allowedProductTypes: string[];
+  brandAliases: Array<{ alias: string; canonical: string }>;
+  smartContextMarkdown: string;
+  codexRules: string;
+};
+
+function brandMappingMarkdown(aliases: Array<{ alias: string; canonical: string }>): string {
+  if (aliases.length === 0) return "(маппинг пуст)";
+  const lines = ["| Alias | Smart-бренд |", "|---|---|"];
+  for (const { alias, canonical } of aliases) {
+    lines.push(`| ${alias} | ${canonical} |`);
+  }
+  return lines.join("\n");
+}
+
+function commonHeader(partNumber: string, ctx: PromptContext): string {
+  return `
+### Допустимые product_type (выбери ОДИН для поля product_type)
+${ctx.allowedProductTypes.map((p) => `- ${p}`).join("\n")}
+
+### Допустимые Smart-бренды (используй один или несколько в поле brand_oem)
+${ctx.allowedBrands.join(", ")}
+
+### Маппинг алиасов брендов → Smart-бренд
+${brandMappingMarkdown(ctx.brandAliases)}
+
+Любой бренд, который ты находишь в источниках, должен быть нормализован в Smart-бренд через этот маппинг. Если бренда нет ни в списке Smart, ни в маппинге — это значит, что мы пока не знаем такого OEM, оставь brand_oem пустым массивом.
+
+${ctx.smartContextMarkdown ? ctx.smartContextMarkdown + "\n" : ""}### Доступные инструменты
+- web_search_exa({query, numResults}) — поиск через Exa.
+- web_fetch_exa({urls, maxCharacters}) — забрать содержимое страницы как markdown. Использовать, если highlights из web_search_exa недостаточны.
+- write_result({json}) — единственный способ сохранить итоговый JSON. Backend сам валидирует и пишет файл.
+
+Помимо обязательных Exa-поисков, заложенных бэкендом, ты можешь делать дополнительные web_search_exa / web_fetch_exa запросы, если этого не хватает. Не зацикливайся — около 20 tool calls на весь thread.
+
+Жесткие правила:
+${ctx.codexRules}
+`.trim();
+}
+
+const SCHEMA_BLOCK = `Строгая JSON-схема результата:
+{
+  "task_part_number": "<входной артикул>",
+  "name": null,
+  "brand_oem": [],
+  "product_type": null,
+  "description": null,
+  "weight": null,
+  "models": null,
+  "is_kit": false,
+  "kit_contents": {},
+  "part_of_kits": [],
+  "numbers": {
+    "article": [],
+    "article_low_confidence": [],
+    "irrelevant": []
+  }
+}
+
+brand_oem — массив строк из Smart-брендов (например ["MERCRUISER"] или ["VOLVO", "MERCRUISER"]). Если бренд не определён — пустой массив, но это плохой исход, постарайся определить.
+
+product_type — одна из трёх Smart-строк ("Для автомобилей" / "Для мототехники" / "Для водного транспорта"). NULL только если из источников реально нельзя выбрать.
+
+Форматы weight / models / numbers.article / numbers.article_low_confidence / numbers.irrelevant / kit_contents / part_of_kits — как раньше:
+
+{
+  "weight": { "kg": 0.123, "source_url": "...", "evidence": "..." }
+}
+{
+  "models": { "text": "Bravo III\\nBravo Two", "source_urls": ["..."], "evidence": "..." }
+}
+{
+  "numbers": {
+    "article":            [{ "article": "...", "source_url": "...", "evidence": "..." }],
+    "article_low_confidence":[{ "article": "...", "source_url": "...", "evidence": "...", "why_low_confidence": "..." }],
+    "irrelevant":         [{ "article": "...", "source_url": "...", "evidence": "...", "why_irrelevant": "..." }]
+  }
+}
+{
+  "kit_contents": {
+    "<артикул или unknown_N>": {
+      "article": "<или null>",
+      "name": "...",
+      "quantity": 1,
+      "description": "...",
+      "source_url": "...",
+      "evidence": "..."
+    }
+  }
+}
+[
+  { "kit_article": "<или null>", "kit_name": "...", "source_url": "...", "evidence": "..." }
+]
+
+is_kit:
+- true, если входной артикул — kit/set/комплект/набор/repair kit/anode kit и подобное.
+- false, если одиночная деталь.
+- При false kit_contents должен быть пустым объектом {}.
+
+Перед вызовом write_result сам проверь:
+- JSON валидный.
+- Все обязательные ключи на месте.
+- task_part_number равен заданному.
+- numbers.article содержит сам task_part_number.
+- brand_oem — массив из Smart-брендов (или пустой массив).
+- product_type — одна из трёх Smart-строк или null.
+- Никаких лишних полей вроде aftermarket/type/confidence.
+`;
 
 export function buildExaQuery(partNumber: string): string {
   return `Найди информацию только по точному артикулу "${partNumber}".
@@ -18,115 +130,28 @@ export function buildKitContentsQuery(partNumber: string, articles: string[]): s
   return `Найди точный состав OEM набора по исходному артикулу "${partNumber}" и подтвержденным OEM-номерам этого же набора в порядке актуальности: ${articles.join(", ")}. Ищи kit contents, includes, components, component part numbers, quantity, contents list, parts included, exploded diagram, parts catalog, PDF. Жесткое условие: в каждом полезном источнике должен явно встречаться хотя бы один из этих OEM-номеров набора: ${articles.join(", ")}. Нужны артикулы компонентов, названия компонентов, количество каждого компонента и источник, который подтверждает, что компонент входит именно в этот OEM-набор. Aftermarket не нужен.`;
 }
 
-export function buildCodexPrompt(params: {
+export function buildMainPrompt(params: {
   partNumber: string;
   exaJsonPath: string;
   outputJsonPath: string;
-  codexRules: string;
+  ctx: PromptContext;
 }): string {
   return `
-Ты отдельный Codex-агент для структурирования результата поиска по OEM-запчасти.
+Ты исследуешь OEM-запчасть по точному артикулу и собираешь структурированный JSON.
 
 Входной артикул задачи: ${params.partNumber}
-Файл с сохраненным сырым ответом Exa: ${params.exaJsonPath}
-Файл, который ты обязан создать: ${params.outputJsonPath}
+Файл с сохранённым ответом основного Exa-поиска: ${params.exaJsonPath}
+Файл, куда будет записан итог: ${params.outputJsonPath} (через инструмент write_result, сам файл не пиши)
 
-Жесткие правила:
-${params.codexRules}
+${commonHeader(params.partNumber, params.ctx)}
 
-Строгая JSON-схема результата:
-{
-  "task_part_number": "${params.partNumber}",
-  "name": null,
-  "brand_oem": null,
-  "description": null,
-  "weight": null,
-  "models": null,
-  "is_kit": false,
-  "kit_contents": {},
-  "part_of_kits": [],
-  "numbers": {
-    "article": [],
-    "article_low_confidence": [],
-    "irrelevant": []
-  }
-}
+${SCHEMA_BLOCK}
 
-Формат models, если найдена применяемость:
-{
-  "text": "Bravo III\\nBravo Two\\nBravo X Three",
-  "source_urls": ["https://...", "https://..."],
-  "evidence": "В источниках перечислены применимые модели ..."
-}
-
-Если применяемость не подтверждена источниками, models = null.
-
-Формат weight, если найден:
-{
-  "kg": 0.123,
-  "source_url": "https://...",
-  "evidence": "В источнике указан вес ..., это переведено в кг."
-}
-
-Формат numbers.article:
-{
-  "article": "8M0077471",
-  "source_url": "https://...",
-  "evidence": "В источнике написано ..., это подтверждает OEM-связь с ${params.partNumber}."
-}
-
-Формат numbers.article_low_confidence:
-{
-  "article": "879984A1",
-  "source_url": "https://...",
-  "evidence": "В источнике номер найден рядом с ${params.partNumber}, но нет явной фразы superseded/replaces/interchange.",
-  "why_low_confidence": "Нужна дополнительная проверка."
-}
-
-Формат numbers.irrelevant:
-{
-  "article": "18-6154M",
-  "source_url": "https://...",
-  "evidence": "В источнике это указано как Sierra/aftermarket или как другой товар.",
-  "why_irrelevant": "Это не OEM-кросс-номер искомой детали."
-}
-
-Формат kit_contents:
-{
-  "123456": {
-    "article": "123456 или null",
-    "name": "Название компонента",
-    "quantity": 1,
-    "description": "Что это за запчасть",
-    "source_url": "https://...",
-    "evidence": "В источнике указано, что этот компонент входит в комплект."
-  }
-}
-
-Формат part_of_kits:
-[
-  {
-    "kit_article": "123456",
-    "kit_name": "Название набора",
-    "source_url": "https://...",
-    "evidence": "В источнике указано, что ${params.partNumber} входит в этот набор."
-  }
-]
-
-Поле is_kit:
-- true, если входной артикул сам является набором/комплектом.
-- false, если входной артикул одиночная деталь или только входит в чужой набор.
-- Если is_kit = false, kit_contents должен быть пустым объектом.
-
-Перед записью проверь:
-- JSON валидный.
-- Обязательные верхние ключи есть по схеме.
-- Нет поля aftermarket.
-- Нет type/confidence у артикулов.
-- task_part_number равен "${params.partNumber}".
-- numbers.article содержит task_part_number "${params.partNumber}" с источником и evidence.
-
-Запиши итоговый JSON в файл: ${params.outputJsonPath}
+Шаги:
+1. Прочитай ${params.exaJsonPath}.
+2. При необходимости вызови дополнительные web_search_exa / web_fetch_exa.
+3. Сформируй итоговый JSON по схеме.
+4. Вызови write_result({"json": <итоговый JSON>}).
 `.trim();
 }
 
@@ -135,26 +160,25 @@ export function buildLowConfidencePrompt(params: {
   outputJsonPath: string;
   lowConfidenceExaJsonPath: string;
   articles: string[];
-  codexRules: string;
+  ctx: PromptContext;
 }): string {
   return `
-Продолжи работу с уже созданным JSON по OEM-запчасти.
+Продолжи работу с уже созданным JSON. Это уточнение по сомнительным артикулам.
 
 Входной артикул задачи: ${params.partNumber}
-Текущий структурированный JSON: ${params.outputJsonPath}
-Файл с дополнительным Exa research по сомнительным артикулам: ${params.lowConfidenceExaJsonPath}
-Проверяемые article_low_confidence: ${params.articles.join(", ")}
+Текущий JSON находится в: ${params.outputJsonPath} (читай его оттуда)
+Доп. Exa-поиск по сомнительным артикулам: ${params.lowConfidenceExaJsonPath}
+Проверяемые артикулы: ${params.articles.join(", ")}
+
+${commonHeader(params.partNumber, params.ctx)}
 
 Задача:
-- Прочитай текущий структурированный JSON.
+- Прочитай текущий JSON.
 - Прочитай дополнительный Exa JSON.
-- Обнови тот же файл: ${params.outputJsonPath}
-
-Правила обновления:
-${params.codexRules}
-- Один и тот же артикул не должен одновременно находиться в нескольких массивах.
-- Это второй и последний проход уточнения: не делай новых запросов, зафиксируй итоговое решение по имеющимся данным.
-- Запиши обновленный JSON в тот же файл: ${params.outputJsonPath}
+- Один и тот же артикул не должен находиться одновременно в нескольких массивах (article / article_low_confidence / irrelevant).
+- Зафиксируй итоговое решение по имеющимся данным.
+- Вызови write_result с обновлённым полным JSON.
+- Это финальный проход по low-confidence: новых web_search_exa делать не надо.
 `.trim();
 }
 
@@ -162,30 +186,27 @@ export function buildKitContentsPrompt(params: {
   partNumber: string;
   outputJsonPath: string;
   kitContentsExaJsonPath: string;
-  codexRules: string;
+  ctx: PromptContext;
 }): string {
   return `
-Продолжи работу с уже созданным JSON по OEM-набору.
+Продолжи работу с уже созданным JSON. Это уточнение по составу набора.
 
 Входной артикул задачи: ${params.partNumber}
-Текущий структурированный JSON: ${params.outputJsonPath}
-Файл с дополнительным Exa research по составу набора: ${params.kitContentsExaJsonPath}
+Текущий JSON: ${params.outputJsonPath}
+Доп. Exa-поиск по составу набора: ${params.kitContentsExaJsonPath}
+
+${commonHeader(params.partNumber, params.ctx)}
 
 Задача:
-- Прочитай текущий структурированный JSON.
+- Прочитай текущий JSON.
 - Прочитай дополнительный Exa JSON по составу набора.
-- Обнови kit_contents в том же файле: ${params.outputJsonPath}
-
-Правила обновления:
-${params.codexRules}
-- Это дополнительный проход только по составу набора. Не добавляй компоненты набора в numbers.article.
-- Если найден артикул компонента, используй его ключом kit_contents. Если артикул компонента неизвестен, используй unknown_1, unknown_2 и ставь article: null.
-- По каждому компоненту заполни article, name, quantity, description, source_url, evidence.
-- Никогда не ставь пустую строку "" в article компонента.
-- Если количество не найдено, quantity = null.
-- Если дополнительный Exa research не дал нового состава, оставь kit_contents как есть.
+- Обнови kit_contents:
+  - Если найден артикул компонента — используй его как ключ.
+  - Если артикул компонента неизвестен — используй ключи unknown_1, unknown_2 и ставь "article": null. Никогда не пиши пустую строку "" в article.
+  - Заполни article, name, quantity (или null), description, source_url, evidence.
+- Не трогай numbers.article — туда компоненты не добавляются.
 - is_kit должен остаться true.
-- Не делай новых запросов.
-- Запиши обновленный JSON в тот же файл: ${params.outputJsonPath}
+- Новых web_search_exa не делай, работай по имеющимся данным.
+- Вызови write_result с обновлённым полным JSON.
 `.trim();
 }

@@ -62,7 +62,7 @@
 Актуальная Smart-схема (см. `central_smart_logic/main.sql` + миграции):
 
 - `parts` — запчасти и наборы. Важные поля: `id` (генерится сам как `smart_XXXXXXXX`), `name`, `articles TEXT[]` (валидируется regex `^[A-Z0-9\-]{4,20}$`, без дублей внутри массива, для опубликованных записей обязателен минимум один артикул), `description`, `product_type` (FK на `product_types(name)`), `model`, `weight_kg NUMERIC(8,3)`, `is_draft`.
-- `brands(name PK)` — справочник Smart-брендов в UPPER_SNAKE_CASE. Текущий список: BRP, MERCRUISER, POLARIS, SUZUKI, HONDA, VOLVO, YAMAHA, ARCTIC_CAT, SEASTAR.
+- `brands(name PK)` — справочник Smart-брендов в UPPER_SNAKE_CASE. Точный список не хардкодим в коде — грузим из `smart.brands` через FDW при старте каждого run`а и подмешиваем в system-prompt research-agent`а. На момент написания спеки в smart есть 13 брендов: ARCTIC_CAT, AUDI, BRP, HONDA, LAND_ROVER, MERCEDES_BENZ, MERCRUISER, OMC, POLARIS, SEASTAR, SUZUKI, VOLVO, YAMAHA. Список может расти.
 - `part_brands(part_id, brand)` — M:N связка. Для `is_draft = false` минимум один бренд обязателен.
 - `part_articles(article PK, part_id)` — глобально-уникальный реестр обычных артикулов, синхронизируется триггером. Гарантирует, что один артикул не может принадлежать двум разным smart_id.
 - `part_components(parent_id, child_id, quantity, can_be_sold_separately, is_unverified)` — состав наборов, циклы запрещены триггером.
@@ -77,9 +77,9 @@
 
 `brands_mapping` — отдельная база на хосте `194.164.245.107:5411`, db `brands_mapping`. Это reusable справочник, который будет использоваться и в других проектах.
 
-В ней лежит таблица `brand_aliases(alias TEXT PRIMARY KEY, canonical TEXT NOT NULL)`. Значения `canonical` всегда соответствуют названиям из Smart `brands.name` (BRP, MERCRUISER, ...).
+В ней лежит таблица `brand_aliases(alias TEXT PRIMARY KEY, canonical TEXT NOT NULL)`. Значения `canonical` всегда соответствуют названиям из Smart `brands.name`.
 
-Примеры сидинга: `Mercury → MERCRUISER`, `MerCruiser → MERCRUISER`, `Quicksilver → MERCRUISER`, `Mariner → MERCRUISER`, `Honda → HONDA`, `Volvo Penta → VOLVO` и так далее.
+Таблица заполняется руками одноразовыми INSERT`ами; примеры алиасов: `Mercury → MERCRUISER`, `MerCruiser → MERCRUISER`, `Quicksilver → MERCRUISER`, `Mariner → MERCRUISER`, `Honda → HONDA`, `Volvo Penta → VOLVO`, `Sea-Doo → BRP`, `Ski-Doo → BRP`, `Can-Am → BRP`, `Mercedes-Benz → MERCEDES_BENZ` и так далее. Полный набор живёт прямо в БД, не в коде — это растущая таблица.
 
 FK на Smart `brands` здесь нет, потому что это разные базы. Согласованность гарантируется тем, что curator перед записью бренда в Smart проверяет, что `canonical` действительно есть в `smart.brands`, либо это видно через FDW.
 
@@ -121,6 +121,20 @@ Smart через FDW также считается одним из источн�
 Очередь простая, FIFO, без приоритетов. Реализуется обычной таблицей `task_runs` со статусом, без отдельного workflow-движка и без Redis/BullMQ.
 
 Worker пуллит свободные задачи через `SELECT ... FOR UPDATE SKIP LOCKED LIMIT N`. Параллелизм — 30 одновременно выполняющихся research-runs. Дополнительные задачи лежат в `queued` и ждут.
+
+### Защита на этапе постановки в очередь
+
+Перед `INSERT INTO tasks` submit-команда обязательно делает проверку через FDW:
+
+```sql
+SELECT 1 FROM smart.parts WHERE $1 = ANY(articles) AND is_draft = false;
+```
+
+Если такая запись есть — артикул считается уже финализированным человеком, постановка в очередь отказывается с понятной ошибкой («article X is already finalized in Smart, research skipped»). Это самая ранняя точка защиты: бессмысленно гонять research, если результаты всё равно нельзя записать в Smart.
+
+Если запись в Smart есть, но `is_draft = true` — постановка в очередь разрешена; курсор позже сможет дополнить пустые поля.
+
+Если записи нет — постановка нормальная.
 
 Статусы run`а:
 
@@ -321,35 +335,41 @@ Curator — это судья и редактор перед записью в S
 
 Curator не подписан на новые draft автоматически. Он реагирует на сообщения пользователя в чате.
 
+### Технологический стек
+
+Curator — это **Codex thread** (тот же `@openai/codex-sdk`, что и у research-agent`а), но с моделью `gpt-5.5`. На этапе 3 общение с курсором идёт через CLI-чат (Node REPL). На этапе 4 поверх этого появляется веб-чат: фронт на Next.js использует **Vercel AI SDK v6** (`useChat`, streaming events) как транспорт; Next.js API route принимает сообщения и форвардит их в тот же Codex thread, стримя события (текст, tool calls, tool results) обратно на клиент. Логика и инструменты у курсора одинаковые в обоих режимах.
+
+Тулы у курсора подключаются через тот же MCP-proxy, что и у research-agent`а (`parts_research_proxy`). К существующим Exa-инструментам там добавляются курсор-специфичные `execute_sql`, `save_to_smart`, `mark_needs_review`. `X-Run-Id` для куратора не используется (он не привязан к одному run); вместо него прокси читает заголовок `X-Curator-Session-Id`, и инструменты курсора логируют свои действия в БД через эту сессию.
+
 ### Когда запускается
 
-- Пользователь открывает чат с куратором.
-- В system-prompt динамически склеивается актуальное состояние: сколько задач сейчас в статусе `done` и ждут обработки куратором, краткий список (task_id, артикул, что в draft).
+- Пользователь открывает чат с куратором (в этапе 3 — командой `npm run curator`; в этапе 4 — открыв вкладку в UI).
+- Перед каждым ответом курсора в начало user-сообщения backend добавляет актуальный snapshot очереди: сколько задач в статусе `done` без публикации, краткий список (task_id, артикул, run_id, что в draft).
 - Пользователь пишет «обработай N» или «обработай все».
-- Curator идет читать draft, evidence, Smart через FDW и публикует.
+- Curator идёт читать draft, evidence, Smart через FDW и публикует.
 
-System-prompt пересобирается при каждом сообщении пользователя — поэтому очередь, которую видит куратор, всегда актуальная.
+Snapshot пересобирается каждый раз — поэтому очередь, которую видит куратор, всегда актуальная.
 
 ### Что у него есть
 
-- `execute_sql({sql})` — сырой SQL по `parts_research`. Через FDW он видит `smart.*` и `brand_mapping.*`. Параметризация не вводится — агент сам пишет SQL. SQL injection не опасен, потому что доступ к куратору есть только у нас, а права БД-пользователя ограничены тремя базами.
-- `exa_search({query, numResults})` — прямой Exa через наш кэширующий proxy. Если куратору нужно уточнение, он сам делает поиск.
-- `save_to_smart(batch)` — основной инструмент записи. Принимает массив операций (создать draft part, создать компонент, создать связь, обновить поле). Выполняется как batch с per-row try/catch: если одна операция упала (например, дубль артикула в `part_articles`), откатывается только она, остальные записываются. Возвращает массив `{op_index, status: 'ok'|'error', smart_id?, error?}`. Tool можно вызывать параллельно — Vercel AI SDK v6 это поддерживает нативно.
-- `mark_needs_review({task_id, reason})` — пометить задачу как `needs_human_review`.
+- `execute_sql({sql})` — сырой SQL по `parts_research`. Через FDW он видит `smart.*` и `brand_mapping.*`. Параметризация не вводится — агент сам пишет SQL, в т.ч. многострочные с `BEGIN/COMMIT`. SQL injection не опасен: доступ к курсору только у нас, права БД-пользователя ограничены тремя базами. Каждый вызов логируется в `agent_sql_log`. Параллельно-вызываемый — модель может в одном turn`е сделать несколько `execute_sql` сразу.
+- `save_to_smart({operations: [...]})` — batch-tool для записи готовых данных. Принимает массив операций (`insert_part`, `update_part`, `add_brand`, `add_component`, `add_publication`, и т.п.). Выполняется в одной транзакции с per-row try/catch: если одна операция упала (например, дубль артикула в `part_articles`), откатывается только она, остальные сохраняются. Возвращает массив `{op_index, status: 'ok'|'error', smart_id?, error?}`. Тоже параллельно-вызываемый. Используется, когда курсор хочет одним вызовом записать партию по нескольким run`ам.
+- `exa_search({query, numResults})` / `web_fetch_exa({urls, maxCharacters})` — прямой Exa через тот же кэширующий proxy, что и у research-agent`а. Если курсору нужно уточнение, он сам делает поиск.
+- `mark_needs_review({run_id, reason})` — пометить run как `needs_human_review`. Параллельно-вызываемый.
 
-Отдельный `read_draft` не делаем — все доступно через `execute_sql`.
+Отдельный `read_draft` не делаем — всё доступно через `execute_sql`.
 
-Curator может делать параллельные tool calls (Vercel AI SDK v6 это умеет — модель в одном response может вызвать несколько tool`ов сразу). Этого достаточно, чтобы обрабатывать задачи батчем, не дожидаясь ответа от предыдущего вызова.
+Параллельные tool calls — это нативная фича Codex и gpt-5.5: модель сама решает, какие вызовы можно сделать в одном turn`е без ожидания результата от предыдущих.
 
 ### Сессии куратора
 
 Сессии куратора хранятся только в БД (никаких jsonl-файлов на диске). Структура:
 
-- `curator_sessions(id, started_at, ended_at)`;
+- `curator_sessions(id, started_at, ended_at, codex_thread_id)`;
 - `curator_messages(id, session_id, role, content, tool_calls, created_at)`;
 - `agent_sql_log(id, session_id, sql_text, rows_affected, error, executed_at)`.
 
-Новый чат на фронтенде = новая сессия. История прошлых сессий доступна как лог.
+Новая сессия = новый Codex thread + новая строка в `curator_sessions`. Между сессиями контекст не наследуется. История прошлых сессий доступна как лог.
 
 ### Правила записи в Smart
 
@@ -359,6 +379,7 @@ Curator работает по таким правилам (они прописы
 - Связи компонентов создаются с `is_unverified = true`.
 - Человек позже снимает флаги вручную в БД.
 - Авто-финализацию пока не делаем.
+- `can_be_sold_separately` в `part_components` не заполняем — оставляем дефолт (`false`). Это решение принимает человек позже.
 
 Маппинг:
 
@@ -373,14 +394,13 @@ Curator работает по таким правилам (они прописы
 
 Если значение неизвестно и Smart-поле допускает null — пишем null.
 
-### Конфликт с уже существующей Smart-записью
+### Поведение по `is_draft = false`
 
-Конфликта в обычном смысле нет: новые данные у нас всегда считаются верными. Но есть нюанс с `is_draft`:
+Основная защита — на уровне сабмита: задача с артикулом, для которого в Smart есть запись с `is_draft = false`, в очередь даже не ставится (см. раздел «Защита на этапе постановки в очередь»). Поэтому до курсора такие случаи в норме не доходят.
 
-- Если Smart-запись по этому артикулу уже существует и `is_draft = true` — curator может перезаписывать поля, потому что запись еще не финализирована человеком.
-- Если Smart-запись `is_draft = false` — curator НЕ перезаписывает существующие поля. Он только дополняет null-поля и может добавлять новые связи компонентов, чтобы не стереть ручную работу человека.
+Если курсор по какой-то причине всё-таки увидел в Smart запись с `is_draft = false` для своей задачи (например, кто-то финализировал её во время research`а), действие одно: пометить run как `needs_human_review` с reason `smart_finalized_during_research`, в Smart ничего не писать. Перезапись финализированных полей запрещена.
 
-Этот пункт явно прописывается в инструкции куратора.
+Если Smart-запись существует и `is_draft = true` — курсор может дополнять её. Не «перетирать ради перетирания», а заполнять null-поля и добавлять связи компонентов, которых ещё нет.
 
 ### Публикации
 
@@ -470,13 +490,7 @@ Storage — это один Docker volume, монтируется и в worker, 
 
 Frontend на Next.js. Backend тоже сначала на Next.js (route handlers + отдельный worker-скрипт на том же кодбейзе). Если позже окажется тесно — вынесем worker в отдельный сервис, но MVP делаем монолитом.
 
-Чат с куратором использует Vercel AI SDK v6:
-
-- `useChat`,
-- `streamText`,
-- tool calls,
-- streaming events,
-- typed tool/data parts.
+Чат с куратором в UI использует **Vercel AI SDK v6** (`useChat`, streaming events, typed tool/data parts) на стороне клиента. На стороне Next.js API route мы НЕ зовём `streamText` напрямую: вместо этого route форвардит входящее сообщение пользователя в нашу серверную обвязку над Codex thread`ом курсора и стримит обратно события (текст, mcp_tool_call с in_progress/completed, agent_message). Vercel AI SDK здесь работает как удобный транспортный слой и React-хуки UI, а собственно «мозг» курсора живёт в Codex SDK с моделью `gpt-5.5`. То есть `useChat` ↔ Next.js route ↔ Codex thread, без второго LLM.
 
 Чата с research-agent`ом нет. С ним не переписываемся напрямую, его визуализация не нужна. Прогресс research-runs показывается в UI как карточки задач со стримингом статусов (через polling в начале, при необходимости перейдем на SSE).
 
@@ -500,10 +514,10 @@ UI должен показывать:
 - Next.js (frontend + backend API).
 - Node-процесс worker`а (тот же кодбейс).
 - Node-процесс Exa-proxy MCP (тот же кодбейс, отдельный entrypoint).
-- PostgreSQL 18 для `parts_research`. Для `smart_test` и `brands_mapping` — уже существующие инстансы.
+- PostgreSQL 18. Все три БД (`parts_research`, `smart_test`, `brands_mapping`) — уже существующие контейнеры на сервере; новые БД не поднимаем.
 - `postgres_fdw` для связи с Smart и brand_mapping.
-- `@openai/codex-sdk` для research-agent.
-- Vercel AI SDK v6 для куратора.
+- `@openai/codex-sdk` для research-agent (модель по умолчанию) и для куратора (модель `gpt-5.5`).
+- Vercel AI SDK v6 на фронте — как UI-транспорт чата куратора (см. раздел UI).
 - `@modelcontextprotocol/sdk` для MCP-клиента и нашего proxy-сервера.
 
 ### DDL
@@ -523,16 +537,15 @@ UI должен показывать:
 
 ## Деплой
 
-Деплой идет по тому же шаблону, что описан в `DEPLOY_TEMPLATE.md`: GHA + Docker Build Cloud + ghcr.io + SSH на `194.164.245.107`. Все Postgres-контейнеры (включая `smart_test` и `brands_mapping`) висят в Docker-сети `db_default`. Новый `parts_research` Postgres тоже сидит в этой же сети.
+Деплой идет по тому же шаблону, что описан в `DEPLOY_TEMPLATE.md`: GHA + Docker Build Cloud + ghcr.io + SSH на `194.164.245.107`. Все три Postgres-контейнера (`parts_research`, `smart_test`, `brands_mapping`) уже подняты на сервере, висят в Docker-сети `db_default`. Новый постгрес поднимать не надо.
 
-Контейнеры:
+Поднимаем только наши процессы как контейнеры (тоже в `db_default`, чтобы хостили постгресы по короткому hostname):
 
-- `parts_research_db` — Postgres 18 с `postgres_fdw`;
-- `parts_research_app` — Next.js приложение (API + UI);
-- `parts_research_worker` — Node-процесс с воркер-пулом research-runs;
-- `parts_research_exa_proxy` — наш MCP-сервер для кэширования Exa.
+- `parts_research_app` — Next.js приложение (API + UI), на этапе 4.
+- `parts_research_worker` — Node-процесс с воркер-пулом research-runs.
+- `parts_research_exa_proxy` — Node-процесс MCP-прокси (Exa-кэш + write_result + curator-tools).
 
-Точные детали (имена volume, маппинг портов, авторизация ghcr) уточняются на этапе деплоя.
+Точные детали (имена volume, маппинг портов, авторизация ghcr, `auth.json` в персистентном volume) уточняются на этапе деплоя.
 
 ## Бэкап и destructive операции
 
@@ -582,14 +595,16 @@ SQL tool куратора технически не ограничен по ти
 - Research-agent может вернуть массив брендов (VOLVO + MERCRUISER и т.п.).
 - product_type обязателен; если не определен — `needs_human_review`.
 - Только один curator на всю систему.
+- Curator реализован на Codex SDK с моделью `gpt-5.5` (один thread на сессию).
+- В UI чат строится поверх Codex thread`а: фронт использует Vercel AI SDK v6 как транспорт, Next.js route форвардит сообщения в Codex thread.
 - Curator запускается только когда пользователь пишет ему в чат «обработай».
-- System-prompt куратора пересобирается каждый раз с актуальным состоянием очереди.
-- Curator может вызывать tool`ы параллельно (Vercel AI SDK v6).
-- `save_to_smart` — batch tool с per-row try/catch (partial rollback).
+- Snapshot очереди подмешивается в начало каждого user-сообщения куратору, чтобы он всегда видел актуальное состояние.
+- У куратора есть четыре tool`а: `execute_sql`, `save_to_smart` (batch с per-row try/catch), `exa_search`/`web_fetch_exa`, `mark_needs_review`. Все параллельно-вызываемые.
+- Защита от записи в финализированные `is_draft = false` — на submit-уровне: задача с таким артикулом в очередь не ставится.
+- `can_be_sold_separately` в `smart.part_components` не заполняем; остаётся дефолт `false`.
 - Curator не делегирует точечный допоиск другим агентам — сам делает Exa.
 - Smart-записи по умолчанию `is_draft = true`, связи компонентов `is_unverified = true`.
 - Человек вручную финализирует записи в БД.
-- Если Smart-запись `is_draft = false` — curator не перезаписывает существующие поля, только дополняет null.
 - Компоненты без артикулов разрешены как draft (с `name`, без `description`).
 - Kit без состава → `needs_human_review`.
 - Aftermarket-only / weight в нераспознанных единицах → `failed_no_data`.
@@ -600,9 +615,9 @@ SQL tool куратора технически не ограничен по ти
 - SQL tool куратора без ограничений по типу запросов; права БД-юзера ограничены тремя базами.
 - Schema создается одним SQL-файлом, миграции — отдельными SQL через терминал.
 - Никаких ORM-миграторов.
-- Стек: TypeScript, Next.js (frontend + API), Node worker, Node MCP-proxy, PostgreSQL 18.
-- UI: чат через Vercel AI SDK v6 только с куратором; прогресс research через polling/SSE.
-- Деплой: GHA + DBC + ghcr.io + SSH; контейнеры в `db_default` Docker-сети.
+- Стек: TypeScript, Next.js (frontend + API), Node worker, Node MCP-proxy, PostgreSQL 18 (БД уже подняты).
+- UI: чат куратора в React реализован через Vercel AI SDK v6 как транспорт; прогресс research через polling/SSE.
+- Деплой: GHA + DBC + ghcr.io + SSH; новые контейнеры (`parts_research_worker`, `parts_research_exa_proxy`, `parts_research_app`) висят в `db_default` Docker-сети рядом с уже живыми postgres-контейнерами.
 
 ## Что сейчас не делаем
 

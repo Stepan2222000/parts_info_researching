@@ -2,25 +2,29 @@
 -- parts_research initial schema
 -- PostgreSQL 18
 -- ============================================================================
--- Этот файл — единственный источник правды по схеме. По мере роста системы
--- (этапы 2 и 3 из IMPLEMENTATION_PLAN.md) сюда добавляются новые таблицы
--- редактированием этого же файла. Миграции применяются через psql вручную.
+-- Единственный источник правды по схеме. Этапы из IMPLEMENTATION_PLAN.md
+-- добавляют новые таблицы редактированием этого же файла; миграции
+-- применяются psql-ом вручную.
 --
--- Сейчас здесь — всё, что нужно для этапа 1: tasks, runs, draft-таблицы для
--- одного research-run. FDW-объекты тоже здесь, чтобы DDL был самодостаточным.
+-- На этапе 2: добавлены exa_cache, exa_cache_usage, plugin_payloads;
+-- brand_oem стал массивом; product_type и needs_review_reason появились;
+-- task_runs.started_at стал nullable (queued/running разделены явно).
 -- ============================================================================
 
 -- ---------------------------------------------------------------------------
 -- Чистый перезапуск (для разработки).
 -- ---------------------------------------------------------------------------
-DROP TABLE IF EXISTS draft_part_of_kits CASCADE;
+DROP TABLE IF EXISTS plugin_payloads     CASCADE;
+DROP TABLE IF EXISTS exa_cache_usage     CASCADE;
+DROP TABLE IF EXISTS exa_cache           CASCADE;
+DROP TABLE IF EXISTS draft_part_of_kits  CASCADE;
 DROP TABLE IF EXISTS draft_kit_components CASCADE;
 DROP TABLE IF EXISTS draft_part_articles CASCADE;
-DROP TABLE IF EXISTS draft_parts CASCADE;
-DROP TABLE IF EXISTS task_runs CASCADE;
-DROP TABLE IF EXISTS tasks CASCADE;
-DROP TYPE IF EXISTS article_confidence;
-DROP TYPE IF EXISTS task_run_status;
+DROP TABLE IF EXISTS draft_parts         CASCADE;
+DROP TABLE IF EXISTS task_runs           CASCADE;
+DROP TABLE IF EXISTS tasks               CASCADE;
+DROP TYPE  IF EXISTS article_confidence;
+DROP TYPE  IF EXISTS task_run_status;
 
 -- ---------------------------------------------------------------------------
 -- Типы.
@@ -43,7 +47,6 @@ CREATE TYPE article_confidence AS ENUM (
 
 -- ---------------------------------------------------------------------------
 -- tasks: одна логическая задача на один артикул.
--- Повторный запуск по тому же артикулу создаёт НОВУЮ task (см. план, этап 1).
 -- ---------------------------------------------------------------------------
 CREATE TABLE tasks (
     id         BIGSERIAL PRIMARY KEY,
@@ -53,12 +56,11 @@ CREATE TABLE tasks (
 
 CREATE INDEX idx_tasks_article ON tasks(article);
 
-COMMENT ON TABLE  tasks            IS 'Задачи ресерча. Один артикул = одна task (на этапе 1, без дедупликации).';
-COMMENT ON COLUMN tasks.article    IS 'Входной артикул после нормализации: только [A-Z0-9-].';
+COMMENT ON TABLE  tasks         IS 'Задачи ресерча. Один submit одного артикула = одна task.';
+COMMENT ON COLUMN tasks.article IS 'Входной артикул после нормализации: только [A-Z0-9-].';
 
 -- ---------------------------------------------------------------------------
--- task_runs: конкретный запуск ресерча. У одной task может быть несколько
--- runs (история перезапусков).
+-- task_runs: конкретный запуск. История запусков по task сохраняется.
 -- ---------------------------------------------------------------------------
 CREATE TABLE task_runs (
     id              BIGSERIAL PRIMARY KEY,
@@ -67,44 +69,48 @@ CREATE TABLE task_runs (
     codex_thread_id TEXT,
     storage_dir     TEXT,
     error           TEXT,
-    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at      TIMESTAMPTZ,
     finished_at     TIMESTAMPTZ
 );
 
-CREATE INDEX idx_task_runs_task   ON task_runs(task_id);
-CREATE INDEX idx_task_runs_status ON task_runs(status);
+CREATE INDEX idx_task_runs_task       ON task_runs(task_id);
+CREATE INDEX idx_task_runs_status     ON task_runs(status);
+CREATE INDEX idx_task_runs_queued     ON task_runs(id) WHERE status = 'queued';
 
-COMMENT ON TABLE  task_runs                 IS 'Запуски ресерча. История запусков по одной task сохраняется.';
-COMMENT ON COLUMN task_runs.codex_thread_id IS 'thread_id из @openai/codex-sdk, для аудита.';
+COMMENT ON TABLE  task_runs                 IS 'Запуски ресерча.';
+COMMENT ON COLUMN task_runs.codex_thread_id IS 'thread_id из @openai/codex-sdk.';
 COMMENT ON COLUMN task_runs.storage_dir     IS 'Относительный путь к storage/runs/{run_id}/.';
-COMMENT ON COLUMN task_runs.error           IS 'Сообщение об ошибке для failed_*-статусов.';
+COMMENT ON COLUMN task_runs.created_at      IS 'Когда запуск создан (в очереди).';
+COMMENT ON COLUMN task_runs.started_at      IS 'Когда worker реально начал работу. NULL пока queued.';
+COMMENT ON COLUMN task_runs.error           IS 'Текст ошибки для failed_*/needs_human_review.';
 
 -- ---------------------------------------------------------------------------
--- draft_parts: итог парсинга финального Codex JSON в нормальную форму.
--- На этапе 1 evidence хранится прямо здесь как denormalized колонки.
--- На этапе 2 evidence переедет в отдельную таблицу.
+-- draft_parts: распарсенный итоговый JSON.
 -- ---------------------------------------------------------------------------
 CREATE TABLE draft_parts (
-    id                  BIGSERIAL PRIMARY KEY,
-    run_id              BIGINT NOT NULL UNIQUE REFERENCES task_runs(id) ON DELETE CASCADE,
-    name                TEXT,
-    brand_oem           TEXT,
-    description         TEXT,
-    is_kit              BOOLEAN NOT NULL,
-    weight_kg           NUMERIC(10,4),
-    weight_source_url   TEXT,
-    weight_evidence     TEXT,
-    models_text         TEXT,
-    models_source_urls  TEXT[],
-    models_evidence     TEXT
+    id                   BIGSERIAL PRIMARY KEY,
+    run_id               BIGINT NOT NULL UNIQUE REFERENCES task_runs(id) ON DELETE CASCADE,
+    name                 TEXT,
+    brand_oem            TEXT[] NOT NULL DEFAULT '{}',
+    product_type         TEXT,
+    description          TEXT,
+    is_kit               BOOLEAN NOT NULL,
+    weight_kg            NUMERIC(10,4),
+    weight_source_url    TEXT,
+    weight_evidence      TEXT,
+    models_text          TEXT,
+    models_source_urls   TEXT[],
+    models_evidence      TEXT,
+    needs_review_reason  TEXT
 );
 
-COMMENT ON TABLE  draft_parts          IS 'Draft-результат research-run`а, по одной строке на run.';
-COMMENT ON COLUMN draft_parts.brand_oem IS 'Бренд как вернул агент. На этапе 1 — одиночная строка. На этапе 2 станет массивом.';
-COMMENT ON COLUMN draft_parts.is_kit    IS 'Что агент сказал. Реальная kit-ность определяется по draft_kit_components.';
+COMMENT ON COLUMN draft_parts.brand_oem           IS 'Массив Smart-брендов (BRP/MERCRUISER/...). Пусто = агент не определил.';
+COMMENT ON COLUMN draft_parts.product_type        IS 'Один из smart.product_types.name. NULL = агент не определил, run → needs_human_review.';
+COMMENT ON COLUMN draft_parts.needs_review_reason IS 'Причина needs_human_review, если run в этот статус. NULL для done и failed_*.';
 
 -- ---------------------------------------------------------------------------
--- draft_part_articles: артикулы из numbers.{article,article_low_confidence,irrelevant}.
+-- draft_part_articles
 -- ---------------------------------------------------------------------------
 CREATE TABLE draft_part_articles (
     id                 BIGSERIAL PRIMARY KEY,
@@ -120,12 +126,8 @@ CREATE TABLE draft_part_articles (
 CREATE INDEX idx_draft_part_articles_draft   ON draft_part_articles(draft_part_id);
 CREATE INDEX idx_draft_part_articles_article ON draft_part_articles(article);
 
-COMMENT ON TABLE draft_part_articles IS
-    'Найденные артикулы, разбитые по confidence (confirmed / low_confidence / irrelevant).';
-
 -- ---------------------------------------------------------------------------
--- draft_kit_components: состав набора. Компонент может быть с артикулом или
--- без (тогда article = NULL, component_key = "unknown_N").
+-- draft_kit_components / draft_part_of_kits
 -- ---------------------------------------------------------------------------
 CREATE TABLE draft_kit_components (
     id            BIGSERIAL PRIMARY KEY,
@@ -141,12 +143,6 @@ CREATE TABLE draft_kit_components (
 
 CREATE INDEX idx_draft_kit_components_draft ON draft_kit_components(draft_part_id);
 
-COMMENT ON COLUMN draft_kit_components.component_key IS
-    'Ключ компонента из JSON: либо артикул, либо "unknown_N", если артикул не найден.';
-
--- ---------------------------------------------------------------------------
--- draft_part_of_kits: наборы, в которые входит исследуемый артикул.
--- ---------------------------------------------------------------------------
 CREATE TABLE draft_part_of_kits (
     id            BIGSERIAL PRIMARY KEY,
     draft_part_id BIGINT NOT NULL REFERENCES draft_parts(id) ON DELETE CASCADE,
@@ -159,9 +155,56 @@ CREATE TABLE draft_part_of_kits (
 CREATE INDEX idx_draft_part_of_kits_draft ON draft_part_of_kits(draft_part_id);
 
 -- ---------------------------------------------------------------------------
+-- exa_cache: exact-match по (tool_name, args без run_id).
+-- ---------------------------------------------------------------------------
+CREATE TABLE exa_cache (
+    id            BIGSERIAL PRIMARY KEY,
+    request_hash  TEXT NOT NULL UNIQUE,
+    tool_name     TEXT NOT NULL,
+    arguments     JSONB NOT NULL,
+    response      JSONB NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    hit_count     INTEGER NOT NULL DEFAULT 0
+);
+
+COMMENT ON TABLE  exa_cache              IS 'Глобальный exact-match кэш Exa-вызовов.';
+COMMENT ON COLUMN exa_cache.request_hash IS 'sha256 от tool_name + canonical JSON аргументов (без run_id).';
+COMMENT ON COLUMN exa_cache.hit_count    IS 'Сколько раз ответ переиспользовался из кэша.';
+
+-- ---------------------------------------------------------------------------
+-- exa_cache_usage: какой run какой кэш-ответ использовал.
+-- ---------------------------------------------------------------------------
+CREATE TABLE exa_cache_usage (
+    id        BIGSERIAL PRIMARY KEY,
+    cache_id  BIGINT NOT NULL REFERENCES exa_cache(id) ON DELETE CASCADE,
+    run_id    BIGINT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    used_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    hit       BOOLEAN NOT NULL
+);
+
+CREATE INDEX idx_exa_cache_usage_run   ON exa_cache_usage(run_id);
+CREATE INDEX idx_exa_cache_usage_cache ON exa_cache_usage(cache_id);
+
+COMMENT ON COLUMN exa_cache_usage.hit IS 'TRUE — взято из кэша, FALSE — впервые попало в кэш этим run-ом.';
+
+-- ---------------------------------------------------------------------------
+-- plugin_payloads: данные от source-плагинов, привязанные к run.
+-- ---------------------------------------------------------------------------
+CREATE TABLE plugin_payloads (
+    id          BIGSERIAL PRIMARY KEY,
+    run_id      BIGINT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    plugin_name TEXT NOT NULL,
+    payload     JSONB NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_plugin_payloads_run ON plugin_payloads(run_id);
+
+COMMENT ON TABLE plugin_payloads IS 'Данные source-плагинов (Smart, в будущем Avito и т.п.).';
+
+-- ---------------------------------------------------------------------------
 -- FDW: smart_test и brands_mapping.
--- Контейнеры висят в docker-сети db_default на сервере, поэтому host —
--- имя контейнера (smart_test / brands_mapping), порт — внутренний 5432.
 -- ---------------------------------------------------------------------------
 CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 
@@ -186,8 +229,6 @@ CREATE USER MAPPING IF NOT EXISTS FOR admin
 CREATE SCHEMA IF NOT EXISTS smart;
 CREATE SCHEMA IF NOT EXISTS brand_mapping;
 
--- При повторном применении IMPORT упадёт на существующих таблицах, поэтому
--- сбрасываем foreign tables и заново тянем актуальную форму удалённых схем.
 DROP FOREIGN TABLE IF EXISTS smart.parts            CASCADE;
 DROP FOREIGN TABLE IF EXISTS smart.brands           CASCADE;
 DROP FOREIGN TABLE IF EXISTS smart.part_brands      CASCADE;
@@ -199,6 +240,5 @@ IMPORT FOREIGN SCHEMA public
     LIMIT TO (parts, brands, part_brands, part_articles, part_components, product_types)
     FROM SERVER smart_fdw INTO smart;
 
--- brands_mapping пока пустая. IMPORT — no-op, оставляем для будущего сидинга.
 IMPORT FOREIGN SCHEMA public
     FROM SERVER brand_mapping_fdw INTO brand_mapping;

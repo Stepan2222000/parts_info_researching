@@ -2,12 +2,19 @@ import type { PoolClient } from "pg";
 import { pool } from "./pool.js";
 import type { StructuredResult } from "../research/validation.js";
 
-export async function saveDraftResult(runId: number, result: StructuredResult): Promise<void> {
+export async function saveDraftResult(
+  runId: number,
+  result: StructuredResult,
+  needsReviewReason: string | null,
+): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // Если по run уже есть draft (повторный turn в том же run), удаляем — каскад
+    // вычистит дочерние таблицы.
+    await client.query("DELETE FROM draft_parts WHERE run_id = $1", [runId]);
 
-    const draftId = await insertDraftPart(client, runId, result);
+    const draftId = await insertDraftPart(client, runId, result, needsReviewReason);
     await insertArticles(client, draftId, result);
     await insertKitComponents(client, draftId, result);
     await insertPartOfKits(client, draftId, result);
@@ -25,18 +32,21 @@ async function insertDraftPart(
   client: PoolClient,
   runId: number,
   r: StructuredResult,
+  needsReviewReason: string | null,
 ): Promise<number> {
   const { rows } = await client.query<{ id: number }>(
     `INSERT INTO draft_parts (
-       run_id, name, brand_oem, description, is_kit,
+       run_id, name, brand_oem, product_type, description, is_kit,
        weight_kg, weight_source_url, weight_evidence,
-       models_text, models_source_urls, models_evidence
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       models_text, models_source_urls, models_evidence,
+       needs_review_reason
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
      RETURNING id`,
     [
       runId,
       r.name,
       r.brand_oem,
+      r.product_type,
       r.description,
       r.is_kit,
       r.weight?.kg ?? null,
@@ -45,16 +55,13 @@ async function insertDraftPart(
       r.models?.text ?? null,
       r.models?.source_urls ?? null,
       r.models?.evidence ?? null,
+      needsReviewReason,
     ],
   );
   return rows[0]!.id;
 }
 
-async function insertArticles(
-  client: PoolClient,
-  draftId: number,
-  r: StructuredResult,
-): Promise<void> {
+async function insertArticles(client: PoolClient, draftId: number, r: StructuredResult) {
   for (const a of r.numbers.article) {
     await client.query(
       `INSERT INTO draft_part_articles
@@ -81,11 +88,7 @@ async function insertArticles(
   }
 }
 
-async function insertKitComponents(
-  client: PoolClient,
-  draftId: number,
-  r: StructuredResult,
-): Promise<void> {
+async function insertKitComponents(client: PoolClient, draftId: number, r: StructuredResult) {
   for (const [key, c] of Object.entries(r.kit_contents)) {
     await client.query(
       `INSERT INTO draft_kit_components
@@ -96,11 +99,7 @@ async function insertKitComponents(
   }
 }
 
-async function insertPartOfKits(
-  client: PoolClient,
-  draftId: number,
-  r: StructuredResult,
-): Promise<void> {
+async function insertPartOfKits(client: PoolClient, draftId: number, r: StructuredResult) {
   for (const k of r.part_of_kits) {
     await client.query(
       `INSERT INTO draft_part_of_kits
