@@ -1,6 +1,7 @@
 import { appendFile } from "node:fs/promises";
 import { Codex } from "@openai/codex-sdk";
 import type { Thread } from "@openai/codex-sdk";
+import { CODEX_SANDBOX_MODE } from "../config.js";
 
 export type ResearchThreadOptions = {
   workingDirectory: string;
@@ -27,7 +28,7 @@ export function createResearchThread(opts: ResearchThreadOptions): Thread {
   return codex.startThread({
     workingDirectory: opts.workingDirectory,
     skipGitRepoCheck: true,
-    sandboxMode: "workspace-write",
+    sandboxMode: CODEX_SANDBOX_MODE,
     approvalPolicy: "never",
     networkAccessEnabled: true,
     webSearchMode: "disabled",

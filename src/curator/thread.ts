@@ -1,6 +1,7 @@
 import { Codex } from "@openai/codex-sdk";
 import type { Thread } from "@openai/codex-sdk";
 import {
+  CODEX_SANDBOX_MODE,
   CURATOR_MODEL,
   CURATOR_REASONING_EFFORT,
   EXA_PROXY_URL,
@@ -32,7 +33,7 @@ export function createCuratorThread(opts: CuratorThreadOptions): Thread {
     modelReasoningEffort: CURATOR_REASONING_EFFORT,
     workingDirectory: opts.workingDirectory,
     skipGitRepoCheck: true,
-    sandboxMode: "workspace-write",
+    sandboxMode: CODEX_SANDBOX_MODE,
     approvalPolicy: "never",
     networkAccessEnabled: true,
     webSearchMode: "disabled",

@@ -33,3 +33,12 @@ export const CURATOR_REASONING_EFFORT =
     | "xhigh"
     | undefined) ?? "high";
 export const CURATOR_RULES_PATH = resolve(PROJECT_ROOT, "curator_rules.md");
+// Codex sandbox mode. Локально дефолт "workspace-write" использует bwrap, что в
+// Docker без user namespaces падает. На сервере выставляем "danger-full-access" —
+// внутри изолированного контейнера это безопасно.
+export const CODEX_SANDBOX_MODE =
+  (process.env.CODEX_SANDBOX_MODE as
+    | "read-only"
+    | "workspace-write"
+    | "danger-full-access"
+    | undefined) ?? "workspace-write";
