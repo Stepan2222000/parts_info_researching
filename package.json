@@ -3,12 +3,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "research": "tsx research_part.ts",
+    "research": "tsx src/cli/research.ts",
+    "research:legacy": "tsx research_part.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/codex-sdk": "^0.130.0",
+    "@types/pg": "^8.20.0",
+    "dotenv": "^17.4.2",
+    "pg": "^8.20.0",
     "tsx": "^4.21.0"
   },
   "devDependencies": {

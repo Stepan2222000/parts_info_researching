@@ -7,5 +7,5 @@
     "strict": true,
     "skipLibCheck": true
   },
-  "include": ["research_part.ts"]
+  "include": ["src/**/*.ts", "research_part.ts"]
 }
