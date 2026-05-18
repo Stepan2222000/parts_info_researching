@@ -7,7 +7,7 @@ import { getCuratorSessionId, getRunId, runCtxStorage } from "./runContext.js";
 import { cachedExaCall } from "./exaCached.js";
 import { writeResultForRun } from "./writeResult.js";
 import { executeSqlForCurator } from "../curator/tools/executeSql.js";
-import { saveToSmart, type SaveOp } from "../curator/tools/saveToSmart.js";
+import { saveToSmart, type SavePart } from "../curator/tools/saveToSmart.js";
 import { markNeedsReview } from "../curator/tools/markNeedsReview.js";
 
 export type ExaProxyOptions = {
@@ -171,23 +171,39 @@ function buildMcpServer(): McpServer {
     },
   );
 
+  const componentSchema = z.object({
+    smart_id: z.string().optional(),
+    name: z.string().optional(),
+    articles: z.array(z.string()).optional(),
+    product_type: z.string().optional(),
+    weight_kg: z.number().optional(),
+    model: z.string().optional(),
+    description: z.string().optional(),
+    brands: z.array(z.string()).optional(),
+    quantity: z.number().int().min(1).optional(),
+  });
+
+  const partSchema = z.object({
+    run_id: z.number().int(),
+    smart_id: z.string().optional(),
+    name: z.string().optional(),
+    articles: z.array(z.string()).optional(),
+    product_type: z.string().optional(),
+    weight_kg: z.number().optional(),
+    model: z.string().optional(),
+    description: z.string().optional(),
+    brands: z.array(z.string()).optional(),
+    components: z.array(componentSchema).optional(),
+  });
+
   server.registerTool(
     "save_to_smart",
     {
       title: "Save to Smart (curator)",
       description:
-        "Curator-only. Batch-publish operations to smart.* via FDW. Each op is INSERT with a per-row SAVEPOINT; a failed op doesn't break the rest. For every successful op a publications row is also written. Returns per-op {op_index, status, smart_id?, error?}.",
+        "Curator-only. Publish one or more parts (single piece or kit-with-components) to Smart via FDW. Each part is wrapped in its own SAVEPOINT: failure of one part does not affect siblings. For a part without smart_id — INSERT new smart.parts (always with is_draft=true, is_unverified=true) plus brands and optional components. For a part with smart_id — UPDATE existing (only if Smart record is is_draft=true AND is_unverified=true; otherwise rejected with explicit error). product_type cannot be changed on existing parts (immutable trigger). brands DELETE+INSERT semantics; components also DELETE+INSERT if components key present. Components reused by smart_id with is_draft=true get patch-merge (fill empty fields only). One publications row written per successful part. See save_to_smart.md in the working directory for full semantics.",
       inputSchema: {
-        operations: z
-          .array(
-            z.object({
-              table: z.enum(["parts", "part_brands", "part_components"]),
-              action: z.literal("insert"),
-              fields: z.record(z.string(), z.unknown()),
-              run_id: z.number().int(),
-            }),
-          )
-          .min(1),
+        parts: z.array(partSchema).min(1),
       },
     },
     async (args) => {
@@ -198,7 +214,7 @@ function buildMcpServer(): McpServer {
           isError: true,
         };
       }
-      const results = await saveToSmart(sid, args.operations as SaveOp[]);
+      const results = await saveToSmart(sid, args.parts as SavePart[]);
       return {
         content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
       };

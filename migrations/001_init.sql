@@ -11,6 +11,8 @@
 -- task_runs.started_at стал nullable (queued/running разделены явно).
 -- На этапе 3: добавлены curator_sessions, curator_messages, agent_sql_log,
 -- publications. На smart_fdw включён batch_size=50 для эффективной записи.
+-- publications хранит один факт «save_to_smart применён к этому run/parent»;
+-- action/smart_table убраны — тул не имеет под-настроек.
 -- ============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -29,7 +31,6 @@ DROP TABLE IF EXISTS draft_part_articles CASCADE;
 DROP TABLE IF EXISTS draft_parts         CASCADE;
 DROP TABLE IF EXISTS task_runs           CASCADE;
 DROP TABLE IF EXISTS tasks               CASCADE;
-DROP TYPE  IF EXISTS publication_action;
 DROP TYPE  IF EXISTS curator_role;
 DROP TYPE  IF EXISTS article_confidence;
 DROP TYPE  IF EXISTS task_run_status;
@@ -54,7 +55,6 @@ CREATE TYPE article_confidence AS ENUM (
 );
 
 CREATE TYPE curator_role AS ENUM ('user', 'assistant', 'tool');
-CREATE TYPE publication_action AS ENUM ('insert', 'update');
 
 -- ---------------------------------------------------------------------------
 -- tasks: одна логическая задача на один артикул.
@@ -266,16 +266,14 @@ CREATE TABLE publications (
     id                 BIGSERIAL PRIMARY KEY,
     run_id             BIGINT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
     curator_session_id BIGINT NOT NULL REFERENCES curator_sessions(id) ON DELETE CASCADE,
-    smart_table        TEXT NOT NULL,
     smart_id           TEXT NOT NULL,
-    action             publication_action NOT NULL,
     published_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_publications_run     ON publications(run_id);
 CREATE INDEX idx_publications_session ON publications(curator_session_id);
 
-COMMENT ON COLUMN publications.smart_id IS 'Для parts — id. Для part_brands — part_id. Для part_components — parent_id||"|"||child_id.';
+COMMENT ON TABLE  publications IS 'Одна строка на каждый успешный save_to_smart-вызов по одному part. smart_id — id parent-записи в smart.parts.';
 
 -- ---------------------------------------------------------------------------
 -- FDW: smart_test и brands_mapping.

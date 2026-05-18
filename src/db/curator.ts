@@ -67,13 +67,11 @@ export async function recordPublication(
   client: { query: typeof pool.query },
   runId: number,
   curatorSessionId: number,
-  smartTable: string,
   smartId: string,
-  action: "insert" | "update",
 ): Promise<void> {
   await client.query(
-    `INSERT INTO publications (run_id, curator_session_id, smart_table, smart_id, action)
-       VALUES ($1, $2, $3, $4, $5)`,
-    [runId, curatorSessionId, smartTable, smartId, action],
+    `INSERT INTO publications (run_id, curator_session_id, smart_id)
+       VALUES ($1, $2, $3)`,
+    [runId, curatorSessionId, smartId],
   );
 }

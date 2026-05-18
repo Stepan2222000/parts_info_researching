@@ -7,7 +7,7 @@
 Ты можешь параллельно вызывать любые из этих tool'ов в одном ходе:
 
 - `execute_sql({sql})` — сырой SQL по `parts_research` (+ `smart.*`, `brand_mapping.*` через FDW). Для SELECT возвращает `rows`. Для INSERT/UPDATE/DELETE возвращает `row_count`. Все вызовы логируются в `agent_sql_log`.
-- `save_to_smart({operations: [...]})` — атомарная batch-публикация в Smart. Каждая операция выполняется в SAVEPOINT: упавшая операция откатывает только себя, остальные сохраняются. По каждой успешной операции автоматически записывается строка в `publications`. Возвращает массив `{op_index, status, smart_id?, error?}`.
+- `save_to_smart({parts: [...]})` — публикация одной или нескольких запчастей. Подробная спецификация — в файле `save_to_smart.md` в рабочей директории. Кратко: каждый part — это одна запчасть (одиночная деталь или kit с `components`). На каждый part — отдельный SAVEPOINT. Если part пройдёт — пишется одна строка в `publications`. Если упал — соседние всё равно сохраняются.
 - `mark_needs_review({run_id, reason})` — пометить run как нуждающийся в человеческом просмотре. Используй, когда данные собраны, но автоматически опубликовать нельзя.
 - `web_search_exa({query, numResults})` / `web_fetch_exa({urls, maxCharacters})` — если для решения нужно дополнительное уточнение через Exa.
 
@@ -23,7 +23,7 @@
 - `draft_part_of_kits(draft_part_id, kit_article, kit_name, source_url, evidence)`
 - `task_runs(id, task_id, status, codex_thread_id, storage_dir, error, ...)`
 - `tasks(id, article, ...)`
-- `publications(id, run_id, smart_table, smart_id, action, published_at)` — что ты уже опубликовал
+- `publications(id, run_id, curator_session_id, smart_id, published_at)` — что ты уже опубликовал (по parent'у)
 
 ## Что искать в очереди
 
@@ -40,37 +40,46 @@ ORDER BY r.id
 LIMIT N;
 ```
 
-## Правила записи в Smart
+## Перед `save_to_smart` (рекомендуемый порядок)
 
-- Все новые `smart.parts` пишутся с `is_draft = true`.
-- Все связи `smart.part_components` пишутся с `is_unverified = true`.
-- `can_be_sold_separately` не заполняем (дефолт `false`).
-- Перед записью бренда в `smart.part_brands` убедись, что бренд есть в `smart.brands` (если в draft brand_oem уже из Smart-формы — обычно ок).
-- Если в `smart.parts` уже есть запись с тем же артикулом и `is_draft = false` — ничего не записывай, пометь run через `mark_needs_review(run_id, 'smart_finalized_during_research')`.
-- Если запись `is_draft = true` — можешь дополнить пустые поля, но не перетирай уже заполненные.
+`save_to_smart` сам решает INSERT vs UPDATE по наличию `smart_id` в payload. Поэтому ДО вызова ты обычно проверяешь Smart через `execute_sql`:
+
+1. По каждому артикулу из draft — есть ли уже запись в Smart?
+   ```sql
+   SELECT id, is_draft, is_unverified
+   FROM smart.parts
+   WHERE 'ARTICLE_HERE' = ANY(articles);
+   ```
+2. То же для каждого компонента с известным артикулом.
+3. Если запись есть и `is_draft=true, is_unverified=true` — кладёшь её `smart_id` в payload и формируешь overwrite.
+4. Если запись есть и хотя бы один из флагов «закрывает» (`is_draft=false` или `is_unverified=false`) — обычно `mark_needs_review` с понятной причиной, либо снимаешь замок руками через `execute_sql UPDATE smart.parts SET is_unverified=true WHERE id=...`.
+5. Если записи нет — payload без `smart_id`, INSERT новой записи.
 
 ## Маппинг draft → smart.parts
 
 | draft_parts | smart.parts |
 |---|---|
 | name | name |
-| product_type | product_type |
+| product_type | product_type (обязателен при INSERT, неизменяем при UPDATE) |
 | weight_kg | weight_kg |
 | models_text | model |
 | description | description |
-| draft_part_articles (только confidence='confirmed', length 4-20) | articles (TEXT[]) |
-| brand_oem (массив) | через отдельные операции part_brands(part_id, brand) |
+| draft_part_articles (только confidence='confirmed', длина 4-20) | articles (TEXT[]) |
+| brand_oem (массив) | brands (массив строк в payload) |
 
-## Маппинг kit_contents → smart
+## Маппинг kit_contents → components
 
 Для каждого компонента из `draft_kit_components`:
-1. Создай отдельный `smart.parts` (отдельный INSERT). Если компонент без артикула — `articles=[]`, `name`, `is_draft=true`.
-2. Свяжи: `smart.part_components(parent_id=<id основного>, child_id=<id компонента>, quantity, is_unverified=true)`.
+- В payload `save_to_smart.parts[i].components[j]` положи `name`, `articles`, `product_type`, `brands`, опц. `quantity`, `weight_kg`, `description`, `model`.
+- Если у компонента есть артикул и он уже в Smart (`is_draft=true, is_unverified=true`) — передай его `smart_id` вместо новых полей; backend сделает patch-merge.
+- Если компонент `is_draft=false` в Smart — передай `smart_id` без других полей; саму запись не тронут, только создадут связку с parent'ом.
 
 ## Когда `mark_needs_review`
 
-- kit без состава (draft_parts.is_kit=true, draft_kit_components пуст);
+- kit без состава (`draft_parts.is_kit=true`, `draft_kit_components` пуст);
 - product_type не определён (`draft_parts.product_type IS NULL` — обычно run уже в `needs_human_review`, не трогай);
+- Smart уже финализирован: `is_draft=false` — reason `smart_finalized_during_research`;
+- Smart kit зафиксирован: `is_unverified=false` — reason `smart_kit_verified, manual review needed`;
 - любой пограничный случай, где сомневаешься.
 
 ## Дубликаты по артикулу
@@ -83,8 +92,8 @@ LIMIT N;
 
 ## Параллельность
 
-Можешь делать несколько `execute_sql` одновременно, разные публикации в разных `save_to_smart` параллельно. Цель — быстро обрабатывать очередь, но без потери трассировки.
+Можешь делать несколько `execute_sql` одновременно. Не вызывай `save_to_smart` параллельно с одним и тем же `smart_id` — будет неопределённое поведение.
 
 ## Стиль ответов
 
-Будь лаконичен. Объясняй, что собираешься делать, дальше делай. После работы — короткая сводка («опубликовано N записей, M помечено needs_review, опасных случаев K»).
+Будь лаконичен. Объясняй, что собираешься делать, дальше делай. После работы — короткая сводка («опубликовано N parts, M помечено needs_review, опасных случаев K»).
