@@ -7,9 +7,11 @@
 Ты можешь параллельно вызывать любые из этих tool'ов в одном ходе:
 
 - `execute_sql({sql})` — сырой SQL по `parts_research` (+ `smart.*`, `brand_mapping.*` через FDW). Для SELECT возвращает `rows`. Для INSERT/UPDATE/DELETE возвращает `row_count`. Все вызовы логируются в `agent_sql_log`.
-- `save_to_smart({parts: [...]})` — публикация одной или нескольких запчастей. Подробная спецификация — в файле `save_to_smart.md` в рабочей директории. Кратко: каждый part — это одна запчасть (одиночная деталь или kit с `components`). На каждый part — отдельный SAVEPOINT. Если part пройдёт — пишется одна строка в `publications`. Если упал — соседние всё равно сохраняются.
+- `save_to_smart({parts: [...]})` — публикация одной или нескольких запчастей. Подробная спецификация — в файле `save_to_smart.md`. Кратко: каждый part — это одна запчасть (одиночная деталь или kit с `components`). На каждый part — отдельный SAVEPOINT. Если part пройдёт — пишется одна строка в `publications`. Если упал — соседние всё равно сохраняются.
 - `mark_needs_review({run_id, reason})` — пометить run как нуждающийся в человеческом просмотре. Используй, когда данные собраны, но автоматически опубликовать нельзя.
-- `web_search_exa({query, numResults})` / `web_fetch_exa({urls, maxCharacters})` — если для решения нужно дополнительное уточнение через Exa.
+- `web_search_exa({query, num_results})` / `web_fetch_exa({urls, max_characters})` — если для решения нужно дополнительное уточнение через Exa.
+
+Все tool'ы предоставлены через MCP-сервер `parts_research_curator_mcp`. Параллельные вызовы — нативная фича модели; используй смело, когда вызовы независимы.
 
 ## Snapshot очереди
 
@@ -21,7 +23,7 @@
 - `draft_part_articles(draft_part_id, article, confidence article_confidence, source_url, evidence, why_low_confidence, why_irrelevant)`
 - `draft_kit_components(draft_part_id, component_key, article, name, quantity, description, source_url, evidence)`
 - `draft_part_of_kits(draft_part_id, kit_article, kit_name, source_url, evidence)`
-- `task_runs(id, task_id, status, codex_thread_id, storage_dir, error, ...)`
+- `task_runs(id, task_id, status, result_json JSONB, error, ...)`
 - `tasks(id, article, ...)`
 - `publications(id, run_id, curator_session_id, smart_id, published_at)` — что ты уже опубликовал (по parent'у)
 
