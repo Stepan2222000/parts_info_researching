@@ -27,19 +27,25 @@
 
 ---
 
+## Прототип (до Этапа 0) — `research_part.py`
+
+Перед началом Этапа 0 в репо есть отладочный скрипт `research_part.py` для одного артикула. Он реализует фазу 1 и фазу 2 research-агента на тестовом stub-окружении (без БД parts_research, без worker'а, без файлового хранилища) — единственная цель: убедиться, что LLM-эндпоинт, Agents SDK, strict JSON schema, Pydantic, Exa-py работают как описано в `PARTS_RESEARCH_SPEC.md`. Полная спецификация скрипта — в `research_part.md`. Прототип не часть production-системы, но именно на нём отлаживается контракт `StructuredResult` и поведение модели на разных артикулах.
+
+---
+
 ## Этап 0 — Фундамент проекта и DDL
 
-**Цель этапа.** Подготовить пустой Python-проект под `uv`, обновлённую DDL под новую схему `parts_research`, и проверить, что все базовые подключения работают: к LLM-эндпоинту, к Postgres, к Exa MCP, к FDW.
+**Цель этапа.** Подготовить пустой Python-проект, обновлённую DDL под новую схему `parts_research`, и проверить, что все базовые подключения работают: к LLM-эндпоинту, к Postgres, к Exa API (`exa-py`), к FDW.
 
 **Что делаем.**
 
 Удаляем старый TS-кодбейз и связанные с ним директории. Создаём чистый Python-проект:
 
-- `pyproject.toml` с минимальным набором зависимостей: `openai-agents`, `openai`, `asyncpg`, `pydantic`, `mcp`, `python-dotenv`.
-- `uv.lock` — генерируется через `uv sync`.
+- `pyproject.toml` с минимальным набором зависимостей: `openai-agents`, `openai`, `exa-py`, `asyncpg`, `pydantic`, `python-dotenv`. Lock-файл не используем — пакеты ставятся в глобальный site-packages mise-python.
+- Python ставится глобально через `mise use -g python@latest` (см. глобальный CLAUDE.md).
 - Базовая структура `src/parts_research/{config,db,research,curator,plugins,queue,cli}/`.
-- `Dockerfile` (Python 3.13-slim, multi-stage с `uv pip install --system`).
-- `docker-compose.yml` с двумя сервисами: `worker` и `curator_mcp`. Образ один и тот же, команды разные.
+- `Dockerfile` (Python 3.13+ slim, multi-stage с `pip install --no-cache-dir`).
+- `docker-compose.yml` с двумя сервисами: `worker` и `curator`. Образ один и тот же, команды разные.
 
 Обновляем `migrations/001_init.sql` под новую схему:
 
@@ -54,7 +60,7 @@
 
 Дропаем существующую БД `parts_research` на сервере и накатываем обновлённую миграцию через psql.
 
-Пишем `src/parts_research/config.py` с чтением всех env-переменных: `PARTS_RESEARCH_DATABASE_URL`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL_RESEARCH`, `LLM_MODEL_CURATOR`, `EXA_API_KEY`, `CURATOR_MCP_URL`, `CURATOR_MCP_PORT`, `WORKER_CONCURRENCY`, `WORKER_STALE_MINUTES`.
+Пишем `src/parts_research/config.py` с чтением всех env-переменных: `PARTS_RESEARCH_DATABASE_URL`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL_RESEARCH`, `LLM_MODEL_CURATOR`, `EXA_API_KEY`, `WORKER_CONCURRENCY`, `WORKER_STALE_MINUTES`.
 
 Пишем `src/parts_research/db/pool.py` — asyncpg пул с `min_size=10, max_size=60`.
 
@@ -71,7 +77,7 @@
 - Curator (этап 3).
 - UI (этап 4).
 
-**Готовность.** Проект собирается через `uv sync`. Команды `uv run python -m parts_research.cli.ping` (отладочный скрипт, который тестирует все три подключения) — отрабатывают и печатают «OK».
+**Готовность.** Зависимости установлены (`python -m pip install -e .` или поштучно). Команда `python -m parts_research.cli.ping` (отладочный скрипт, тестирующий все три подключения) — отрабатывает и печатает «OK».
 
 ---
 
@@ -86,7 +92,7 @@
 - Считает hash от `tool_name + canonical_json(args)`.
 - `SELECT response FROM exa_cache WHERE request_hash = $1`.
 - На попадание — `INSERT INTO exa_cache_usage (cache_id, run_id, hit, phase)` (только если `run_id` не None) и возвращает кэш.
-- На промах — зовёт реальный Exa MCP (`https://mcp.exa.ai/mcp` через `mcp` SDK Python-клиент), сохраняет в `exa_cache`, делает `exa_cache_usage` с `hit=false`, возвращает ответ.
+- На промах — зовёт реальный Exa API через `exa-py` (`exa.search(...)`), сохраняет в `exa_cache`, делает `exa_cache_usage` с `hit=false`, возвращает ответ.
 - Никаких файлов не пишет.
 
 Пишем `src/parts_research/research/prompts.py` — функции `build_main_user_message`, `build_low_confidence_user_message`, `build_kit_contents_user_message`, `build_phase2_user_message`. Системный промпт (`build_system_prompt`) подгружает `research_rules.md`, список Smart-брендов, product_types, brand_aliases, Smart-plugin payload.
@@ -149,28 +155,35 @@
 
 **Готовность.** Гоняем `python -m parts_research.cli.research 807252T5` (или другой реальный артикул). В терминале видим стрим событий (tool_called, message_output_created). В БД появляются: `tasks`, `task_runs` со статусом `done` (или `needs_human_review`), `task_runs.result_json` заполнен, `agent_history` содержит всю переписку, `agent_stream_events` содержит события всех turn'ов, `exa_cache` пополнен, `exa_cache_usage` имеет строки с разными `phase`, `draft_parts` и связанные таблицы заполнены. Прогоняем 3–5 разных артикулов: одиночная деталь, kit с известным составом, артикул где product_type неочевиден.
 
+> **Примечание (уточнено позже).** На Этапе 1 `cli.research` запускал pipeline **inline** (без очереди и воркера) — это была отладочная веха для контракта `execute_run`. В Этапе 2 `cli.research` переопределяется в **submit-and-wait** поверх общей очереди воркеров (см. ниже); inline-режим как отдельная команда не сохраняется.
+
 ---
 
-## Этап 2 — Worker-пул с очередью
+## Этап 2 — Общая очередь воркеров и agent-facing `cli.research`
 
-**Цель этапа.** Превратить одноразовый CLI-research в production-логику с очередью, параллелизмом и submit-командой. После этого этапа research-часть закончена.
+**Цель этапа.** Ввести общий пул воркеров с одной очередью и переопределить `cli.research` в **submit-and-wait**: команда кладёт артикулы в очередь, воркеры разбирают её постепенно, команда дожидается результата и возвращает его как JSON вызывающему (в т.ч. агенту). После этого этапа research-часть закончена.
 
 **Что делаем.**
 
-Пишем `src/parts_research/db/tasks.py` — DB-helpers: `create_task`, `create_queued_run`, `pick_next_queued_run` (внутри транзакции с `FOR UPDATE SKIP LOCKED`), `ensure_running`, `finish_run`, `mark_crashed_stale_runs`.
+Пишем `src/parts_research/db/tasks.py` — DB-helpers: `create_task`, `create_queued_run`, `pick_next_queued_run` (внутри транзакции с `FOR UPDATE SKIP LOCKED`), `ensure_running`, `finish_run`, `mark_crashed_stale_runs`. Плюс liveness-helpers: `acquire_worker_lock(conn)` (`pg_advisory_lock_shared` на фиксированном ключе) и `count_live_workers(pool)` (через `pg_locks`).
 
-Пишем `src/parts_research/queue/worker.py` — главный цикл:
+Пишем `src/parts_research/queue/worker.py` — главный цикл воркера:
 
-- При старте: `mark_crashed_stale_runs(timeout_minutes=WORKER_STALE_MINUTES)`.
+- При старте: берёт **shared advisory-lock** на фиксированном ключе на отдельном соединении и держит его весь lifetime — liveness-сигнал для `cli.research`. Затем `mark_crashed_stale_runs(timeout_minutes=WORKER_STALE_MINUTES)`.
 - Бесконечный async-цикл:
   - Если `len(inflight) >= WORKER_CONCURRENCY` — `await asyncio.wait(inflight, return_when=FIRST_COMPLETED)`.
-  - Иначе `next = await pick_next_queued_run()`. Если `None` — `await asyncio.sleep(poll_interval)`, иначе создаём task через `asyncio.create_task(execute_run(...))`, добавляем в `inflight`.
-- На SIGINT/SIGTERM — graceful drain: ждём всех inflight, потом выходим.
+  - Иначе `next = await pick_next_queued_run()`. Если `None` — `await asyncio.sleep(poll_interval)`, иначе `asyncio.create_task(execute_run(...))`, добавляем в `inflight`.
+- На SIGINT/SIGTERM — graceful drain: ждём всех inflight, потом выходим (advisory-lock освободится сам при закрытии соединения).
 
-Пишем `src/parts_research/cli/submit.py` — entry point с несколькими артикулами на вход:
+Несколько воркеров берут один и тот же ключ в shared-режиме — они совместимы и все видны в `pg_locks`; параллелизм каждого — `asyncio.Semaphore(WORKER_CONCURRENCY)`.
 
-- Для каждого артикула: нормализует, проверяет регулярку, проверяет submit-guard через FDW, создаёт `task` + `queued` run.
-- Печатает `queued task=X run=Y article=Z` для каждого или ошибку.
+Переопределяем `src/parts_research/cli/research.py` в **submit-and-wait** (см. «Постановка задач и возврат результата» в спеке):
+
+- Принимает один или несколько артикулов.
+- Для каждого: нормализация + regex + FDW submit-guard; создаёт `task` + `queued` run. Невалидный/отказанный артикул не валит остальные — попадает в итог со своим `status` (`invalid` / `refused`), без `run_id`.
+- Проверяет живого воркера через `pg_locks`. Нет воркера → возвращает по каждому артикулу `{status:"queued", worker_alive:false, run_id}` сразу, не зависая.
+- Есть воркер → поллит `task_runs.status` (~1 c) до терминального статуса без жёсткого таймаута; если живые воркеры исчезли посреди ожидания — возвращает текущий статус с `worker_alive:false`.
+- Печатает **JSON-массив** результатов в stdout, логи — в stderr.
 
 Пишем `src/parts_research/cli/worker.py` — entry point, запускает `worker.run_forever()` с обработкой SIGINT/SIGTERM.
 
@@ -178,61 +191,57 @@
 
 **Что не делаем (откладывается).**
 
-- Curator (этап 3).
-- Деплой на сервер (конец этапа 3).
-- UI (этап 4).
+- `cli.submit` (bulk fire-and-forget без ожидания результата) — пока не нужен, `cli.research` покрывает постановку и ожидание. Добавим при необходимости массовой загрузки без чтения результата.
+- Полноценный heartbeat-мониторинг воркеров (только advisory-lock liveness).
+- Curator (этап 3), деплой на сервер (конец этапа 3), UI (этап 4).
 
-**Готовность.** Запускаем `python -m parts_research.cli.worker` локально. В отдельном терминале — `python -m parts_research.cli.submit 807252T5 295100923 76868A04 ...` с разными артикулами. Worker сам параллельно обрабатывает их (видно по логам), обновляет статусы. В БД — все runs корректно doneнутся / помечаются нужным failure-статусом. Перезапускаем worker во время работы — `failed_crashed` отрабатывает на следующий старт.
+**Готовность.** Запускаем `python -m parts_research.cli.worker` локально (можно несколько процессов). В отдельном терминале — `python -m parts_research.cli.research 807252T5 295100923 76868A04` с разными артикулами: команда ставит их в общую очередь, воркеры параллельно разбирают, команда дожидается и печатает JSON-массив результатов в stdout. Останавливаем все воркеры и снова зовём `cli.research` — команда сразу отдаёт `worker_alive:false` и не виснет. Перезапускаем воркер во время работы — `failed_crashed` отрабатывает на следующем старте.
 
 ---
 
-## Этап 3 — Curator (MCP-сервер + CLI REPL) и деплой
+## Этап 3 — Curator (CLI REPL) и деплой
 
 **Цель этапа.** Подключить куратора, который превращает накопившийся draft в записи Smart, и в конце этапа развернуть всё на сервере. После этого этапа backend полностью готов, остаётся только UI.
 
 **Что делаем.**
 
-Пишем `src/parts_research/curator/server.py` — MCP-сервер на `mcp.server.fastmcp.FastMCP`. Реализует тулы:
+Пишем тулы курсора как `@function_tool` в `src/parts_research/curator/tools.py`. Все они живут в том же Python-процессе, что и курсор-агент; никакого MCP-сервера нет.
 
-- `execute_sql(sql: str) -> str` — выполняет SQL на `parts_research`, логирует начало в `agent_sql_log`, по завершении дописывает `rows_affected`/`error`. Для SELECT возвращает rows, для остальных — `row_count`. Читает `X-Curator-Session-Id` через `get_http_request().headers`.
-- `save_to_smart(parts: list[dict]) -> list[dict]` — реализует семантику из `save_to_smart.md`: каждый part в своём SAVEPOINT, INSERT vs UPDATE по `smart_id`, проверки `is_draft`/`is_unverified`, patch-merge компонентов, запись в `publications`.
+- `execute_sql(ctx, sql: str) -> str` — выполняет SQL на `parts_research` через `asyncpg`-пул. До выполнения — `INSERT INTO agent_sql_log (session_id, sql_text, started_at)`; после — `UPDATE agent_sql_log SET rows_affected=…, error=…, finished_at=now()`. Для SELECT возвращает rows, для остальных — `row_count`. `ctx.context` содержит `curator_session_id`.
+- `save_to_smart(ctx, parts: list[dict]) -> list[dict]` — семантика из `save_to_smart.md`: каждый part в своём SAVEPOINT, INSERT vs UPDATE по `smart_id`, проверки `is_draft`/`is_unverified`, patch-merge компонентов, запись в `publications`.
 - `mark_needs_review(run_id: int, reason: str) -> str` — UPDATE `task_runs.status = 'needs_human_review'`.
-- `web_search_exa(query: str, num_results: int = 10) -> str` — через тот же `cached_exa_call`, но `run_id=None, phase=None` (для куратора кэш-usage не записывается; кэш только переиспользуется).
-- `web_fetch_exa(urls: list[str], max_characters: int = 3000) -> str` — аналогично.
-
-Сервер запускается через `mcp.run(transport="streamable-http", host="0.0.0.0", port=CURATOR_MCP_PORT)`. `stateless_http=True, json_response=True`.
+- `web_search_exa(query: str, num_results: int = 10) -> str` — прямой `exa.search(...)`, БЕЗ кэша (у курсора Exa-запросы редкие и контекстные).
+- `web_fetch_exa(urls: list[str], max_characters: int = 3000) -> str` — прямой `exa.get_contents(urls, text=True)`, с обрезкой по `max_characters`.
 
 Пишем `src/parts_research/curator/snapshot.py` — `load_snapshot()` и `format_snapshot()`.
 
 Пишем `src/parts_research/curator/agent_factory.py` — `make_curator_agent(session_id: str)`:
 
-- Создаёт `MCPServerStreamableHttp(params={"url": CURATOR_MCP_URL, "headers": {"X-Curator-Session-Id": session_id}})`.
-- Создаёт `Agent(name="curator", instructions=curator_system_prompt, model=OpenAIChatCompletionsModel(...), mcp_servers=[mcp_server])`.
+- Создаёт `Agent(name="curator", instructions=curator_system_prompt, model=OpenAIChatCompletionsModel(...), tools=[execute_sql, save_to_smart, mark_needs_review, web_search_exa, web_fetch_exa], model_settings=ModelSettings(retry=retry_policies.network_error(max_retries=2)))`.
 - Системный промпт собирается из `curator_rules.md` + ссылка на `save_to_smart.md`.
 
 Пишем `src/parts_research/curator/repl.py` — async-REPL:
 
 - При старте: `INSERT INTO curator_sessions (started_at)` → получает `session_id`.
 - Создаёт `PostgresSession(f"curator_{session_id}", pool)`.
-- Цикл: читает строку из stdin, добавляет `<queue>...</queue>` snapshot в начало, пишет user-message в `curator_messages`, запускает `Runner.run_streamed(agent, input=..., session=session)`, перебирает события, рендерит в stdout, дублирует tool calls и assistant messages в `curator_messages`.
+- Цикл: читает строку из stdin, добавляет `<queue>...</queue>` snapshot в начало, пишет user-message в `curator_messages`, запускает `Runner.run_streamed(agent, input=..., session=session, context=CuratorRunContext(session_id=session_id, pool=pool, exa=exa))`. Перебирает события, рендерит в stdout, дублирует tool calls и assistant messages в `curator_messages`.
 - Команды `/exit`, `/new`.
 
 Пишем `src/parts_research/cli/curator.py` — entry point для REPL.
-Пишем `src/parts_research/cli/curator_mcp.py` — entry point для MCP-сервера.
 
-Обновляем `docker-compose.yml`: добавляем сервис `curator_mcp` с командой `python -m parts_research.cli.curator_mcp`, мапим порт 8765.
+Обновляем `docker-compose.yml`: добавляем сервис `curator` с командой `python -m parts_research.cli.curator`. Образ тот же, что у `worker`.
 
 **Деплой.**
 
-После того как все три скрипта (`worker`, `curator_mcp`, `curator` REPL) работают локально на нескольких реальных артикулах, поднимаем prod-деплой по шаблону `DEPLOY_TEMPLATE.md`:
+После того как `worker` и `curator` REPL работают локально на нескольких реальных артикулах, поднимаем prod-деплой по шаблону `DEPLOY_TEMPLATE.md`:
 
 - GHA workflow собирает Docker-образ через Docker Build Cloud, пушит в ghcr.io.
 - SSH-деплой на `194.164.245.107`: `docker compose pull && docker compose up -d`.
-- `parts_research_worker` и `parts_research_curator_mcp` поднимаются в `db_default` Docker-сети рядом с Postgres-контейнерами.
+- `parts_research_worker` и `parts_research_curator` поднимаются в `db_default` Docker-сети рядом с Postgres-контейнерами.
 - Никаких volume'ов не нужно (диск не используется).
 - env-переменные кладутся через `.env` в директорию деплоя.
 
-Прогоняем на сервере: submit пары артикулов → worker их обрабатывает → подключаемся к серверу по SSH → запускаем `docker exec -it parts_research_worker python -m parts_research.cli.curator` → пишем «обработай все» → проверяем `smart.parts`, `smart.part_brands`, `smart.part_components`, `publications`.
+Прогоняем на сервере: submit пары артикулов → worker их обрабатывает → подключаемся к серверу по SSH → запускаем `docker exec -it parts_research_curator python -m parts_research.cli.curator` → пишем «обработай все» → проверяем `smart.parts`, `smart.part_brands`, `smart.part_components`, `publications`.
 
 **Что не делаем (откладывается).**
 
@@ -254,8 +263,8 @@
 
 Поднимаем `parts_research_app` контейнер с Next.js. Бэкенд приложения = Next.js route handlers; они ходят в Python-процессы по HTTP:
 
-- Для submit, queue-status, run-detail — пишем минимальный HTTP-API в Python (через FastAPI). FastAPI добавляется в зависимости именно на этом этапе.
-- Для куратора — Next.js route handler принимает сообщение пользователя через Vercel AI SDK v6 (`useChat`), форвардит его в Python-обвязку над `Agents SDK`-сессией куратора, стримит обратно события.
+- Для submit, queue-status, run-detail — пишем минимальный HTTP-API в Python (FastAPI) поверх `parts_research_worker`. FastAPI добавляется в зависимости на этом этапе.
+- Для куратора — добавляем FastAPI-эндпоинт `POST /curator/message` поверх `parts_research_curator` (тонкая обвязка над `Runner.run_streamed`, стримит SSE). Next.js route handler принимает сообщение пользователя через Vercel AI SDK v6 (`useChat`) и форвардит его сюда, потом стримит события обратно в `useChat`.
 
 Боковая панель добавления задач: поле ввода, кнопка «отправить», валидация на стороне Python через регулярку.
 
@@ -273,6 +282,6 @@ CLI REPL из этапа 3 не убираем — debug-инструмент.
 
 ## Что не делается вообще (вне scope любого этапа)
 
-Зафиксировано в спеке (раздел «Что сейчас не делаем»). Кратко: fuzzy Exa-cache, передача старых research-results, workflow engine, авто-финализация, обязательные UI-подтверждения destructive SQL, raw evidence внутри Smart, отношение к плагинам как к истине, требование полного состава перед публикацией, флаги `has_missing_article` и `is_kit` в Smart, прод-Smart-миграция, версионирование промптов, heartbeat для worker'а, авто-ретраи failure-статусов, retry-стратегии, похожие записи в Smart-плагине, приоритеты в очереди, MCP-обёртка для research-агента, дополнительные фазы 1.5, authentication/мультиюзер, raw token-deltas в `agent_stream_events`, детерминированный merge JSON между turn'ами, auto-обработка пустых обязательных полей в фазе 2.
+Зафиксировано в спеке (раздел «Что сейчас не делаем»). Кратко: fuzzy Exa-cache, передача старых research-results, workflow engine, авто-финализация, обязательные UI-подтверждения destructive SQL, raw evidence внутри Smart, отношение к плагинам как к истине, требование полного состава перед публикацией, флаги `has_missing_article` и `is_kit` в Smart, прод-Smart-миграция, версионирование промптов, heartbeat для worker'а, авто-ретраи failure-статусов, retry-стратегии, похожие записи в Smart-плагине, приоритеты в очереди, MCP-серверы для любых агентов, дополнительные фазы 1.5, authentication/мультиюзер, raw token-deltas в `agent_stream_events`, детерминированный merge JSON между turn'ами, auto-обработка пустых обязательных полей в фазе 2.
 
 Если в процессе работы какой-то из этих пунктов окажется реально нужным — обсуждаем отдельно, добавляем в спеку и в план, после чего реализуем.

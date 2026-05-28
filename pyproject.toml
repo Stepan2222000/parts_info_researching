@@ -1,0 +1,24 @@
+[project]
+name = "parts-research"
+version = "0.1.0"
+description = "Parts research system: research-agent + curator on top of OpenAI Agents SDK + Postgres"
+requires-python = ">=3.13"
+dependencies = [
+    "openai-agents",
+    "openai",
+    "exa-py",
+    "asyncpg",
+    "pydantic",
+    "python-dotenv",
+]
+# Python ставится глобально через mise (см. ~/.config/mise/config.toml).
+# Пакеты — в системный site-packages этого mise-python:
+#   python -m pip install -e .
+# Запуск любого entry-point — `python -m parts_research.cli.<name>`.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

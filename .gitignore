@@ -1,9 +1,19 @@
-node_modules/
 .env
 .txt
 
+# Python
+.venv/
+__pycache__/
+*.pyc
+.python-version
+*.egg-info/
+
+# Legacy TS artifacts (kept for reference but never tracked)
+node_modules/
 exa_results/
 codex_results/
 prompts/
 readable_results/
 storage/
+test_runs/
+test_runs_*/
