@@ -16,6 +16,11 @@ dependencies = [
 #   python -m pip install -e .
 # Запуск любого entry-point — `python -m parts_research.cli.<name>`.
 
+[project.scripts]
+parts-research = "parts_research.cli.research:main"
+parts-research-worker = "parts_research.cli.worker:main"
+parts-research-curator = "parts_research.cli.curator:main"
+
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"

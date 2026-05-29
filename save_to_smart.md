@@ -13,9 +13,9 @@
 - **`parts`** — `name`, `product_type` NOT NULL; `articles`, `model`, `weight_kg`, `description` nullable. `weight_kg > 0 OR NULL`. `product_type` иммутабелен (триггер). Артикулы — regex `^[A-Z0-9\-]{4,20}$`, без дублей внутри массива; для `is_draft=false` минимум один.
 - **`part_articles(article PK)`** — глобальный реестр, синхронизируется триггером с `parts.articles[]`. Один артикул не может жить в двух разных `parts.id` (PK violation).
 - **`part_brands`** — FK на `brands.name`; при `is_draft=false` любая модификация заблокирована, плюс deferred-требование минимум одного бренда.
-- **`part_components`** — PK (parent, child), `quantity > 0`, без self-ref, без циклов. При `is_unverified=false` модификация связок заблокирована, плюс deferred-требование минимум одного компонента.
-- **`is_draft=false`** замораживает поля `parts` (`name`, `articles`, `weight_kg`, `description`, `model`) и `part_brands`. Состав регулируется отдельно — флагом `is_unverified`.
-- **`is_unverified=false`** замораживает только состав. Поля `parts` и `part_brands` остаются изменяемыми (при `is_draft=true`).
+- **`part_components`** — PK (parent, child), `quantity > 0`, без self-ref, без циклов; колонки `quantity`, `can_be_sold_separately`. Флаг `is_unverified` живёт на **`parts`** (не на `part_components`) и относится к составу набора, где запчасть — `parent`.
+- **`is_draft=false`** замораживает поля `parts` (`name`, `articles`, `weight_kg`, `description`, `model`) и `part_brands`. Состав регулируется отдельно — флагом `is_unverified` на строке parent-`parts`.
+- **`is_unverified=false`** (на строке parent-`parts`) замораживает только состав этого набора. Поля `parts` и `part_brands` остаются изменяемыми (при `is_draft=true`).
 
 ## Вход
 

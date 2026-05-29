@@ -169,7 +169,7 @@
 
 Пишем `src/parts_research/queue/worker.py` — главный цикл воркера:
 
-- При старте: берёт **shared advisory-lock** на фиксированном ключе на отдельном соединении и держит его весь lifetime — liveness-сигнал для `cli.research`. Затем `mark_crashed_stale_runs(timeout_minutes=WORKER_STALE_MINUTES)`.
+- При старте: берёт **shared advisory-lock** на фиксированном ключе на отдельном соединении и держит его весь lifetime — liveness-сигнал для `cli.research`; lock-соединение пингуется keepalive'ом (~30 c) и переподключается при разрыве. Затем `mark_crashed_stale_runs(timeout_minutes=WORKER_STALE_MINUTES)`.
 - Бесконечный async-цикл:
   - Если `len(inflight) >= WORKER_CONCURRENCY` — `await asyncio.wait(inflight, return_when=FIRST_COMPLETED)`.
   - Иначе `next = await pick_next_queued_run()`. Если `None` — `await asyncio.sleep(poll_interval)`, иначе `asyncio.create_task(execute_run(...))`, добавляем в `inflight`.
