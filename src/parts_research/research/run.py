@@ -23,6 +23,8 @@ from .context import SMART_PLUGIN_NAME, load_context
 from .errors import NoExactDataError
 from .exa_client import cached_exa_call, pick_search
 from .prompts import (
+    build_family_query,
+    build_family_user_message,
     build_kit_contents_query,
     build_kit_contents_user_message,
     build_low_confidence_query,
@@ -109,7 +111,28 @@ async def _phase1(
     validate(current)
     turn = 1
 
-    # Turn 2 — low_confidence (если есть).
+    # Turn 2 — family-expansion (если у turn 1 есть подтверждённые кроссы):
+    # засеваем поиск самими ПОДТВЕРЖДЁННЫМИ кроссами (не входным артикулом), чтобы
+    # добрать пропущенных «соседей» по семейству преемственности. substring_check на
+    # входной артикул тут НЕ зовём — на страницах-родственниках его законно может не
+    # быть. Highlights only: полный текст при нужде дотянет агент в фазе 2.
+    crosses = [a.article for a in current.numbers.article if a.article != article]
+    if crosses:
+        turn += 1
+        log(f"[phase1] turn {turn} — family_expansion: {crosses}")
+        raw_fam = await cached_exa_call(
+            pool, exa, "web_search_exa",
+            {"query": build_family_query(crosses), "num_results": 10},
+            run_id=run_id, phase="family_expansion",
+        )
+        picked_fam = json.dumps(pick_search(raw_fam), ensure_ascii=False)
+        msg_fam = build_family_user_message(article, picked_fam, current.model_dump_json(indent=2))
+        current = await run_streamed_and_persist(agent, msg_fam, session, pool, run_id, turn)
+        await _write_result(pool, run_id, current)
+        validate(current)
+
+    # low_confidence (если есть): пере-классификация уже известных сомнительных
+    # номеров — список берём из ОБНОВЛЁННОГО после family результата.
     low_conf = [a.article for a in current.numbers.article_low_confidence]
     if low_conf:
         turn += 1
@@ -125,7 +148,7 @@ async def _phase1(
         await _write_result(pool, run_id, current)
         validate(current)
 
-    # Turn 3 — kit_contents (если is_kit).
+    # kit_contents (если is_kit).
     if current.is_kit:
         turn += 1
         log(f"[phase1] turn {turn} — kit_contents")

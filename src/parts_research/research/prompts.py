@@ -26,42 +26,39 @@ RULES_PATH = Path(os.environ.get("RESEARCH_RULES_PATH", _DEFAULT_RULES_PATH))
 
 # ── Exa-запросы фазы 1 (детерминированные формулировки) ────────────────────────
 def build_main_query(article: str) -> str:
+    # Keyword-поиск Exa: номер доминирует. Нейронный режим тащил похожие номера,
+    # из-за чего точное вхождение не находилось и run уходил в failed_no_data.
     return (
-        f'Find information only about the exact part number "{article}".\n\n'
-        f'Hard requirement: in every useful source the string "{article}" must explicitly '
-        "appear in the page text, title, highlights or description. Do not use similar "
-        "numbers, partial matches, transposed digits, or numbers without the letter "
-        "suffix.\n\n"
-        "Needed: exact part name, OEM brand, old/new part number, superseded by, "
-        "replaces, replacement, cross reference, interchange, fitment/application, "
-        "kit contents, weight, exploded diagram, parts catalog, PDF, stores and listings.\n\n"
-        "OEM only. Aftermarket part numbers are not needed, but if an aftermarket page explicitly "
-        f'states the OEM replacement number "{article}" or another OEM number, use only the OEM number.'
+        f"{article} OEM part number cross reference interchange supersedes superseded by "
+        "replaces replacement fitment application kit contents"
+    )
+
+
+def build_family_query(crosses: list[str]) -> str:
+    # Засеваем уже ПОДТВЕРЖДЁННЫМИ кроссами (не входным номером): цель — выйти на
+    # страницы, перечисляющие всё семейство преемственности, и добрать пропущенных
+    # «соседей». type не задаём (как у main) — нейтральный режим давал больше
+    # семейства в highlights, чем keyword.
+    joined = " ".join(crosses)
+    return (
+        f"{joined} OEM part number supersedes superseded by replaces replaced by "
+        "previous version next version interchange cross reference variants"
     )
 
 
 def build_low_confidence_query(article: str, articles: list[str]) -> str:
-    joined = ", ".join(articles)
+    joined = " ".join([article, *articles])
     return (
-        f"Check whether the part numbers {joined} are OEM cross-numbers, superseded by, "
-        f"replaces, replacement, cross reference or interchange for the original part number {article}. "
-        "Only OEM relations are needed, aftermarket is not needed. It is important to find sources where "
-        f"{article} and the checked part numbers explicitly appear together, or where the relation between "
-        "them is stated directly. For each checked part number, find evidence that it is the same OEM "
-        "product, or evidence that the relation is not confirmed / it is a different product."
+        f"{joined} OEM cross reference interchange supersedes superseded by "
+        "replaces replacement same OEM part"
     )
 
 
 def build_kit_contents_query(article: str, articles: list[str]) -> str:
-    joined = ", ".join(articles)
+    joined = " ".join([article, *articles])
     return (
-        f'Find the exact contents of the OEM kit by the original part number "{article}" and the '
-        f"confirmed OEM numbers of this same kit in order of currency: {joined}. Look for kit contents, "
-        "includes, components, component part numbers, quantity, contents list, parts included, exploded "
-        "diagram, parts catalog, PDF. Hard requirement: in every useful source at least one of these OEM "
-        f"kit numbers must explicitly appear: {joined}. Needed: component part numbers, component names, "
-        "quantity of each component, and a source confirming that the component belongs specifically to "
-        "this OEM kit. Aftermarket is not needed."
+        f"{joined} kit contents includes components part numbers quantity "
+        "contents list parts included exploded diagram"
     )
 
 
@@ -77,6 +74,7 @@ SCHEMA_REMINDER = """\
 - Если is_kit=false — kit_contents=[] (пустой массив).
 - numbers.article, numbers.article_low_confidence, numbers.irrelevant — массивы объектов.
 - task_part_number обязан присутствовать в numbers.article.
+- Каждый номер — РОВНО в одном из numbers.article / numbers.article_low_confidence / numbers.irrelevant, без дублей между массивами (особенно нельзя класть один номер и в article, и в irrelevant).
 - brand_oem — массив Smart-брендов (UPPER_SNAKE_CASE из списка выше).
 - product_type — одно из допустимых значений или null.
 - Пустые строки запрещены: если значения нет — ставь null / пустой массив, не "".
@@ -144,6 +142,24 @@ def build_main_user_message(article: str, raw_json: str) -> str:
         f"Входной артикул: {article}\n"
         f"Основной Exa-поиск (url/title/highlights):\n{raw_json}\n\n"
         "Сформируй стартовый JSON по схеме на основании этих источников."
+    )
+
+
+def build_family_user_message(article: str, raw_json: str, current_json: str) -> str:
+    return (
+        f"Это ДОПОЛНИТЕЛЬНЫЙ поиск, засеянный уже ПОДТВЕРЖДЁННЫМИ OEM-кроссами "
+        f"артикула {article} (не самим входным номером), чтобы найти ПРОПУЩЕННЫЕ "
+        f"родственные номера того же семейства.\n\n"
+        f"Свежий Exa-поиск (url/title/highlights):\n{raw_json}\n\n"
+        f"Твой текущий JSON:\n{current_json}\n\n"
+        "Добавь найденные новые номера: уверенные (есть явный источник в этом "
+        "поиске) → numbers.article; спорные → numbers.article_low_confidence. "
+        "Если новый источник явно подтверждает номер, ранее лежавший в "
+        "numbers.irrelevant, можешь перенести его в article/low_confidence. "
+        "НИКОГДА не выкидывай и не перемещай входной артикул и уже подтверждённые "
+        "кроссы. Не добавляй номер, который нечем подкрепить из этого поиска. "
+        "Остальные поля сохрани без изменений. Один номер — только в одном массиве. "
+        "Ответ — только валидный JSON по схеме."
     )
 
 
