@@ -610,6 +610,7 @@ UI должен показывать:
 - `parts_research_worker` — Python-процесс с пулом параллельных research-runs (Agents SDK + `@function_tool`, без MCP).
 - `parts_research_curator` — Python-процесс с курсор-агентом и его тулами (`@function_tool` в том же процессе). На этапе 3 в нём поднимается CLI REPL; на этапе 4 — FastAPI-эндпоинт `POST /curator/message` для UI.
 - На этапе 4: `parts_research_app` — Next.js приложение (API + UI), которое ходит в `parts_research_curator` по HTTP и в `parts_research_worker` (или прямо в БД через FDW-views) для статуса задач.
+- `parts_research_public_api` (`cli.public_api`) — отдельный публичный HTTP-процесс **только для внешних систем**: `POST /research` (submit-and-wait), `GET /research/{run_id}`, `GET /health`. Намеренно без эндпоинтов куратора и UI-выборок (куратор умеет SQL и запись в Smart — наружу не выставляется). Единственный сервис с проброшенным наружу портом; без аутентификации. Контракт для внешних описан в `EXTERNAL_API.md`.
 
 Все Python-процессы собираются из одного `Dockerfile` (multi-stage с `pip install --no-cache-dir`), различаются только командой запуска в `docker-compose.yml`. Образ — `python:3.13-slim` базовый.
 
