@@ -10,6 +10,9 @@ dependencies = [
     "asyncpg",
     "pydantic",
     "python-dotenv",
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlparse",
 ]
 # Python ставится глобально через mise (см. ~/.config/mise/config.toml).
 # Пакеты — в системный site-packages этого mise-python:
@@ -20,6 +23,7 @@ dependencies = [
 parts-research = "parts_research.cli.research:main"
 parts-research-worker = "parts_research.cli.worker:main"
 parts-research-curator = "parts_research.cli.curator:main"
+parts-research-api = "parts_research.cli.api:main"
 
 [build-system]
 requires = ["setuptools>=61"]

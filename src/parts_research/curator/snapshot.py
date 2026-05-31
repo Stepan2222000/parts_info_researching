@@ -9,15 +9,20 @@ import asyncpg
 PENDING_LIMIT = 20
 
 
+# Считаем по ПОСЛЕДНЕМУ run каждой задачи — консистентно с дашбордом (api/queries.py),
+# чтобы число «ждёт куратора» в снапшоте совпадало с чипом в UI (re-run не двоит).
+_LATEST = "SELECT DISTINCT ON (task_id) id AS run_id, task_id, status FROM task_runs ORDER BY task_id, id DESC"
+
+
 async def load_snapshot(pool: asyncpg.Pool) -> dict:
-    counts = await pool.fetch("SELECT status, count(*) AS n FROM task_runs GROUP BY status")
+    counts = await pool.fetch(f"SELECT status, count(*) AS n FROM ({_LATEST}) s GROUP BY status")
     pending = await pool.fetch(
-        "SELECT r.id AS run_id, t.article, dp.name, dp.product_type, dp.is_kit "
-        "FROM task_runs r "
-        "JOIN tasks t ON t.id = r.task_id "
-        "JOIN draft_parts dp ON dp.run_id = r.id "
-        "WHERE r.status = 'done' AND NOT EXISTS (SELECT 1 FROM publications p WHERE p.run_id = r.id) "
-        "ORDER BY r.id LIMIT $1",
+        f"SELECT s.run_id, t.article, dp.name, dp.product_type, dp.is_kit "
+        f"FROM ({_LATEST}) s "
+        f"JOIN tasks t ON t.id = s.task_id "
+        f"LEFT JOIN draft_parts dp ON dp.run_id = s.run_id "
+        f"WHERE s.status = 'done' AND NOT EXISTS (SELECT 1 FROM publications p WHERE p.run_id = s.run_id) "
+        f"ORDER BY s.run_id LIMIT $1",
         PENDING_LIMIT,
     )
     return {

@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError
 
 from ..config import settings
+from ..db.pool import strip_nul
 from ..db.session import PostgresSession
 from .agent_factory import make_research_agent
 from .context import SMART_PLUGIN_NAME, load_context
@@ -203,6 +204,9 @@ async def _phase2(
 async def _parse_to_draft(
     pool: asyncpg.Pool, run_id: int, r: StructuredResult, needs_review_reason: str | None
 ) -> None:
+    # draft-таблицы пишут поля как plain text (name, evidence, ...), а не jsonb —
+    # codec strip_nul их не покрывает; чистим  в самом результате модели.
+    r = StructuredResult.model_validate(strip_nul(r.model_dump(mode="json")))
     async with pool.acquire() as conn:
         async with conn.transaction():
             weight_kg = Decimal(str(r.weight.kg)) if r.weight is not None else None

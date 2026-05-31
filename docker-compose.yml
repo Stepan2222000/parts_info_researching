@@ -1,0 +1,71 @@
+# ============================================================
+# parts_research — prod-сервисы (Этапы 2–4).
+# Postgres-контейнеры (parts_research / smart_test / brands_mapping) уже подняты
+# на сервере в сети db_default — здесь их НЕ поднимаем, только подключаемся.
+#
+#   docker compose build                # собрать локально
+#   docker compose up -d worker api app # поднять
+#   docker compose --profile debug run --rm curator   # REPL куратора (по требованию)
+#
+# Образы тянутся из ghcr при деплое (GHCR_OWNER/TAG задаёт CI).
+# ============================================================
+
+x-python-image: &python-image
+  image: ghcr.io/${GHCR_OWNER:-local}/parts-research-api:${TAG:-latest}
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env
+  networks: [db_default]
+  restart: unless-stopped
+
+services:
+  worker:
+    <<: *python-image
+    command: ["python", "-m", "parts_research.cli.worker"]
+
+  api:
+    <<: *python-image
+    command: ["python", "-m", "parts_research.cli.api"]
+    expose: ["8000"]
+    # db_default — общая сеть многих проектов, где сервис `api` неоднозначен.
+    # Даём уникальный алиас, чтобы app точно попадал в НАШ api.
+    networks:
+      db_default:
+        aliases: [parts_research_api]
+
+  # Публичный API для внешних систем: ТОЛЬКО постановка в очередь + ожидание
+  # результата (без куратора и UI). Единственный наш сервис с проброшенным наружу
+  # портом. Без аутентификации — обращаться может кто угодно из доступной сети.
+  public-api:
+    <<: *python-image
+    command: ["python", "-m", "parts_research.cli.public_api"]
+    ports:
+      - "8100:8100"
+
+  app:
+    image: ghcr.io/${GHCR_OWNER:-local}/parts-research-app:${TAG:-latest}
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      PARTS_RESEARCH_API_URL: "http://parts_research_api:8000"
+    ports:
+      # 3000 занят на сервере (ebay_to_buy_web) → публикуем на 3001.
+      - "3001:3000"
+    depends_on: [api]
+    networks: [db_default]
+    restart: unless-stopped
+
+  # Debug-only: интерактивный REPL куратора. Не стартует по умолчанию.
+  curator:
+    <<: *python-image
+    profiles: ["debug"]
+    command: ["python", "-m", "parts_research.cli.curator"]
+    stdin_open: true
+    tty: true
+    restart: "no"
+
+networks:
+  db_default:
+    external: true

@@ -16,3 +16,7 @@ prompts/
 readable_results/
 storage/
 test_runs/
+
+# Local agent config & dated test artifacts
+.claude/
+test_runs_*/

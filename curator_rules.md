@@ -66,7 +66,7 @@ LIMIT N;
 | weight_kg | weight_kg |
 | models_text | model |
 | description | description |
-| draft_part_articles (только confidence='confirmed', длина 4-20) | articles (TEXT[]) |
+| draft_part_articles (только confidence='confirmed', длина 4-20) | articles (TEXT[]) — порядок задаётся research'ем (новые/актуальные → старые) и принудительно восстанавливается тулом `save_to_smart` по `draft_part_articles`; сам порядок в payload можешь не выверять |
 | brand_oem (массив) | brands (массив строк в payload) |
 
 ## Маппинг kit_contents → components

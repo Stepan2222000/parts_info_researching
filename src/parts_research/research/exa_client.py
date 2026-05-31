@@ -7,12 +7,42 @@ Pick/обрезка под нужды модели применяются на �
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
+import time
+from collections import deque
 from typing import Any
 
 import asyncpg
 from exa_py import AsyncExa
+
+# Глобальный троттл РЕАЛЬНЫХ Exa-вызовов (Exa лимитит 10 req/s). Скользящее окно
+# 1 сек; применяется только на cache-miss — попадания в кэш Exa не дёргают.
+# Один процесс = один лимитер (общий для всех конкурентных run'ов процесса).
+EXA_MAX_REQUESTS_PER_SEC = int(os.environ.get("EXA_MAX_REQUESTS_PER_SEC", "10"))
+
+
+class _ExaRateLimiter:
+    def __init__(self, max_per_sec: int) -> None:
+        self._max = max_per_sec
+        self._calls: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                while self._calls and now - self._calls[0] >= 1.0:
+                    self._calls.popleft()
+                if len(self._calls) < self._max:
+                    self._calls.append(now)
+                    return
+                await asyncio.sleep(1.0 - (now - self._calls[0]))
+
+
+_exa_limiter = _ExaRateLimiter(EXA_MAX_REQUESTS_PER_SEC)
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -40,11 +70,14 @@ def _canonical_hash(tool_name: str, args: dict[str, Any]) -> str:
 
 async def _call_exa(exa: AsyncExa, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     if tool_name == "web_search_exa":
-        response = await exa.search(
-            args["query"],
-            num_results=int(args.get("num_results", 10)),
-            contents={"highlights": True},
-        )
+        search_kwargs: dict[str, Any] = {
+            "num_results": int(args.get("num_results", 10)),
+            "contents": {"highlights": True},
+        }
+        # type="keyword" — точный поиск по номеру (нейронный режим тащил похожие номера).
+        if args.get("type"):
+            search_kwargs["type"] = args["type"]
+        response = await exa.search(args["query"], **search_kwargs)
     elif tool_name == "web_fetch_exa":
         response = await exa.get_contents(args["urls"], text=True)
     else:
@@ -81,6 +114,8 @@ async def cached_exa_call(
         )
     else:
         # Реальный сетевой вызов вне транзакции (не держим соединение).
+        # Глобальный троттл, чтобы не ловить Exa 429 (10 req/s) при высокой параллельности.
+        await _exa_limiter.acquire()
         response = await _call_exa(exa, tool_name, args)
         cache_id = await pool.fetchval(
             "INSERT INTO exa_cache (request_hash, tool_name, arguments, response) "

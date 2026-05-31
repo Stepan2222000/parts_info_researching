@@ -15,8 +15,27 @@ import asyncpg
 from ..config import settings
 
 
+def strip_nul(value: object) -> object:
+    """Рекурсивно вырезает байт \\u0000 из всех строк структуры.
+
+    Postgres text/jsonb физически не хранит NUL (UntranslatableCharacterError:
+    "\\u0000 cannot be converted to text"). NUL прилетает в сыром тексте страниц
+    из Exa-скрейпа и роняет INSERT (весь run -> failed_crashed). Чистим перед
+    записью. На ключ кэша не влияет — request_hash считается отдельно от args.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [strip_nul(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(strip_nul(v) for v in value)
+    if isinstance(value, dict):
+        return {k: strip_nul(v) for k, v in value.items()}
+    return value
+
+
 def _dumps(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False)
+    return json.dumps(strip_nul(value), ensure_ascii=False)
 
 
 async def _init_connection(conn: asyncpg.Connection) -> None:

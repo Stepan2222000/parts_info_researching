@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 import asyncpg
+import sqlparse
 from exa_py import AsyncExa
 from pydantic import BaseModel
 
@@ -42,40 +43,66 @@ def _dec(v: float | None) -> Decimal | None:
 
 
 # ── execute_sql ──────────────────────────────────────────────────────────────────
+def _split_sql(sql: str) -> list[str]:
+    """Режет скрипт на отдельные statement'ы через sqlparse (учитывает строки/кавычки/комментарии)."""
+    return [s for s in (x.strip() for x in sqlparse.split(sql)) if s]
+
+
+def _returns_rows(stmt: str) -> bool:
+    head = stmt.lstrip().lower()
+    return head.startswith("select") or head.startswith("with") or "returning" in head
+
+
 @function_tool
 async def execute_sql(wrapper: RunContextWrapper[CuratorRunContext], sql: str) -> str:
     """Execute raw SQL against parts_research (+ smart.* / brand_mapping.* via FDW).
 
-    SELECT/WITH/RETURNING return rows as JSON; other statements return affected row_count.
-    Every call is logged to agent_sql_log. Multi-statement scripts (BEGIN/COMMIT) are allowed.
+    Поддерживает несколько statement'ов в одном вызове (разделяй `;`) — каждый выполняется
+    по очереди на одном соединении. SELECT/WITH/RETURNING возвращают строки, прочее — row_count.
+    Один statement → результат напрямую; несколько → {"statements": [...]}. Каждый вызов
+    логируется в agent_sql_log. Ошибку statement'а показываем (не скрываем) и останавливаемся.
 
     Args:
-        sql: SQL to run.
+        sql: один SQL-statement или скрипт из нескольких (через `;`).
     """
     ctx = wrapper.context
     log_id = await ctx.pool.fetchval(
         "INSERT INTO agent_sql_log (session_id, sql_text) VALUES ($1, $2) RETURNING id",
         ctx.session_id, sql,
     )
+    statements = _split_sql(sql)
+    results: list[dict] = []
+    total = 0
+    error: str | None = None
     try:
-        head = sql.lstrip().lower()
-        returns_rows = head.startswith("select") or head.startswith("with") or "returning" in head
         async with ctx.pool.acquire() as conn:
-            if returns_rows:
-                rows = await conn.fetch(sql)
-                data = [dict(r) for r in rows]
-                await ctx.pool.execute(
-                    "UPDATE agent_sql_log SET rows_affected=$2, finished_at=now() WHERE id=$1", log_id, len(data))
-                return json.dumps({"rows": data, "row_count": len(data)}, ensure_ascii=False, default=str)
-            tag = await conn.execute(sql)
-            n = _parse_count(tag)
-            await ctx.pool.execute(
-                "UPDATE agent_sql_log SET rows_affected=$2, finished_at=now() WHERE id=$1", log_id, n)
-            return json.dumps({"command": tag, "row_count": n}, ensure_ascii=False, default=str)
-    except Exception as e:  # noqa: BLE001 — текст ошибки наружу, не скрываем
-        await ctx.pool.execute(
-            "UPDATE agent_sql_log SET error=$2, finished_at=now() WHERE id=$1", log_id, f"{type(e).__name__}: {e}")
-        return f"SQL error: {type(e).__name__}: {e}"
+            for i, st in enumerate(statements):
+                try:
+                    if _returns_rows(st):
+                        rows = await conn.fetch(st)
+                        results.append({"rows": [dict(r) for r in rows], "row_count": len(rows)})
+                        total += len(rows)
+                    else:
+                        tag = await conn.execute(st)
+                        n = _parse_count(tag)
+                        results.append({"command": tag, "row_count": n})
+                        total += n
+                except Exception as e:  # noqa: BLE001 — ошибку statement'а показываем, не глотаем
+                    error = f"statement {i + 1}/{len(statements)}: {type(e).__name__}: {e}"
+                    results.append({"statement_index": i, "error": error})
+                    break
+    except Exception as e:  # noqa: BLE001 — ошибка соединения
+        error = f"{type(e).__name__}: {e}"
+    await ctx.pool.execute(
+        "UPDATE agent_sql_log SET rows_affected=$2, error=$3, finished_at=now() WHERE id=$1",
+        log_id, total, error,
+    )
+    # Один statement без ошибки — отдаём результат напрямую (как раньше); иначе массив.
+    if len(statements) <= 1 and error is None:
+        return json.dumps(results[0] if results else {"rows": [], "row_count": 0},
+                          ensure_ascii=False, default=str)
+    return json.dumps({"statements": results, "row_count": total, "error": error},
+                      ensure_ascii=False, default=str)
 
 
 # ── mark_needs_review ────────────────────────────────────────────────────────────
@@ -223,7 +250,35 @@ async def _save_component(conn, parent_id, comp: SaveComponent) -> dict:
     return {"status": "ok", "smart_id": cid, "linked": True}
 
 
+async def _confirmed_article_order(conn, run_id: int) -> list[str]:
+    """Эталонная цепочка артикулов из research для run'а: подтверждённые OEM-номера в
+    порядке, заданном агентом (новые/актуальные → старые). draft_parts.run_id UNIQUE,
+    порядок строк = порядок вставки (executemany) → ORDER BY id восстанавливает его."""
+    rows = await conn.fetch(
+        "SELECT a.article FROM draft_part_articles a "
+        "JOIN draft_parts d ON d.id = a.draft_part_id "
+        "WHERE d.run_id = $1 AND a.confidence = 'confirmed' ORDER BY a.id",
+        run_id)
+    return [r["article"] for r in rows]
+
+
+def _order_articles(articles: list[str] | None, reference: list[str]) -> list[str] | None:
+    """Переупорядочить articles под эталон reference (новые→старые из research), не меняя состав.
+    Номера из reference идут в его порядке; добавленные куратором (которых нет в reference) —
+    в хвост с сохранением их относительного порядка. None/пустой список — не трогаем."""
+    if not articles:
+        return articles
+    idx = {a: i for i, a in enumerate(reference)}
+    known = sorted((a for a in articles if a in idx), key=lambda a: idx[a])
+    unknown = [a for a in articles if a not in idx]
+    return known + unknown
+
+
 async def _save_one_part(conn, part: SavePart, session_id: int) -> dict:
+    # Порядок articles задаёт research (новые→старые), а не куратор: берём эталон из
+    # draft_part_articles этого run'а и переставляем под него. Состав не меняем.
+    part.articles = _order_articles(part.articles, await _confirmed_article_order(conn, part.run_id))
+
     if part.smart_id is None:
         parent_id = await _insert_part(conn, name=part.name, product_type=part.product_type, articles=part.articles,
                                        model=part.model, weight_kg=part.weight_kg, description=part.description)

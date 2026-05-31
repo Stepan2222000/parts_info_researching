@@ -1,0 +1,6 @@
+allowBuilds:
+  sharp: true
+minimumReleaseAgeExclude:
+  - '@ai-sdk/gateway@3.0.121'
+  - '@ai-sdk/react@3.0.195'
+  - ai@6.0.193
