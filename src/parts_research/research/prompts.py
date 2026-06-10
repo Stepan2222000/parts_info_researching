@@ -1,8 +1,8 @@
 """Сборка системного промпта и user-сообщений всех turn'ов.
 
 Системный промпт одинаков для всех turn'ов одного run'а: правила
-research_rules.md + допустимые product_type/бренды/алиасы (из БД через FDW) +
-подсказка Smart-плагина (если есть) + напоминание о формате. Бренды/типы/алиасы
+research_rules.md + классы техники/бренды/алиасы (из БД через FDW) +
+подсказка Smart-плагина (если есть) + напоминание о формате. Бренды/классы/алиасы
 берутся из ResearchContext, НЕ хардкодятся.
 
 В каждое user-сообщение фаз 1/2 (кроме turn 1) явно встраивается текущий JSON —
@@ -76,7 +76,9 @@ SCHEMA_REMINDER = """\
 - task_part_number обязан присутствовать в numbers.article.
 - Каждый номер — РОВНО в одном из numbers.article / numbers.article_low_confidence / numbers.irrelevant, без дублей между массивами (особенно нельзя класть один номер и в article, и в irrelevant).
 - brand_oem — массив Smart-брендов (UPPER_SNAKE_CASE из списка выше).
-- product_type — одно из допустимых значений или null.
+- vehicle_classes — массив слагов классов техники из списка выше (можно несколько,
+  в т.ч. разных типов — например, общая деталь гидроциклов и снегоходов:
+  ["jetski","snowmobile"]). Не смог определить — пустой массив [].
 - Пустые строки запрещены: если значения нет — ставь null / пустой массив, не "".
 """
 
@@ -121,12 +123,15 @@ def build_system_prompt(context: ResearchContext) -> str:
     if context.smart_payload is not None:
         smart_hint = "\n" + format_smart_hint(context.smart_payload) + "\n"
 
+    classes = "\n".join(
+        f"  {vc.slug} — {vc.title_ru}" for vc in context.vehicle_classes
+    )
     return f"""\
 Ты исследуешь OEM-запчасть по входному артикулу и собираешь о ней структурированные \
 данные строго на основании предоставленных источников. Отвечай на русском.
 
-Допустимые product_type:
-  {", ".join(context.allowed_product_types)}
+Классы техники (vehicle_classes — слаги только из этого списка):
+{classes}
 
 Допустимые Smart-бренды (brand_oem только из этого списка, UPPER_SNAKE_CASE):
   {", ".join(context.allowed_brands)}

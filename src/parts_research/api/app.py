@@ -40,8 +40,11 @@ async def lifespan(app: FastAPI):
     exa = AsyncExa(api_key=settings.exa_api_key)
     async with pool.acquire() as conn:
         brands = [r["name"] for r in await conn.fetch("SELECT name FROM smart.brands ORDER BY name")]
-        types = [r["name"] for r in await conn.fetch("SELECT name FROM smart.product_types ORDER BY name")]
-    agent = make_curator_agent(build_curator_system_prompt(brands, types))
+        classes = [
+            r["name"] for r in await conn.fetch(
+                "SELECT slug || ' — ' || title_ru AS name FROM smart.vehicle_classes ORDER BY position")
+        ]
+    agent = make_curator_agent(build_curator_system_prompt(brands, classes))
 
     app.state.pool = pool
     app.state.exa = exa

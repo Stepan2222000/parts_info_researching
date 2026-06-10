@@ -2,7 +2,7 @@
 валидация входного артикула и substring-check Exa-ответа.
 
 Каждое правило живёт только в одном слое; здесь — правила, которым нужны
-runtime-данные (allowed_brands/product_types, expected_part_number) и
+runtime-данные (allowed_brands/vehicle_classes, expected_part_number) и
 backend-проверки, которых нет в Pydantic-схеме."""
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def post_validate(
     *,
     expected_part_number: str,
     allowed_brands: list[str],
-    allowed_product_types: list[str],
+    allowed_vehicle_classes: list[str],
 ) -> None:
     """Доменные правила, требующие runtime-данных. Провал -> ValueError -> failed_validation."""
     if result.task_part_number != expected_part_number:
@@ -50,8 +50,13 @@ def post_validate(
     if bad_brands:
         raise ValueError(f"brand_oem not in allowed Smart brands: {bad_brands}")
 
-    if result.product_type is not None and result.product_type not in allowed_product_types:
-        raise ValueError(f"product_type {result.product_type!r} not in allowed set")
+    # Кросс-типовый мультикласс легален (Rotax: jetski+snowmobile) — проверяем
+    # только что слаги из справочника. Дубли запрещены.
+    bad_classes = [c for c in result.vehicle_classes if c not in allowed_vehicle_classes]
+    if bad_classes:
+        raise ValueError(f"vehicle_classes not in allowed set: {bad_classes}")
+    if len(set(result.vehicle_classes)) != len(result.vehicle_classes):
+        raise ValueError("vehicle_classes contains duplicates")
 
     if not result.is_kit and result.kit_contents:
         raise ValueError("is_kit=false but kit_contents is not empty")

@@ -89,7 +89,7 @@ class StructuredResult(BaseModel):
     task_part_number: NonEmptyStr
     name: NonEmptyStr | None
     brand_oem: list[NonEmptyStr]
-    product_type: NonEmptyStr | None
+    vehicle_classes: list[NonEmptyStr]  # слаги smart.vehicle_classes; [] = не определены
     description: NonEmptyStr | None
     weight: WeightBlock | None
     models: ModelsBlock | None

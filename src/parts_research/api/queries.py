@@ -34,6 +34,7 @@ SELECT * FROM (
         r.finished_at,
         dp.name,
         dp.product_type,
+        dp.vehicle_classes,
         dp.is_kit,
         dp.brand_oem,
         EXISTS (SELECT 1 FROM publications p WHERE p.run_id = r.id) AS published
@@ -88,6 +89,7 @@ def _card(r: asyncpg.Record) -> dict:
         "finished_at": _iso(r["finished_at"]),
         "name": r["name"],
         "product_type": r["product_type"],
+        "vehicle_classes": list(r["vehicle_classes"]) if r["vehicle_classes"] is not None else [],
         "is_kit": r["is_kit"],
         "brand_oem": list(r["brand_oem"]) if r["brand_oem"] is not None else [],
         "published": r["published"],
@@ -195,6 +197,7 @@ def _draft(d: asyncpg.Record) -> dict:
         "name": d["name"],
         "brand_oem": list(d["brand_oem"]) if d["brand_oem"] is not None else [],
         "product_type": d["product_type"],
+        "vehicle_classes": list(d["vehicle_classes"]) if d["vehicle_classes"] is not None else [],
         "description": d["description"],
         "is_kit": d["is_kit"],
         "weight_kg": float(d["weight_kg"]) if d["weight_kg"] is not None else None,

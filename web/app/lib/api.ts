@@ -38,6 +38,7 @@ export interface TaskCard {
   finished_at: string | null;
   name: string | null;
   product_type: string | null;
+  vehicle_classes: string[];
   is_kit: boolean | null;
   brand_oem: string[];
   published: boolean;
@@ -93,6 +94,7 @@ export interface RunDetail {
     name: string | null;
     brand_oem: string[];
     product_type: string | null;
+    vehicle_classes: string[];
     description: string | null;
     is_kit: boolean;
     weight_kg: number | null;

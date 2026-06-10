@@ -1,6 +1,6 @@
 """Контекст промпта research-агента, загружаемый из БД через FDW на старте run'а:
-список Smart-брендов, product_types, алиасы брендов и Smart-плагин (точное
-совпадение по артикулу + связанные компоненты).
+список Smart-брендов, классы техники (vehicle_classes), алиасы брендов и
+Smart-плагин (точное совпадение по артикулу + связанные компоненты).
 
 Всё грузится параллельно (4 запроса). Smart-плагин — подсказка, не истина:
 если ничего не найдено, payload = None и в промпт ничего не подмешивается."""
@@ -17,11 +17,32 @@ SMART_PLUGIN_NAME = "smart"
 
 
 @dataclass(frozen=True)
+class VehicleClassInfo:
+    slug: str
+    title_ru: str
+    product_type: str  # проекция на грубый тип (словарь smart.product_types)
+    position: int
+
+
+@dataclass(frozen=True)
 class ResearchContext:
     allowed_brands: list[str]
-    allowed_product_types: list[str]
+    vehicle_classes: list[VehicleClassInfo]  # справочник классов техники (по position)
     brand_aliases: dict[str, str]  # alias -> canonical (Smart-бренд)
     smart_payload: dict[str, Any] | None  # подсказка Smart-плагина или None
+
+    @property
+    def allowed_vehicle_classes(self) -> list[str]:
+        return [vc.slug for vc in self.vehicle_classes]
+
+    def derive_product_type(self, slugs: list[str]) -> str | None:
+        """Деривация грубого типа для draft_parts: тип класса с минимальной position
+        (та же логика, что во VIEW smart.parts_with_components)."""
+        chosen = set(slugs)
+        for vc in self.vehicle_classes:  # уже отсортированы по position
+            if vc.slug in chosen:
+                return vc.product_type
+        return None
 
 
 async def smart_plugin_lookup(pool: asyncpg.Pool, article: str) -> dict[str, Any] | None:
@@ -75,15 +96,24 @@ async def smart_plugin_lookup(pool: asyncpg.Pool, article: str) -> dict[str, Any
 
 
 async def load_context(pool: asyncpg.Pool, article: str) -> ResearchContext:
-    brands, types, aliases, smart_payload = await asyncio.gather(
+    brands, classes, aliases, smart_payload = await asyncio.gather(
         pool.fetch("SELECT name FROM smart.brands ORDER BY name"),
-        pool.fetch("SELECT name FROM smart.product_types ORDER BY name"),
+        pool.fetch(
+            "SELECT slug, title_ru, product_type, position "
+            "FROM smart.vehicle_classes ORDER BY position"
+        ),
         pool.fetch("SELECT alias, canonical FROM brand_mapping.brand_aliases"),
         smart_plugin_lookup(pool, article),
     )
     return ResearchContext(
         allowed_brands=[r["name"] for r in brands],
-        allowed_product_types=[r["name"] for r in types],
+        vehicle_classes=[
+            VehicleClassInfo(
+                slug=r["slug"], title_ru=r["title_ru"],
+                product_type=r["product_type"], position=r["position"],
+            )
+            for r in classes
+        ],
         brand_aliases={r["alias"]: r["canonical"] for r in aliases},
         smart_payload=smart_payload,
     )

@@ -10,7 +10,7 @@
 
 Тул не валидирует то, что уже форсит БД; правила доступа ниже опираются на эти инварианты:
 
-- **`parts`** — `name`, `product_type` NOT NULL; `articles`, `model`, `weight_kg`, `description` nullable. `weight_kg > 0 OR NULL`. `product_type` иммутабелен (триггер). Артикулы — regex `^[A-Z0-9\-]{4,20}$`, без дублей внутри массива; для `is_draft=false` минимум один.
+- **`parts`** — `name` NOT NULL; `articles`, `vehicle_classes`, `model`, `weight_kg`, `description` nullable. `weight_kg > 0 OR NULL`. Колонки `product_type` в `parts` НЕТ (миграция 015) — тип вычисляется из классов во VIEW. `vehicle_classes` — массив слагов (boat/jetski/quad/snowmobile/motorcycle/auto), синхронится в реестр `part_vehicle_classes` триггером; сверенные строки реестра заморожены. Артикулы — regex `^[A-Z0-9\-]{4,20}$`, без дублей внутри массива; для `is_draft=false` минимум один.
 - **`part_articles(article PK)`** — глобальный реестр, синхронизируется триггером с `parts.articles[]`. Один артикул не может жить в двух разных `parts.id` (PK violation).
 - **`part_brands`** — FK на `brands.name`; при `is_draft=false` любая модификация заблокирована, плюс deferred-требование минимум одного бренда.
 - **`part_components`** — PK (parent, child), `quantity > 0`, без self-ref, без циклов; колонки `quantity`, `can_be_sold_separately`. Флаг `is_unverified` живёт на **`parts`** (не на `part_components`) и относится к составу набора, где запчасть — `parent`.
@@ -27,14 +27,14 @@
 
 - `run_id` (обяз.) — id research-run'а, идёт в `publications`.
 - `smart_id` (опц.) — id существующей `smart.parts`. **Есть → UPDATE.** Нет → INSERT.
-- `name`, `articles`, `product_type`, `weight_kg`, `model`, `description` — поля `smart.parts`. При INSERT обязательны `name` и `product_type` (NOT NULL в схеме). Остальные nullable.
+- `name`, `articles`, `vehicle_classes`, `weight_kg`, `model`, `description` — поля `smart.parts`. При INSERT обязательны `name` и непустой `vehicle_classes` (валидация тула). Остальные nullable.
 - `brands` — массив строк (например `["MERCRUISER"]`). Имена должны быть в `smart.brands`.
 - `components` — массив компонентов (если kit). Отсутствие или `[]` — состав не трогаем.
 
 Поля одного `component` (run_id наследуется от parent'а):
 
 - `smart_id` (опц.) — id существующей `smart.parts`. Есть → работа с существующей записью, нет → INSERT нового.
-- `name`, `articles`, `product_type`, `weight_kg`, `model`, `description` — те же поля.
+- `name`, `articles`, `vehicle_classes`, `weight_kg`, `model`, `description` — те же поля; `vehicle_classes` компонента опционален: пустой/отсутствует → компонент наследует классы родителя-кита.
 - `brands` — массив строк.
 - `quantity` (опц., default 1) — количество в связке `part_components`.
 
@@ -53,7 +53,7 @@ INSERT в `smart.parts` с явными `is_draft=true, is_unverified=true` (FDW
 1. **Записи нет** → ошибка `smart_id=X not found`.
 2. **`is_draft = false`** → отказ всего part'а (Smart-триггеры всё равно заблокируют поля и бренды; модификация состава ещё могла бы пройти, но мы консервативно не разрешаем апдейт published-записи через этот тул).
 3. **`is_draft = true`** → разрешён UPDATE:
-   - Поля `name`, `articles`, `weight_kg`, `model`, `description` перезаписываются из payload. `product_type` игнорируется всегда.
+   - Поля `name`, `articles`, `weight_kg`, `model`, `description` перезаписываются из payload. `vehicle_classes` — merge-only: классы из payload добавляются к существующим, удаление классов тулом невозможно (только человек руками; сверенные строки защищены freeze-триггером).
    - `brands` — если ключ передан: DELETE всех связок + INSERT по payload (включая `brands: []` = очистка).
    - `components` — поведение зависит от `is_unverified`:
      - **`is_unverified = true`**: DELETE всех `part_components` с этим `parent_id` + INSERT новых по `components[]`.
@@ -116,7 +116,7 @@ Backend читает запись компонента:
 
 ```json
 { "parts": [ { "run_id": 8, "name": "Сиденье Sea-Doo", "articles": ["295100923"],
-  "product_type": "Для водного транспорта", "weight_kg": 6.8, "brands": ["BRP"] } ] }
+  "vehicle_classes": ["jetski"], "weight_kg": 6.8, "brands": ["BRP"] } ] }
 ```
 
 Backend: INSERT `smart.parts` (с явными `is_draft=true, is_unverified=true`) → INSERT `part_brands(BRP)` → 1 строка в `publications` для этого part'а.
@@ -126,10 +126,10 @@ Backend: INSERT `smart.parts` (с явными `is_draft=true, is_unverified=tru
 ```json
 { "parts": [ {
   "run_id": 4, "name": "Kit сальников", "articles": ["76868A04"],
-  "product_type": "Для водного транспорта", "brands": ["MERCRUISER"],
+  "vehicle_classes": ["boat"], "brands": ["MERCRUISER"],
   "components": [
-    { "name": "Сальники", "articles": [], "product_type": "Для водного транспорта", "brands": ["MERCRUISER"] },
-    { "name": "O-rings",  "articles": [], "product_type": "Для водного транспорта", "brands": ["MERCRUISER"] }
+    { "name": "Сальники", "articles": [], "brands": ["MERCRUISER"] },
+    { "name": "O-rings",  "articles": [], "brands": ["MERCRUISER"] }
   ]
 } ] }
 ```
@@ -172,7 +172,7 @@ Payload с любым `components` (включая `[]`) возвращает:
 ```json
 { "parts": [ {
   "run_id": 13, "name": "New kit", "articles": ["NK01"],
-  "product_type": "Для водного транспорта", "brands": ["MERCRUISER"],
+  "vehicle_classes": ["boat"], "brands": ["MERCRUISER"],
   "components": [ { "smart_id": "smart_36555915", "quantity": 2 } ]
 } ] }
 ```
@@ -188,8 +188,8 @@ Payload с любым `components` (включая `[]`) возвращает:
 
 ```json
 { "parts": [
-  { "run_id": 6, "name": "Катушка", "articles": ["8M0077471"], "product_type": "Для водного транспорта", "brands": ["MERCRUISER"] },
-  { "run_id": 8, "name": "Сиденье", "articles": ["295100923"],  "product_type": "Для водного транспорта", "brands": ["BRP"] }
+  { "run_id": 6, "name": "Катушка", "articles": ["8M0077471"], "vehicle_classes": ["boat"], "brands": ["MERCRUISER"] },
+  { "run_id": 8, "name": "Сиденье", "articles": ["295100923"],  "vehicle_classes": ["jetski"], "brands": ["BRP"] }
 ] }
 ```
 

@@ -21,6 +21,7 @@ function matchesQuery(card: TaskCardData, query: string): boolean {
     card.name ?? "",
     (card.brand_oem ?? []).join(" "),
     card.product_type ?? "",
+    (card.vehicle_classes ?? []).join(" "),
     STATUS_LABEL[card.status] ?? card.status,
     card.is_kit ? "набор" : "",
     card.published ? "в smart" : "",

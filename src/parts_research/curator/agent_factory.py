@@ -1,6 +1,6 @@
 """Фабрика curator-агента + сборка системного промпта.
 
-Системный промпт = правила `curator_rules.md` + допустимые Smart-бренды и product_types
+Системный промпт = правила `curator_rules.md` + допустимые Smart-бренды и классы техники
 (из Smart через FDW). Тулы — `@function_tool` в том же процессе (без MCP). Модель —
 `settings.llm_model_curator`. Tracing off (эндпоинт не openai.com)."""
 
@@ -40,13 +40,13 @@ _model = OpenAIChatCompletionsModel(model=settings.llm_model_curator, openai_cli
 _retry = ModelSettings(retry=ModelRetrySettings(max_retries=2, policy=retry_policies.network_error()))
 
 
-def build_curator_system_prompt(allowed_brands: list[str], allowed_product_types: list[str]) -> str:
+def build_curator_system_prompt(allowed_brands: list[str], allowed_vehicle_classes: list[str]) -> str:
     rules = RULES_PATH.read_text(encoding="utf-8")
     return f"""\
 {rules}
 
 --- Справочник Smart (для записи) ---
-Допустимые product_type: {", ".join(allowed_product_types)}
+Классы техники (vehicle_classes, слаги): {"; ".join(allowed_vehicle_classes)}
 Допустимые Smart-бренды (brands, UPPER_SNAKE_CASE): {", ".join(allowed_brands)}
 Бренд для save_to_smart должен быть из этого списка (иначе FK-ошибка по конкретному part).
 --- Конец справочника ---"""

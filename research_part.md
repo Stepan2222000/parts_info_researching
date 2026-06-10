@@ -18,7 +18,7 @@
 - Нет worker-пула и очереди.
 - Нет PostgresSession — история turn'ов держится в памяти через `result.to_input_list()`.
 - Нет Smart-плагина — выжимка Smart-данных в системный промпт не подмешивается.
-- Нет подключений к `smart_test`/`brands_mapping`: списки `Smart.brands`, `Smart.product_types` и `brand_aliases` **захардкожены** в коде. Над каждым блоком — комментарий: «в production берётся из БД через FDW».
+- Нет подключений к `smart_test`/`brands_mapping`: списки `Smart.brands`, `Smart.vehicle_classes` и `brand_aliases` **захардкожены** в коде. Над каждым блоком — комментарий: «в production берётся из БД через FDW».
 
 ## Запуск
 
@@ -57,7 +57,7 @@ python -m pip install -e .
 В коде объявлены три константы с комментариями «в production — из БД»:
 
 - `ALLOWED_BRANDS` — список Smart-брендов (`ARCTIC_CAT, AUDI, BRP, HONDA, LAND_ROVER, MERCEDES_BENZ, MERCRUISER, OMC, POLARIS, SEASTAR, SUZUKI, VOLVO, YAMAHA`).
-- `ALLOWED_PRODUCT_TYPES` — `Для автомобилей`, `Для мототехники`, `Для водного транспорта`.
+- `VEHICLE_CLASSES` / `ALLOWED_VEHICLE_CLASSES` — классы техники (boat, jetski, quad, snowmobile, motorcycle, auto) с русскими названиями.
 - `BRAND_ALIASES` — словарь алиасов (`Mercury → MERCRUISER`, `Quicksilver → MERCRUISER`, `Sea-Doo → BRP`, и т.д.).
 
 Содержимое `research_rules.md` читается с диска и подмешивается в системный промпт целиком.
@@ -67,7 +67,7 @@ python -m pip install -e .
 Один на весь run. Собирается из:
 
 - Преамбула «ты исследуешь OEM-запчасть».
-- Список allowed product_types.
+- Список классов техники (vehicle_classes: slug — название).
 - Список allowed Smart-брендов.
 - Список алиасов брендов **обычным текстом** (без markdown-таблицы, без визуального выравнивания).
 - Текст `research_rules.md`.
@@ -101,7 +101,7 @@ agent_1 = Agent(
 - User-message turn'а 1: «Входной артикул X, основной Exa-поиск ниже, сформируй стартовый JSON по схеме» + raw_exa блок.
 - `Runner.run_streamed(agent_1, input=user_message)`. Drain событий (минимальный лог в stderr: `reasoning`/`tool_called`/`message_output_created`).
 - `current = streamed.final_output` (уже instance `StructuredResult` — strict schema гарантирует структуру).
-- `post_validate(current, expected_part_number=article, allowed_brands=..., allowed_product_types=...)` — слой 3.
+- `post_validate(current, expected_part_number=article, allowed_brands=..., allowed_vehicle_classes=...)` — слой 3.
 
 ### 7. Фаза 1, Turn 2 — low_confidence (если есть)
 
@@ -162,7 +162,7 @@ agent_1 = Agent(
 3. **`post_validate`** — Python-функция, runtime-доменные правила:
    - `task_part_number == expected_part_number`.
    - `brand_oem ⊂ allowed_brands` (хардкод-список).
-   - `product_type ∈ allowed_product_types ∪ {null}`.
+   - `vehicle_classes ⊆ allowed_vehicle_classes`, без дублей (кросс-типовый мультикласс легален).
    - `is_kit == False ⇒ len(kit_contents) == 0`.
    - `task_part_number` присутствует в `numbers.article`.
    - Артикул не встречается одновременно в нескольких массивах `numbers.*`.

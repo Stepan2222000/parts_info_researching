@@ -19,7 +19,7 @@
 
 ## Где лежат draft-данные
 
-- `draft_parts(id, run_id, name, brand_oem TEXT[], product_type, description, is_kit, weight_kg, weight_source_url, weight_evidence, models_text, models_source_urls TEXT[], models_evidence, needs_review_reason)`
+- `draft_parts(id, run_id, name, brand_oem TEXT[], vehicle_classes TEXT[], product_type, description, is_kit, weight_kg, weight_source_url, weight_evidence, models_text, models_source_urls TEXT[], models_evidence, needs_review_reason)` — `vehicle_classes` определяет research-агент (слаги классов техники); `product_type` — деривация из классов, только для отображения
 - `draft_part_articles(draft_part_id, article, confidence article_confidence, source_url, evidence, why_low_confidence, why_irrelevant)`
 - `draft_kit_components(draft_part_id, component_key, article, name, quantity, description, source_url, evidence)`
 - `draft_part_of_kits(draft_part_id, kit_article, kit_name, source_url, evidence)`
@@ -32,7 +32,7 @@
 Чаще всего пользователь просит «обработай очередь» / «обработай первые N». Это значит:
 
 ```sql
-SELECT r.id AS run_id, t.article, dp.name, dp.product_type, dp.is_kit, dp.brand_oem
+SELECT r.id AS run_id, t.article, dp.name, dp.vehicle_classes, dp.is_kit, dp.brand_oem
 FROM task_runs r
 JOIN tasks t ON t.id = r.task_id
 JOIN draft_parts dp ON dp.run_id = r.id
@@ -62,7 +62,7 @@ LIMIT N;
 | draft_parts | smart.parts |
 |---|---|
 | name | name |
-| product_type | product_type (обязателен при INSERT, неизменяем при UPDATE) |
+| vehicle_classes | vehicle_classes (массив слагов; обязателен непустой при INSERT; при UPDATE merge-only — классы добавляются, не удаляются) |
 | weight_kg | weight_kg |
 | models_text | model |
 | description | description |
@@ -72,14 +72,14 @@ LIMIT N;
 ## Маппинг kit_contents → components
 
 Для каждого компонента из `draft_kit_components`:
-- В payload `save_to_smart.parts[i].components[j]` положи `name`, `articles`, `product_type`, `brands`, опц. `quantity`, `weight_kg`, `description`, `model`.
+- В payload `save_to_smart.parts[i].components[j]` положи `name`, `articles`, `brands`, опц. `vehicle_classes` (пусто → наследует классы родителя-кита), `quantity`, `weight_kg`, `description`, `model`.
 - Если у компонента есть артикул и он уже в Smart (`is_draft=true, is_unverified=true`) — передай его `smart_id` вместо новых полей; backend сделает patch-merge.
 - Если компонент `is_draft=false` в Smart — передай `smart_id` без других полей; саму запись не тронут, только создадут связку с parent'ом.
 
 ## Когда `mark_needs_review`
 
 - kit без состава (`draft_parts.is_kit=true`, `draft_kit_components` пуст);
-- product_type не определён (`draft_parts.product_type IS NULL` — обычно run уже в `needs_human_review`, не трогай);
+- классы техники не определены (`draft_parts.vehicle_classes = '{}'` — обычно run уже в `needs_human_review` с reason `vehicle_classes_unknown`, не трогай);
 - Smart уже финализирован: `is_draft=false` — reason `smart_finalized_during_research`;
 - Smart kit зафиксирован: `is_unverified=false` — reason `smart_kit_verified, manual review needed`;
 - любой пограничный случай, где сомневаешься.

@@ -69,8 +69,8 @@ async def _finish(pool: asyncpg.Pool, run_id: int, status: str, error: str | Non
 
 def _needs_review_reason(r: StructuredResult) -> str | None:
     reasons: list[str] = []
-    if r.product_type is None:
-        reasons.append("product_type_unknown")
+    if not r.vehicle_classes:
+        reasons.append("vehicle_classes_unknown")
     if r.is_kit and not r.kit_contents:
         reasons.append("kit_without_contents")
     return "; ".join(reasons) if reasons else None
@@ -93,7 +93,7 @@ async def _phase1(
             r,
             expected_part_number=article,
             allowed_brands=context.allowed_brands,
-            allowed_product_types=context.allowed_product_types,
+            allowed_vehicle_classes=context.allowed_vehicle_classes,
         )
 
     # Turn 1 — основной Exa.
@@ -195,14 +195,15 @@ async def _phase2(
         result,
         expected_part_number=article,
         allowed_brands=context.allowed_brands,
-        allowed_product_types=context.allowed_product_types,
+        allowed_vehicle_classes=context.allowed_vehicle_classes,
     )
     return result
 
 
 # ── парсинг финального JSON -> draft-таблицы ───────────────────────────────────
 async def _parse_to_draft(
-    pool: asyncpg.Pool, run_id: int, r: StructuredResult, needs_review_reason: str | None
+    pool: asyncpg.Pool, run_id: int, r: StructuredResult, needs_review_reason: str | None,
+    derived_product_type: str | None,
 ) -> None:
     # draft-таблицы пишут поля как plain text (name, evidence, ...), а не jsonb —
     # codec strip_nul их не покрывает; чистим  в самом результате модели.
@@ -212,11 +213,12 @@ async def _parse_to_draft(
             weight_kg = Decimal(str(r.weight.kg)) if r.weight is not None else None
             draft_part_id = await conn.fetchval(
                 "INSERT INTO draft_parts ("
-                "  run_id, name, brand_oem, product_type, description, is_kit, "
+                "  run_id, name, brand_oem, vehicle_classes, product_type, description, is_kit, "
                 "  weight_kg, weight_source_url, weight_evidence, "
                 "  models_text, models_source_urls, models_evidence, needs_review_reason"
-                ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id",
-                run_id, r.name, list(r.brand_oem), r.product_type, r.description, r.is_kit,
+                ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id",
+                run_id, r.name, list(r.brand_oem), list(r.vehicle_classes),
+                derived_product_type, r.description, r.is_kit,
                 weight_kg,
                 r.weight.source_url if r.weight else None,
                 r.weight.evidence if r.weight else None,
@@ -303,7 +305,10 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
         )
 
         reason = _needs_review_reason(current)
-        await _parse_to_draft(pool, run_id, current, reason)
+        await _parse_to_draft(
+            pool, run_id, current, reason,
+            derived_product_type=context.derive_product_type(list(current.vehicle_classes)),
+        )
         status = "needs_human_review" if reason else "done"
         await _finish(pool, run_id, status, error=reason)
         log(f"[done] run {run_id} -> {status}" + (f" ({reason})" if reason else ""))

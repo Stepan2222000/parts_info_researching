@@ -43,3 +43,16 @@
 22. Вес всегда указывай в килограммах. Фунты, унции и граммы переводи в кг. Если веса нет, weight = null.
 22a. Вес — это вес самой OEM-детали по каталожным/производственным данным (OEM-каталог, спецификация, exploded diagram, OEM PDF). НЕ используй shipping weight магазинов и реселлеров (это вес посылки с упаковкой, а не детали) и НЕ используй вес aftermarket-аналогов (Sierra, GLM, Mallory, EMP, Quicksilver-aftermarket и подобных). Если надёжного OEM-веса нет, а есть только вес магазина/реселлера или aftermarket-аналога — weight = null. В evidence указывай, что вес взят именно из OEM-источника.
 23. models должен быть null или объектом с text, source_urls и evidence на русском. Каждую подтвержденную применяемость пиши с новой строки.
+
+# Классы техники (vehicle_classes)
+
+24. Определи классы техники, к которой подходит деталь, и положи их слаги в `vehicle_classes`. Главный сигнал — модели применимости (блок `models`): к какой технике относятся найденные модели, те классы и ставь. Отдельных пруфов на классы не нужно — обоснованием служат source_urls и evidence блока `models`.
+25. Классов может быть несколько, в том числе разных типов техники: общие детали платформ BRP законно получают `["jetski","snowmobile"]` (двигатели Rotax стоят и в Sea-Doo, и в Ski-Doo) или `["quad","snowmobile"]`. Не выбирай «один главный» — перечисляй все подтверждённые применяемостью.
+26. Маркеры брендов и линеек (если модель применимости содержит такой бренд — это его класс):
+    - `snowmobile` (снегоходы): Ski-Doo, Lynx, Arctic Cat, Polaris RMK/XC/WideTrak/Switchback;
+    - `jetski` (гидроциклы): Sea-Doo, WaveRunner (Yamaha), Kawasaki Jet Ski;
+    - `quad` (квадроциклы и мотовездеходы, ATV/SxS/UTV): Can-Am (Outlander, Renegade, Maverick, Defender, Commander), Polaris Sportsman/RZR/Ranger, Honda TRX/Pioneer/Foreman/Rincon;
+    - `boat` (катера и лодочные моторы): Mercury, MerCruiser, Quicksilver, Volvo Penta, Evinrude, Johnson, OMC, SeaStar, подвесные моторы Suzuki DF / Honda BF / Yamaha F, sterndrive/outboard;
+    - `motorcycle` (мотоциклы): Suzuki GSX-R/GSF, Honda CBR, Yamaha YZF/R1/R6, Kawasaki Ninja;
+    - `auto` (автомобили): легковые Audi, Land Rover, Mercedes-Benz и т.п.
+27. Если применяемость определить не удалось — `vehicle_classes: []` (run уйдёт на ручное ревью, это нормально). Не угадывай класс по одному только бренду-корпорации: BRP сам по себе класс не определяет (делает гидроциклы, снегоходы и квадры) — смотри на модельный ряд.

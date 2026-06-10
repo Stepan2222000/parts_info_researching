@@ -154,7 +154,7 @@ class SaveComponent(BaseModel):
     smart_id: str | None
     name: str | None
     articles: list[str] | None
-    product_type: str | None
+    vehicle_classes: list[str] | None  # null/[] -> наследует классы родителя-кита
     weight_kg: float | None
     model: str | None
     description: str | None
@@ -167,7 +167,7 @@ class SavePart(BaseModel):
     smart_id: str | None
     name: str | None
     articles: list[str] | None
-    product_type: str | None
+    vehicle_classes: list[str] | None  # обязателен непустой при INSERT новой детали
     weight_kg: float | None
     model: str | None
     description: str | None
@@ -175,19 +175,26 @@ class SavePart(BaseModel):
     components: list[SaveComponent] | None
 
 
-async def _insert_part(conn, *, name, product_type, articles, model, weight_kg, description) -> str:
+async def _insert_part(conn, *, name, vehicle_classes, articles, model, weight_kg, description) -> str:
     """INSERT новой smart.parts с явными is_draft=true, is_unverified=true. RETURNING smart_id.
 
-    product_type принимается для совместимости с payload, но в smart НЕ пишется:
-    с миграции 015 колонки в parts нет — тип выводится из классов техники
-    (parts.vehicle_classes), которые появятся в контракте агента (заход 2).
+    vehicle_classes — массив слагов: реестр part_vehicle_classes и проекцию
+    product_type дальше синхронизирует сама smart (триггеры миграций 014-015).
     """
-    del product_type
     return await conn.fetchval(
-        "INSERT INTO smart.parts (name, articles, model, weight_kg, description, is_draft, is_unverified) "
-        "VALUES ($1, $2, $3, $4, $5, true, true) RETURNING id",
-        name, articles, model, _dec(weight_kg), description,
+        "INSERT INTO smart.parts (name, articles, vehicle_classes, model, weight_kg, description, is_draft, is_unverified) "
+        "VALUES ($1, $2, $3, $4, $5, $6, true, true) RETURNING id",
+        name, articles, vehicle_classes, model, _dec(weight_kg), description,
     )
+
+
+async def _merge_vehicle_classes(conn, part_id: str, new_classes: list[str]) -> None:
+    """Merge-only: добавляем недостающие классы, существующие НИКОГДА не удаляем
+    (снятие класса — только человек; сверенные строки защищены freeze-триггером)."""
+    current = await conn.fetchval("SELECT vehicle_classes FROM smart.parts WHERE id=$1", part_id) or []
+    merged = list(current) + [c for c in new_classes if c not in current]
+    if merged != list(current):
+        await conn.execute("UPDATE smart.parts SET vehicle_classes=$2 WHERE id=$1", part_id, merged)
 
 
 async def _set_brands(conn, part_id, brands) -> None:
@@ -197,7 +204,8 @@ async def _set_brands(conn, part_id, brands) -> None:
 
 
 async def _update_nonempty_payload_fields(conn, part_id, part) -> None:
-    """UPDATE существующего parent: пишем только непустые поля payload; product_type иммутабелен."""
+    """UPDATE существующего parent: пишем только непустые поля payload;
+    vehicle_classes — merge-only (классы добавляются, не удаляются)."""
     fields = {
         "name": part.name, "articles": part.articles, "weight_kg": _dec(part.weight_kg),
         "model": part.model, "description": part.description,
@@ -207,12 +215,19 @@ async def _update_nonempty_payload_fields(conn, part_id, part) -> None:
         cols = list(upd)
         set_clause = ", ".join(f"{c}=${i + 2}" for i, c in enumerate(cols))
         await conn.execute(f"UPDATE smart.parts SET {set_clause} WHERE id=$1", part_id, *[upd[c] for c in cols])
+    if part.vehicle_classes:
+        await _merge_vehicle_classes(conn, part_id, part.vehicle_classes)
 
 
 async def _save_component(conn, parent_id, comp: SaveComponent) -> dict:
     qty = comp.quantity if comp.quantity is not None else 1
+    # классы компонента: свои из payload, иначе наследуем классы родителя-кита
+    comp_classes = comp.vehicle_classes
+    if not comp_classes:
+        comp_classes = list(await conn.fetchval(
+            "SELECT vehicle_classes FROM smart.parts WHERE id=$1", parent_id) or [])
     if comp.smart_id is None:
-        cid = await _insert_part(conn, name=comp.name, product_type=comp.product_type, articles=comp.articles,
+        cid = await _insert_part(conn, name=comp.name, vehicle_classes=comp_classes, articles=comp.articles,
                                  model=comp.model, weight_kg=comp.weight_kg, description=comp.description)
         if comp.brands:
             for b in comp.brands:
@@ -249,6 +264,8 @@ async def _save_component(conn, parent_id, comp: SaveComponent) -> dict:
             if await conn.fetchval("SELECT count(*) FROM smart.part_brands WHERE part_id=$1", cid) == 0:
                 for b in comp.brands:
                     await conn.execute("INSERT INTO smart.part_brands (part_id, brand) VALUES ($1, $2)", cid, b)
+        if comp_classes:
+            await _merge_vehicle_classes(conn, cid, comp_classes)
     # is_draft=false → саму запись не трогаем, только создаём связку.
     await conn.execute(
         "INSERT INTO smart.part_components (parent_id, child_id, quantity, can_be_sold_separately) "
@@ -286,8 +303,13 @@ async def _save_one_part(conn, part: SavePart, session_id: int) -> dict:
     part.articles = _order_articles(part.articles, await _confirmed_article_order(conn, part.run_id))
 
     if part.smart_id is None:
-        parent_id = await _insert_part(conn, name=part.name, product_type=part.product_type, articles=part.articles,
-                                       model=part.model, weight_kg=part.weight_kg, description=part.description)
+        if not part.vehicle_classes:
+            raise ValueError(
+                "vehicle_classes is required (non-empty) when inserting a new part; "
+                "determine the vehicle class before saving to smart")
+        parent_id = await _insert_part(conn, name=part.name, vehicle_classes=part.vehicle_classes,
+                                       articles=part.articles, model=part.model,
+                                       weight_kg=part.weight_kg, description=part.description)
         if part.brands:
             await _set_brands(conn, parent_id, part.brands)
     else:

@@ -109,6 +109,7 @@ export function RunDetail({ runId, onClose, onRetry }: {
                   <div className="section-label">Draft</div>
                   <div className="field-grid">
                     <Field k="Название" v={d.draft.name} serif />
+                    <Field k="Классы" v={d.draft.vehicle_classes.join(", ") || null} />
                     <Field k="Тип" v={d.draft.product_type} />
                     <Field k="Бренды" v={d.draft.brand_oem.join(", ") || null} />
                     <Field k="Набор" v={d.draft.is_kit ? "да" : "нет"} />

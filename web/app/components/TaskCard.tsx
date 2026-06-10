@@ -25,7 +25,9 @@ export function TaskCard({
         {card.brand_oem.map((b) => (
           <span className="chip" key={b}>{b}</span>
         ))}
-        {card.product_type && <span className="chip">{card.product_type}</span>}
+        {card.vehicle_classes.map((vc) => (
+          <span className="chip" key={vc}>{vc}</span>
+        ))}
       </div>
       <div className="card-foot">
         {card.is_kit && (

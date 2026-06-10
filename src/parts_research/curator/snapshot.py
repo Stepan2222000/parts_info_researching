@@ -17,7 +17,7 @@ _LATEST = "SELECT DISTINCT ON (task_id) id AS run_id, task_id, status FROM task_
 async def load_snapshot(pool: asyncpg.Pool) -> dict:
     counts = await pool.fetch(f"SELECT status, count(*) AS n FROM ({_LATEST}) s GROUP BY status")
     pending = await pool.fetch(
-        f"SELECT s.run_id, t.article, dp.name, dp.product_type, dp.is_kit "
+        f"SELECT s.run_id, t.article, dp.name, dp.vehicle_classes, dp.is_kit "
         f"FROM ({_LATEST}) s "
         f"JOIN tasks t ON t.id = s.task_id "
         f"LEFT JOIN draft_parts dp ON dp.run_id = s.run_id "
@@ -39,8 +39,9 @@ def format_snapshot(snap: dict) -> str:
     suffix = f" (показаны первые {PENDING_LIMIT})" if len(pending) == PENDING_LIMIT else ""
     lines.append(f"done без публикации: {len(pending)}{suffix}")
     for p in pending:
+        classes = ",".join(p["vehicle_classes"] or []) or "—"
         lines.append(
-            f"  run={p['run_id']} {p['article']} | {p['name']} | {p['product_type']} | kit={p['is_kit']}"
+            f"  run={p['run_id']} {p['article']} | {p['name']} | classes={classes} | kit={p['is_kit']}"
         )
     lines.append("</queue>")
     return "\n".join(lines)

@@ -62,12 +62,12 @@
 
 Актуальная Smart-схема (см. `central_smart_logic/main.sql` + миграции):
 
-- `parts` — запчасти и наборы. Важные поля: `id` (генерится сам как `smart_XXXXXXXX`), `name`, `articles TEXT[]` (валидируется regex `^[A-Z0-9\-]{4,20}$`, без дублей внутри массива, для опубликованных записей обязателен минимум один артикул), `description`, `product_type` (FK на `product_types(name)`), `model`, `weight_kg NUMERIC(8,3)`, `is_draft`.
+- `parts` — запчасти и наборы. Важные поля: `id` (генерится сам как `smart_XXXXXXXX`), `name`, `articles TEXT[]` (валидируется regex `^[A-Z0-9\-]{4,20}$`, без дублей внутри массива, для опубликованных записей обязателен минимум один артикул), `description`, `vehicle_classes TEXT[]` (слаги классов техники; колонки `product_type` в parts с миграции 015 НЕТ — тип вычисляется во VIEW из классов), `model`, `weight_kg NUMERIC(8,3)`, `is_draft`.
 - `brands(name PK)` — справочник Smart-брендов в UPPER_SNAKE_CASE. Точный список не хардкодим в коде — грузим из `smart.brands` через FDW при старте каждого run'а и подмешиваем в system-prompt research-агента.
 - `part_brands(part_id, brand)` — M:N связка. Для `is_draft = false` минимум один бренд обязателен.
 - `part_articles(article PK, part_id)` — глобально-уникальный реестр обычных артикулов, синхронизируется триггером.
 - `part_components(parent_id, child_id, quantity, can_be_sold_separately, is_unverified)` — состав наборов, циклы запрещены триггером.
-- `product_types(name PK)` — фиксированные значения: `Для автомобилей`, `Для мототехники`, `Для водного транспорта`.
+- `vehicle_classes(slug PK, title_ru, product_type, season_months, position)` — классы техники: boat, jetski, quad, snowmobile, motorcycle, auto. `product_types(name PK)` остаётся словарём грубых типов, на который классы ссылаются.
 - `parts_with_components` — view с разворотом компонентов и вычисленным `is_kit` через `EXISTS`.
 
 В Smart мы не храним raw Exa-ответы, длинные evidence-тексты, логи агента и историю research-JSON. Smart хранит итоговую каталожную форму.
@@ -160,7 +160,7 @@ SELECT 1 FROM smart.parts WHERE $1 = ANY(articles) AND is_draft = false;
 - `failed_no_data` — Exa не нашел источников с точным артикулом в основном поиске фазы 1, либо найден только aftermarket, либо вес есть, но единицы не распознаны. Это не баг, просто данных нет. В Smart ничего не пишется;
 - `failed_validation` — модель отдала невалидный JSON в одном из turn'ов pipeline'а, либо в фазе 2 модель упёрлась в `max_turns` без финализации. Raw payload сохраняется для отладки. Авто-ретраев нет, пользователь перезапускает руками;
 - `failed_crashed` — worker упал во время выполнения. Восстанавливается так: при старте worker помечает все `running`-задачи старше 30 минут как `failed_crashed`. Полноценного heartbeat-мониторинга нет — только liveness через advisory-lock (см. «Liveness воркеров»);
-- `needs_human_review` — задача дошла до финального JSON, но это пограничный случай, нужен ручной взгляд (kit без состава, не определён product_type, и т.п.).
+- `needs_human_review` — задача дошла до финального JSON, но это пограничный случай, нужен ручной взгляд (kit без состава, не определены vehicle_classes, и т.п.).
 
 `needs_human_review` нужен для случаев, когда система фактически собрала данные, но не имеет права автоматически их публиковать. Эти задачи не failure — они просто ждут человека.
 
@@ -245,7 +245,7 @@ Research-агент работает в **две фазы**. Фаза 1 — де
 Backend параллельно подгружает контекст:
 
 1. Список Smart-брендов (для валидации `brand_oem`).
-2. Список Smart `product_types`.
+2. Справочник классов техники `smart.vehicle_classes` (slug, title_ru, position).
 3. `brand_mapping.brand_aliases` через FDW.
 4. Smart-plugin payload (точное совпадение по артикулу + связанные `part_components` parents/children).
 
@@ -254,7 +254,7 @@ Backend параллельно подгружает контекст:
 Из всего этого собирается **системный промпт** агента. Он одинаковый для всех turn'ов одного run'а:
 
 - общие правила (`research_rules.md`),
-- допустимые product_type,
+- классы техники (слаги vehicle_classes с названиями),
 - допустимые Smart-бренды,
 - таблица алиасов брендов (markdown),
 - Smart-подсказка (если есть точное совпадение по артикулу),
@@ -269,7 +269,7 @@ Backend параллельно подгружает контекст:
 
 1. **OpenAI strict JSON schema** (`output_type=StructuredResult` → `response_format={"type":"json_schema","strict":true,...}`) — структура, типы, обязательность полей, `additionalProperties=false`. Это серверная гарантия: модель не может вернуть лишнее поле или неверный тип.
 2. **Pydantic-валидаторы** на полях, не выразимых в strict-схеме: запрет пустых строк через `AfterValidator` (а **не** `Field(min_length=1)` — иначе `minLength` попал бы в JSON-схему, а часть эндпоинтов strict-mode такой ключ отклоняет), плюс проверка непустоты массива `models.source_urls`.
-3. **Доменная пост-валидация** (Python-функция `post_validate`) — правила с runtime-данными: `brand_oem ⊂ allowed_brands`, `product_type ∈ allowed_product_types ∪ {null}`, `task_part_number == expected`, `task_part_number ∈ numbers.article`, `is_kit=false ⇒ kit_contents пуст`, артикул в `numbers.*` встречается не более одного раза по массивам, `kit_contents[i].article ≠ task_part_number и любому из numbers.article`.
+3. **Доменная пост-валидация** (Python-функция `post_validate`) — правила с runtime-данными: `brand_oem ⊂ allowed_brands`, `vehicle_classes ⊆ allowed_vehicle_classes` (без дублей; кросс-типовый мультикласс легален), `task_part_number == expected`, `task_part_number ∈ numbers.article`, `is_kit=false ⇒ kit_contents пуст`, артикул в `numbers.*` встречается не более одного раза по массивам, `kit_contents[i].article ≠ task_part_number и любому из numbers.article`.
 
 Каждое правило живёт **только в одном слое**. Дубли запрещены.
 
@@ -345,7 +345,7 @@ Backend параллельно подгружает контекст:
 1. Финальный JSON уже лежит в `task_runs.result_json`.
 2. Backend проверяет правила перевода в `needs_human_review`:
    - `is_kit=true` и `kit_contents` пустой → `kit_without_contents`;
-   - `product_type=null` → `product_type_unknown`.
+   - `vehicle_classes=[]` → `vehicle_classes_unknown`.
 3. Backend детерминированно парсит финальный JSON в draft-таблицы (см. раздел «Парсинг JSON → draft-таблицы»).
 4. Run помечается `done` или `needs_human_review`.
 
@@ -375,7 +375,7 @@ Backend параллельно подгружает контекст:
 - `task_part_number` — входной артикул.
 - `name` — название.
 - `brand_oem` — массив строк из Smart-брендов (например `["MERCRUISER"]` или `["MERCRUISER", "VOLVO"]`).
-- `product_type` — одно из трёх Smart-значений; `null`, если определить не удалось (run → `needs_human_review`).
+- `vehicle_classes` — массив слагов классов техники (может быть несколько, в т.ч. разных типов: Rotax → jetski+snowmobile); `[]`, если определить не удалось (run → `needs_human_review`).
 - `description` — может быть `null`.
 - `weight` — `{kg, source_url, evidence}` или `null`.
 - `models` — `{text, source_urls[], evidence}` или `null`.
@@ -404,7 +404,7 @@ Draft-таблицы — нормальные реляционные табли�
 
 Структура draft-слоя:
 
-- `draft_parts` — основные поля: name, description, brand_oem (массив), product_type, is_kit, weight_kg, weight_source_url, weight_evidence, models_text, models_source_urls (массив), models_evidence, needs_review_reason.
+- `draft_parts` — основные поля: name, description, brand_oem (массив), vehicle_classes (массив слагов от агента), product_type (деривация из классов — тип класса с min position, только для морды), is_kit, weight_kg, weight_source_url, weight_evidence, models_text, models_source_urls (массив), models_evidence, needs_review_reason.
 - `draft_part_articles` — все артикулы с разбивкой `confidence ∈ {confirmed, low_confidence, irrelevant}` + `source_url`, `evidence`, и при необходимости `why_low_confidence` / `why_irrelevant`.
 - `draft_kit_components(draft_part_id, component_key, article, name, quantity, description, source_url, evidence)` — компоненты набора. Колонка `component_key` существует только в draft-таблице (в JSON от модели её нет): backend генерирует её **детерминированно** при парсинге — `article`, если он не `null`; иначе `unknown_1`, `unknown_2`, … в порядке появления компонента в массиве `kit_contents`.
 - `draft_part_of_kits` — наборы, в которые входит исследуемый артикул.
@@ -426,9 +426,9 @@ Smart-плагин — первый и базовый. Логика такая:
 
 - ищет в Smart точное совпадение по нормализованному артикулу + все `part_components`, где артикул является parent или child;
 - если ничего не нашлось — плагин ничего не подмешивает;
-- если нашлось — собирает выжимку из полей (name, articles, brands, product_type, model, weight_kg, is_draft, список компонентов с article+name+quantity) и кладет в промпт с явной пометкой «это подсказка из Smart, может быть устаревшей, проверь через Exa».
+- если нашлось — собирает выжимку из полей (name, articles, brands, vehicle_classes, model, weight_kg, is_draft, список компонентов с article+name+quantity) и кладет в промпт с явной пометкой «это подсказка из Smart, может быть устаревшей, проверь через Exa».
 
-Похожие записи (same brand, same product_type) не подмешиваются — это шум. Только точное совпадение.
+Похожие записи (same brand, same vehicle class) не подмешиваются — это шум. Только точное совпадение.
 
 Плагиновые данные — подсказка, не истина. Агент может использовать их как направление проверки, но не должен слепо им верить.
 
@@ -492,7 +492,7 @@ Curator работает по таким правилам (они прописы
 - draft `brand_oem` (массив) → `smart.part_brands`. Перед записью curator проверяет через `brand_mapping.brand_aliases`, что значение действительно соответствует одному из Smart-брендов;
 - draft `description` → `smart.parts.description`, если описание реально полезное;
 - draft `models_text` → `smart.parts.model`;
-- draft `product_type` → `smart.parts.product_type` (обязательное);
+- draft `vehicle_classes` → `smart.parts.vehicle_classes` (обязателен непустой при INSERT; при UPDATE merge-only);
 - draft `weight_kg` → `smart.parts.weight_kg`;
 - draft `kit_contents` → `smart.parts` (новые draft-записи для компонентов) + `smart.part_components` (связи).
 
@@ -559,9 +559,9 @@ Curator работает по таким правилам (они прописы
 
 ## Product type
 
-`product_type` — обязательное поле в Smart. Допустимые значения подгружаются из `smart.product_types` и передаются research-агенту в промпте. Агент возвращает один из трех типов.
+`vehicle_classes` — эталонная классификация в Smart. Справочник подгружается из `smart.vehicle_classes` и передаётся research-агенту в промпте. Агент возвращает массив слагов (можно несколько, кросс-тип легален).
 
-Маппинг бренд → product_type делать не пытаемся (Honda бывает и автомобильная, и марине). Тип определяет агент по контексту источников. Если определить не удалось — `product_type = null` + run помечается `needs_human_review`.
+Жёсткий маппинг бренд-корпорация → класс делать не пытаемся (Honda бывает и автомобильная, и марине; BRP делает гидроциклы, снегоходы и квадры). Классы агент определяет по моделям применимости; маркеры линеек даны в research_rules.md. Если определить не удалось — `vehicle_classes = []` + run помечается `needs_human_review`.
 
 ## UI
 
@@ -641,9 +641,9 @@ SQL tool куратора технически не ограничен по ти
 - **Модель отдаёт финальный JSON как обычное assistant-сообщение в тексте** (не через специальный tool). `write_result` как MCP-tool удалён.
 - **В каждое user-сообщение фазы 1 backend подмешивает текущий JSON модели явно** — как страховка от потери полей.
 - Brand mapping передается агенту через текст промпта, куратору — через FDW SQL.
-- Список Smart-брендов и product_type загружается из Smart и подмешивается в промпт research-агента.
+- Список Smart-брендов и справочник классов техники загружается из Smart и подмешивается в промпт research-агента.
 - Research-агент может вернуть массив брендов (VOLVO + MERCRUISER и т.п.).
-- product_type обязателен; если не определен — `needs_human_review`.
+- vehicle_classes обязательны; если не определены — `needs_human_review`.
 - Smart-плагин подмешивает в промпт research-агента выжимку по точному совпадению артикула.
 - **Технологически:** Python 3.13+ (mise) + Agents SDK (openai-agents) + openai + exa-py + asyncpg + pydantic v2 + python-dotenv. Без `uv`, без venv в репо, без MCP — пакеты в глобальный site-packages mise-python.
 - **Strict JSON schema** через `output_type=StructuredResult` — OpenAI на стороне эндпоинта гарантирует структуру/типы/required/`additionalProperties=false`. Валидаторы Pydantic покрывают то, чего нет в strict-схеме (запрет пустых строк через `AfterValidator`, непустота `models.source_urls`); доменные правила — в `post_validate`. Слои не пересекаются.

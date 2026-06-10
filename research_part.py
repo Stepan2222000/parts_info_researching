@@ -73,10 +73,17 @@ ALLOWED_BRANDS: list[str] = [
     "MERCRUISER", "OMC", "POLARIS", "SEASTAR", "SUZUKI", "VOLVO", "YAMAHA",
 ]
 
-# Допустимые product_type. В production: SELECT name FROM smart.product_types.
-ALLOWED_PRODUCT_TYPES: list[str] = [
-    "Для автомобилей", "Для мототехники", "Для водного транспорта",
+# Классы техники. В production: SELECT slug, title_ru FROM smart.vehicle_classes
+# ORDER BY position.
+VEHICLE_CLASSES: list[tuple[str, str]] = [
+    ("boat", "Катера и лодочные моторы"),
+    ("jetski", "Гидроциклы"),
+    ("quad", "Квадроциклы и мотовездеходы"),
+    ("snowmobile", "Снегоходы"),
+    ("motorcycle", "Мотоциклы"),
+    ("auto", "Автомобили"),
 ]
+ALLOWED_VEHICLE_CLASSES: list[str] = [slug for slug, _ in VEHICLE_CLASSES]
 
 # Алиасы OEM-брендов → Smart-бренд. В production: SELECT alias, canonical
 # FROM brand_mapping.brand_aliases.
@@ -179,7 +186,7 @@ class StructuredResult(BaseModel):
     task_part_number: NonEmptyStr
     name: NonEmptyStr | None
     brand_oem: list[NonEmptyStr]
-    product_type: NonEmptyStr | None
+    vehicle_classes: list[NonEmptyStr]  # слаги smart.vehicle_classes; [] = не определены
     description: NonEmptyStr | None
     weight: WeightBlock | None
     models: ModelsBlock | None
@@ -195,7 +202,7 @@ def post_validate(
     *,
     expected_part_number: str,
     allowed_brands: list[str],
-    allowed_product_types: list[str],
+    allowed_vehicle_classes: list[str],
 ) -> None:
     if result.task_part_number != expected_part_number:
         raise ValueError(
@@ -206,8 +213,11 @@ def post_validate(
     if bad_brands:
         raise ValueError(f"brand_oem not in allowed Smart brands: {bad_brands}")
 
-    if result.product_type is not None and result.product_type not in allowed_product_types:
-        raise ValueError(f"product_type {result.product_type!r} not in allowed set")
+    bad_classes = [c for c in result.vehicle_classes if c not in allowed_vehicle_classes]
+    if bad_classes:
+        raise ValueError(f"vehicle_classes not in allowed set: {bad_classes}")
+    if len(set(result.vehicle_classes)) != len(result.vehicle_classes):
+        raise ValueError("vehicle_classes contains duplicates")
 
     if not result.is_kit and result.kit_contents:
         raise ValueError("is_kit=false but kit_contents is not empty")
@@ -429,7 +439,9 @@ SCHEMA_REMINDER = """\
 - numbers.article, numbers.article_low_confidence, numbers.irrelevant — массивы объектов.
 - task_part_number обязан присутствовать в numbers.article.
 - brand_oem — массив Smart-брендов (UPPER_SNAKE_CASE из списка выше).
-- product_type — одно из допустимых значений или null.
+- vehicle_classes — массив слагов классов техники из списка выше (можно несколько,
+  в т.ч. разных типов — например, общая деталь гидроциклов и снегоходов:
+  ["jetski","snowmobile"]). Не смог определить — пустой массив [].
 - Пустые строки запрещены: если значения нет — ставь null / пустой массив, не "".
 """
 
@@ -441,8 +453,8 @@ def build_system_prompt() -> str:
 Ты исследуешь OEM-запчасть по входному артикулу и собираешь о ней структурированные \
 данные строго на основании предоставленных источников. Отвечай на русском.
 
-Допустимые product_type:
-  {", ".join(ALLOWED_PRODUCT_TYPES)}
+Классы техники (vehicle_classes — слаги только из этого списка):
+{chr(10).join(f"  {slug} — {title}" for slug, title in VEHICLE_CLASSES)}
 
 Допустимые Smart-бренды (brand_oem только из этого списка, UPPER_SNAKE_CASE):
   {", ".join(ALLOWED_BRANDS)}
@@ -483,7 +495,7 @@ async def phase1(article: str) -> tuple[StructuredResult, list[Any]]:
     streamed = await _run_and_capture(agent, msg1, label="p1.t1")
     current, history = streamed
     post_validate(current, expected_part_number=article,
-                  allowed_brands=ALLOWED_BRANDS, allowed_product_types=ALLOWED_PRODUCT_TYPES)
+                  allowed_brands=ALLOWED_BRANDS, allowed_vehicle_classes=ALLOWED_VEHICLE_CLASSES)
 
     # Turn 2 — low_confidence (если есть).
     low_conf = [a.article for a in current.numbers.article_low_confidence]
@@ -506,7 +518,7 @@ async def phase1(article: str) -> tuple[StructuredResult, list[Any]]:
         }]
         current, history = await _run_and_capture(agent, msg2, label="p1.t2")
         post_validate(current, expected_part_number=article,
-                      allowed_brands=ALLOWED_BRANDS, allowed_product_types=ALLOWED_PRODUCT_TYPES)
+                      allowed_brands=ALLOWED_BRANDS, allowed_vehicle_classes=ALLOWED_VEHICLE_CLASSES)
 
     # Turn 3 — kit_contents (если is_kit).
     if current.is_kit:
@@ -529,7 +541,7 @@ async def phase1(article: str) -> tuple[StructuredResult, list[Any]]:
         }]
         current, history = await _run_and_capture(agent, msg3, label="p1.t3")
         post_validate(current, expected_part_number=article,
-                      allowed_brands=ALLOWED_BRANDS, allowed_product_types=ALLOWED_PRODUCT_TYPES)
+                      allowed_brands=ALLOWED_BRANDS, allowed_vehicle_classes=ALLOWED_VEHICLE_CLASSES)
 
     return current, history
 
@@ -601,7 +613,7 @@ async def phase2(article: str, current: StructuredResult, history: list[Any]) ->
     )
     log(f"[phase2] exa_calls used: {ctx.exa_calls}/{ctx.limit}")
     post_validate(result, expected_part_number=article,
-                  allowed_brands=ALLOWED_BRANDS, allowed_product_types=ALLOWED_PRODUCT_TYPES)
+                  allowed_brands=ALLOWED_BRANDS, allowed_vehicle_classes=ALLOWED_VEHICLE_CLASSES)
     return result
 
 

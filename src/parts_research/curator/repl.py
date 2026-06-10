@@ -31,11 +31,11 @@ def out(msg: str = "") -> None:
 
 
 async def _load_allowed(pool: asyncpg.Pool) -> tuple[list[str], list[str]]:
-    brands, types = await asyncio.gather(
+    brands, classes = await asyncio.gather(
         pool.fetch("SELECT name FROM smart.brands ORDER BY name"),
-        pool.fetch("SELECT name FROM smart.product_types ORDER BY name"),
+        pool.fetch("SELECT slug || ' — ' || title_ru AS name FROM smart.vehicle_classes ORDER BY position"),
     )
-    return [r["name"] for r in brands], [r["name"] for r in types]
+    return [r["name"] for r in brands], [r["name"] for r in classes]
 
 
 async def _new_session(pool: asyncpg.Pool) -> int:
