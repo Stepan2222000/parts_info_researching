@@ -93,7 +93,7 @@ def format_smart_hint(payload: dict[str, Any]) -> str:
         f"name: {payload.get('name')}",
         f"articles: {', '.join(payload.get('articles') or []) or '—'}",
         f"brands: {', '.join(payload.get('brands') or []) or '—'}",
-        f"product_type: {payload.get('product_type')}",
+        f"vehicle_classes: {', '.join(payload.get('vehicle_classes') or []) or '—'}",
         f"model: {payload.get('model')}",
         f"weight_kg: {payload.get('weight_kg')}",
         f"is_draft: {payload.get('is_draft')}",

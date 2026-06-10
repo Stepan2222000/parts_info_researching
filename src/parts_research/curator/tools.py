@@ -176,11 +176,17 @@ class SavePart(BaseModel):
 
 
 async def _insert_part(conn, *, name, product_type, articles, model, weight_kg, description) -> str:
-    """INSERT новой smart.parts с явными is_draft=true, is_unverified=true. RETURNING smart_id."""
+    """INSERT новой smart.parts с явными is_draft=true, is_unverified=true. RETURNING smart_id.
+
+    product_type принимается для совместимости с payload, но в smart НЕ пишется:
+    с миграции 015 колонки в parts нет — тип выводится из классов техники
+    (parts.vehicle_classes), которые появятся в контракте агента (заход 2).
+    """
+    del product_type
     return await conn.fetchval(
-        "INSERT INTO smart.parts (name, product_type, articles, model, weight_kg, description, is_draft, is_unverified) "
-        "VALUES ($1, $2, $3, $4, $5, $6, true, true) RETURNING id",
-        name, product_type, articles, model, _dec(weight_kg), description,
+        "INSERT INTO smart.parts (name, articles, model, weight_kg, description, is_draft, is_unverified) "
+        "VALUES ($1, $2, $3, $4, $5, true, true) RETURNING id",
+        name, articles, model, _dec(weight_kg), description,
     )
 
 

@@ -30,7 +30,7 @@ async def smart_plugin_lookup(pool: asyncpg.Pool, article: str) -> dict[str, Any
     Возвращает payload-подсказку или None, если в Smart ничего не найдено.
     """
     part = await pool.fetchrow(
-        "SELECT id, name, articles, product_type, model, weight_kg, is_draft, description "
+        "SELECT id, name, articles, vehicle_classes, model, weight_kg, is_draft, description "
         "FROM smart.parts WHERE $1 = ANY(articles) LIMIT 1",
         article,
     )
@@ -59,7 +59,7 @@ async def smart_plugin_lookup(pool: asyncpg.Pool, article: str) -> dict[str, Any
         "name": part["name"],
         "articles": list(part["articles"] or []),
         "brands": [r["brand"] for r in brands_rows],
-        "product_type": part["product_type"],
+        "vehicle_classes": list(part["vehicle_classes"] or []),
         "model": part["model"],
         "weight_kg": float(part["weight_kg"]) if part["weight_kg"] is not None else None,
         "description": part["description"],
