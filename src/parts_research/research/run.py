@@ -36,6 +36,7 @@ from .prompts import (
     build_price_query,
     build_price_user_message,
     build_system_prompt,
+    build_user_preamble,
 )
 from .schema import StructuredResult
 from .streaming import log, run_streamed_and_persist
@@ -89,6 +90,7 @@ async def _phase1(
     exa: AsyncExa,
 ) -> tuple[StructuredResult, int]:
     agent = make_research_agent(system_prompt)
+    preamble = build_user_preamble(context)
 
     def validate(r: StructuredResult) -> None:
         post_validate(
@@ -108,7 +110,7 @@ async def _phase1(
     picked = json.dumps(pick_search(raw), ensure_ascii=False)
     substring_check(article, picked)
     current = await run_streamed_and_persist(
-        agent, build_main_user_message(article, picked), session, pool, run_id, 1
+        agent, build_main_user_message(article, picked), session, pool, run_id, 1, preamble=preamble
     )
     await _write_result(pool, run_id, current)
     validate(current)
@@ -130,7 +132,7 @@ async def _phase1(
         )
         picked_fam = json.dumps(pick_search(raw_fam), ensure_ascii=False)
         msg_fam = build_family_user_message(article, picked_fam, current.model_dump_json(indent=2))
-        current = await run_streamed_and_persist(agent, msg_fam, session, pool, run_id, turn)
+        current = await run_streamed_and_persist(agent, msg_fam, session, pool, run_id, turn, preamble=preamble)
         await _write_result(pool, run_id, current)
         validate(current)
 
@@ -147,7 +149,7 @@ async def _phase1(
         )
         picked2 = json.dumps(pick_search(raw2), ensure_ascii=False)
         msg2 = build_low_confidence_user_message(picked2, current.model_dump_json(indent=2))
-        current = await run_streamed_and_persist(agent, msg2, session, pool, run_id, turn)
+        current = await run_streamed_and_persist(agent, msg2, session, pool, run_id, turn, preamble=preamble)
         await _write_result(pool, run_id, current)
         validate(current)
 
@@ -164,7 +166,7 @@ async def _phase1(
         picked3 = json.dumps(pick_search(raw3), ensure_ascii=False)
         substring_check(article, picked3)
         msg3 = build_kit_contents_user_message(picked3, current.model_dump_json(indent=2))
-        current = await run_streamed_and_persist(agent, msg3, session, pool, run_id, turn)
+        current = await run_streamed_and_persist(agent, msg3, session, pool, run_id, turn, preamble=preamble)
         await _write_result(pool, run_id, current)
         validate(current)
 
@@ -188,6 +190,7 @@ async def _price_fallback(
     основного поиска (отдельный ключ). Остальные поля JSON агент сохраняет."""
     log("[price] fallback price search (turn-1 us_prices пуст)")
     agent = make_research_agent(system_prompt)
+    preamble = build_user_preamble(context)
     hint = current.name_en or (current.brand_oem[0] if current.brand_oem else "")
     raw = await cached_exa_call(
         pool, exa, "web_search_exa",
@@ -197,7 +200,7 @@ async def _price_fallback(
     )
     picked = json.dumps(pick_fetch(raw, 4000), ensure_ascii=False)
     msg = build_price_user_message(article, picked, current.model_dump_json(indent=2))
-    result = await run_streamed_and_persist(agent, msg, session, pool, run_id, turn)
+    result = await run_streamed_and_persist(agent, msg, session, pool, run_id, turn, preamble=preamble)
     await _write_result(pool, run_id, result)
     post_validate(
         result,
@@ -224,10 +227,11 @@ async def _phase2(
     log("[phase2] agent-driven free search")
     agent = make_research_agent(system_prompt, tools=[web_search_exa, web_fetch_exa])
     ctx = Phase2Ctx(pool=pool, exa=exa, run_id=run_id)
+    preamble = build_user_preamble(context)
     msg = build_phase2_user_message(article, current.model_dump_json(indent=2), PHASE2_EXA_LIMIT)
     turn = last_turn + 1
     result = await run_streamed_and_persist(
-        agent, msg, session, pool, run_id, turn, context=ctx, max_turns=PHASE2_MAX_TURNS
+        agent, msg, session, pool, run_id, turn, context=ctx, max_turns=PHASE2_MAX_TURNS, preamble=preamble
     )
     await _write_result(pool, run_id, result)
     log(f"[phase2] exa_calls used: {ctx.exa_calls}/{ctx.limit}")
@@ -359,15 +363,23 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
         current, last_turn = await _phase1(
             pool, run_id, article, context, session, system_prompt, exa
         )
-        # Цены не нашлись в едином turn-1 -> отдельный фокусный ценовой turn (US, полный текст).
+        # Фаза 1 — ядро (результат уже валиден и записан). Ценовой фолбэк и фаза 2 —
+        # best-effort дозаполнение: их падение (квота/лимит провайдера, обрыв тулов и т.п.)
+        # НЕ должно терять готовый результат фазы 1 — ловим и идём дальше с current.
         if not current.us_prices:
             last_turn += 1
-            current = await _price_fallback(
+            try:
+                current = await _price_fallback(
+                    pool, run_id, article, context, session, system_prompt, exa, current, last_turn
+                )
+            except Exception as e:  # noqa: BLE001 — best-effort, не валим run
+                log(f"[price] fallback failed (non-fatal): {type(e).__name__}: {e}")
+        try:
+            current = await _phase2(
                 pool, run_id, article, context, session, system_prompt, exa, current, last_turn
             )
-        current = await _phase2(
-            pool, run_id, article, context, session, system_prompt, exa, current, last_turn
-        )
+        except Exception as e:  # noqa: BLE001 — best-effort, оставляем результат фазы 1
+            log(f"[phase2] failed (non-fatal), keeping pre-phase2 result: {type(e).__name__}: {e}")
 
         reason = _needs_review_reason(current)
         await _parse_to_draft(

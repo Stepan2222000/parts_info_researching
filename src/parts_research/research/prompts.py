@@ -17,6 +17,34 @@ from pathlib import Path
 from typing import Any
 
 from .context import ResearchContext
+from .schema import StructuredResult
+
+_STRUCT_SCHEMA_JSON = json.dumps(StructuredResult.model_json_schema(), ensure_ascii=False)
+
+
+def build_user_preamble(context: ResearchContext) -> str:
+    """Критичные ограничения В USER-СООБЩЕНИИ (а не в system): текущий LLM-эндпоинт
+    (cli-proxy → Codex) игнорирует system-инструкции и response_format, но слушает
+    user-сообщение. Сюда — JSON Schema, точные имена полей, и enum'ы brand_oem/
+    vehicle_classes с алиасами. Без этого модель выдаёт свои поля и display-бренды."""
+    aliases = "\n".join(f"  {a} -> {c}" for a, c in context.brand_aliases.items())
+    classes = "\n".join(f"  {vc.slug} — {vc.title_ru}" for vc in context.vehicle_classes)
+    return (
+        "ФОРМАТ ОТВЕТА (ОБЯЗАТЕЛЬНО): верни РОВНО один JSON-объект строго по JSON Schema ниже. "
+        "Имена полей — ТОЧНО: task_part_number, name, name_en, brand_oem, vehicle_classes, "
+        "description, description_en, weight, models, is_kit, kit_contents, part_of_kits, numbers, "
+        "us_prices. НЕ придумывай свои поля (никаких input_article/oem_part_number/pricing/sources/"
+        "replaces/applications). БЕЗ markdown-обёртки (никаких ```), без текста до/после — только JSON.\n\n"
+        f"brand_oem — ТОЛЬКО из этого списка Smart-брендов (UPPER_SNAKE_CASE): {', '.join(context.allowed_brands)}\n"
+        f"Нормализуй найденные бренды по алиасам (левое -> правое), не пиши display-имена:\n{aliases}\n\n"
+        f"vehicle_classes — ТОЛЬКО слаги из списка (можно несколько; [] если не определил):\n{classes}\n\n"
+        "ЖЁСТКИЕ ПРАВИЛА (иначе результат отклоняется):\n"
+        "- numbers.article ОБЯЗАН включать сам входной артикул (task_part_number) с source_url и evidence.\n"
+        "- Каждый номер — РОВНО в одном из numbers.article / numbers.article_low_confidence / "
+        "numbers.irrelevant, без дублей между ними.\n"
+        "- Пустые строки запрещены: нет значения -> null или [] (не \"\").\n\n"
+        f"JSON Schema:\n{_STRUCT_SCHEMA_JSON}\n"
+    )
 
 # research_rules.md лежит в корне репозитория; в Docker-образ кладётся рядом.
 # Путь можно переопределить через RESEARCH_RULES_PATH.

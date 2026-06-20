@@ -9,6 +9,7 @@ SDK-retry не ловит (replay-safety), повторяем turn целико�
 
 from __future__ import annotations
 
+import re
 import sys
 from typing import Any
 
@@ -22,6 +23,34 @@ from agents.memory.session import SessionABC
 from .schema import StructuredResult
 
 TURN_NETWORK_RETRIES = 2
+
+_FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.S)
+
+
+def _with_preamble(preamble: str | None, inp: Any) -> Any:
+    """Префиксует строковый user-ввод преамбулой (схема+enum'ы+формат). Эндпоинт
+    игнорирует system, поэтому критичные ограничения дублируем в КАЖДОМ user-сообщении.
+    Нестроковый ввод / отсутствие преамбулы не трогаем."""
+    if preamble and isinstance(inp, str):
+        return f"{preamble}\n=== ЗАДАНИЕ ===\n{inp}"
+    return inp
+
+
+def _parse_structured_result(raw: Any) -> StructuredResult:
+    """Финальный вывод модели -> StructuredResult. Эндпоинт не применяет
+    response_format, поэтому модель отдаёт JSON (часто в markdown-обёртке) как
+    текст: снимаем ```-обёртку / берём объект от первой { до последней }, чистим
+    NUL и валидируем pydantic'ом. Невалид -> ValidationError -> failed_validation."""
+    if isinstance(raw, StructuredResult):
+        return raw
+    text = (str(raw) if raw is not None else "").replace("\x00", "").strip()
+    m = _FENCED_JSON.search(text)
+    if m:
+        js = m.group(1)
+    else:
+        i, j = text.find("{"), text.rfind("}")
+        js = text[i:j + 1] if i >= 0 and j > i else text
+    return StructuredResult.model_validate_json(js)
 
 
 def log(msg: str) -> None:
@@ -69,6 +98,7 @@ async def run_streamed_and_persist(
     *,
     context: Any = None,
     max_turns: int | None = None,
+    preamble: str | None = None,
 ) -> StructuredResult:
     last_exc: Exception | None = None
     for attempt in range(1, TURN_NETWORK_RETRIES + 2):
@@ -80,7 +110,7 @@ async def run_streamed_and_persist(
             if max_turns is not None:
                 kwargs["max_turns"] = max_turns
 
-            streamed = Runner.run_streamed(agent, input=input, **kwargs)
+            streamed = Runner.run_streamed(agent, input=_with_preamble(preamble, input), **kwargs)
             seq = 0
             async for ev in streamed.stream_events():
                 serialized = _serialize_event(ev)
@@ -89,9 +119,7 @@ async def run_streamed_and_persist(
                 events.append((run_id, turn_idx, seq, serialized))
                 seq += 1
 
-            result = streamed.final_output
-            if not isinstance(result, StructuredResult):
-                raise ValueError(f"final_output is not StructuredResult: {type(result)}")
+            result = _parse_structured_result(streamed.final_output)
 
             # Стрим завершён успешно — фиксируем события одним батчем.
             if events:

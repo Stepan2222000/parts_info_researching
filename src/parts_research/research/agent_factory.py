@@ -18,7 +18,6 @@ from agents import (
 from agents.model_settings import ModelRetrySettings
 
 from ..config import settings
-from .schema import StructuredResult
 
 set_tracing_disabled(True)
 
@@ -30,11 +29,14 @@ _retry = ModelSettings(retry=ModelRetrySettings(max_retries=2, policy=retry_poli
 
 
 def make_research_agent(system_prompt: str, tools: list[Any] | None = None) -> Agent:
+    # БЕЗ output_type: текущий LLM-эндпоинт (cli-proxy → Codex-бэкенд) НЕ применяет
+    # response_format/json_schema, поэтому SDK-структурирование не работает. Схему
+    # отдаём текстом в системном промпте, а финальный JSON парсим вручную в
+    # streaming.run_streamed_and_persist (снимаем markdown-обёртку -> StructuredResult).
     return Agent(
         name="research",
         instructions=system_prompt,
         model=_model,
         model_settings=_retry,
-        output_type=StructuredResult,
         tools=tools or [],
     )
