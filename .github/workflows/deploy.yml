@@ -1,16 +1,21 @@
-# Сборка образов parts_research_api / parts_research_app в ghcr.io.
-# Деплой на сервер — ТОЛЬКО вручную (workflow_dispatch), «on go»: push в main
-# лишь собирает и пушит образы, но не выкатывает.
-name: build-and-deploy
+# Сборка образов parts_research_api / parts_research_app через Docker Build Cloud
+# (driver: cloud — кэш слоёв персистентный, на стороне облачного билдера) -> ghcr.io,
+# затем SSH-выкат на сервер (git reset --hard + compose pull + up -d).
+# push в main = собрать + выкатить.
+name: build & deploy
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
-  OWNER: ${{ github.repository_owner }}
+  IMAGE_OWNER: stepan2222000   # ghcr требует строчное имя
 
 jobs:
   build:
@@ -29,41 +34,62 @@ jobs:
             dockerfile: ./web/Dockerfile
     steps:
       - uses: actions/checkout@v4
-      # GHCR требует строчные имена репозиториев; owner (github.repository_owner)
-      # может содержать заглавные (Stepan2222000) -> приводим к нижнему регистру.
-      - name: Lowercase owner
-        run: echo "OWNER_LC=${OWNER,,}" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+
+      - name: Login to Docker Hub (for Build Cloud)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+
+      - name: Set up Docker Buildx (cloud)
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: cloud
+          endpoint: "${{ secrets.DOCKERHUB_USERNAME }}/builder1"
+
+      # Кэш — на стороне Build Cloud (общий, персистентный между прогонами),
+      # поэтому cache-from/cache-to: type=gha не нужны.
+      - name: Build & push ${{ matrix.name }}
+        uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/parts-research-${{ matrix.name }}:latest
-            ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/parts-research-${{ matrix.name }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/parts-research-${{ matrix.name }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/parts-research-${{ matrix.name }}:${{ github.sha }}
 
   deploy:
     needs: build
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - name: SSH deploy (docker compose pull && up -d)
+      - name: SSH deploy on server
         uses: appleboy/ssh-action@v1
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd ${{ secrets.DEPLOY_DIR }}
-            export GHCR_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+            set -euo pipefail
+            # Разовый вывод из эксплуатации старого кустарного деплоя (локальные образы
+            # ghcr.io/local/*, занимал порт 3001). После первого прогона — no-op.
+            if [ -f /root/parts_research_deploy/docker-compose.yml ]; then
+              docker compose -p parts_research_deploy -f /root/parts_research_deploy/docker-compose.yml down 2>/dev/null || true
+            fi
+            cd /root/parts_research_app
+            git fetch --quiet origin main
+            git reset --hard origin/main
+            export GHCR_OWNER=stepan2222000
             export TAG=latest
             docker compose pull
-            docker compose up -d worker api app
+            docker compose up -d --remove-orphans worker api app
+            docker image prune -f
+            docker compose ps
