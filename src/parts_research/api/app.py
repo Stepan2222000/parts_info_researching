@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..curator.agent_factory import build_curator_system_prompt, make_curator_agent
-from ..db.pool import create_pool
+from ..db.pool import create_parts_prices_pool, create_pool
 from ..db.tasks import count_live_workers, submit_article
 from ..research.validation import pre_validate_article
 from .queries import load_queue, load_run_detail
@@ -37,6 +37,7 @@ _GUARD_SQL = "SELECT 1 FROM smart.parts WHERE $1 = ANY(articles) AND is_draft = 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     pool = await create_pool(min_size=2, max_size=12)
+    prices_pool = await create_parts_prices_pool()
     exa = AsyncExa(api_key=settings.exa_api_key)
     async with pool.acquire() as conn:
         brands = [r["name"] for r in await conn.fetch("SELECT name FROM smart.brands ORDER BY name")]
@@ -47,6 +48,7 @@ async def lifespan(app: FastAPI):
     agent = make_curator_agent(build_curator_system_prompt(brands, classes))
 
     app.state.pool = pool
+    app.state.prices_pool = prices_pool
     app.state.exa = exa
     app.state.curator_agent = agent
     app.state.session_locks = defaultdict(asyncio.Lock)
@@ -54,6 +56,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await pool.close()
+        if prices_pool is not None:
+            await prices_pool.close()
 
 
 app = FastAPI(title="parts_research_api", lifespan=lifespan)
@@ -205,6 +209,7 @@ async def curator_message(body: CuratorMessageBody):
                 agent=app.state.curator_agent,
                 pool=pool,
                 exa=app.state.exa,
+                prices_pool=app.state.prices_pool,
                 session_id=session_id,
                 user_text=body.text,
             ):

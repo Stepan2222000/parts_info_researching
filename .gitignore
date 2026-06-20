@@ -20,3 +20,4 @@ test_runs/
 # Local agent config & dated test artifacts
 .claude/
 test_runs_*/
+price_probe/

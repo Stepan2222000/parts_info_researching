@@ -22,7 +22,7 @@ from ..db.session import PostgresSession
 from .agent_factory import make_research_agent
 from .context import SMART_PLUGIN_NAME, load_context
 from .errors import NoExactDataError
-from .exa_client import cached_exa_call, pick_search
+from .exa_client import cached_exa_call, pick_fetch, pick_search
 from .prompts import (
     build_family_query,
     build_family_user_message,
@@ -33,6 +33,8 @@ from .prompts import (
     build_main_query,
     build_main_user_message,
     build_phase2_user_message,
+    build_price_query,
+    build_price_user_message,
     build_system_prompt,
 )
 from .schema import StructuredResult
@@ -169,6 +171,44 @@ async def _phase1(
     return current, turn
 
 
+# ── ценовой фолбэк (если в turn-1 валидных us_prices не нашлось) ─────────────────
+async def _price_fallback(
+    pool: asyncpg.Pool,
+    run_id: int,
+    article: str,
+    context,
+    session: PostgresSession,
+    system_prompt: str,
+    exa: AsyncExa,
+    current: StructuredResult,
+    turn: int,
+) -> StructuredResult:
+    """Отдельный ценовой turn: фокусный US-запрос с полным текстом страниц
+    (user_location=US, contents=text) -> агент заполняет us_prices. Не трогает кэш
+    основного поиска (отдельный ключ). Остальные поля JSON агент сохраняет."""
+    log("[price] fallback price search (turn-1 us_prices пуст)")
+    agent = make_research_agent(system_prompt)
+    hint = current.name_en or (current.brand_oem[0] if current.brand_oem else "")
+    raw = await cached_exa_call(
+        pool, exa, "web_search_exa",
+        {"query": build_price_query(article, hint), "num_results": 8,
+         "type": "keyword", "contents": "text", "user_location": "US"},
+        run_id=run_id, phase="price_fallback",
+    )
+    picked = json.dumps(pick_fetch(raw, 4000), ensure_ascii=False)
+    msg = build_price_user_message(article, picked, current.model_dump_json(indent=2))
+    result = await run_streamed_and_persist(agent, msg, session, pool, run_id, turn)
+    await _write_result(pool, run_id, result)
+    post_validate(
+        result,
+        expected_part_number=article,
+        allowed_brands=context.allowed_brands,
+        allowed_vehicle_classes=context.allowed_vehicle_classes,
+    )
+    log(f"[price] us_prices after fallback: {len(result.us_prices)}")
+    return result
+
+
 # ── фаза 2 ──────────────────────────────────────────────────────────────────────
 async def _phase2(
     pool: asyncpg.Pool,
@@ -215,8 +255,9 @@ async def _parse_to_draft(
                 "INSERT INTO draft_parts ("
                 "  run_id, name, brand_oem, vehicle_classes, product_type, description, is_kit, "
                 "  weight_kg, weight_source_url, weight_evidence, "
-                "  models_text, models_source_urls, models_evidence, needs_review_reason"
-                ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id",
+                "  models_text, models_source_urls, models_evidence, needs_review_reason, "
+                "  name_en, description_en"
+                ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id",
                 run_id, r.name, list(r.brand_oem), list(r.vehicle_classes),
                 derived_product_type, r.description, r.is_kit,
                 weight_kg,
@@ -226,6 +267,7 @@ async def _parse_to_draft(
                 list(r.models.source_urls) if r.models else None,
                 r.models.evidence if r.models else None,
                 needs_review_reason,
+                r.name_en, r.description_en,
             )
 
             article_rows = []
@@ -256,13 +298,15 @@ async def _parse_to_draft(
                     unknown += 1
                     key = f"unknown_{unknown}"
                 comp_rows.append(
-                    (draft_part_id, key, c.article, c.name, c.quantity, c.description, c.source_url, c.evidence)
+                    (draft_part_id, key, c.article, c.name, c.quantity, c.description, c.source_url, c.evidence,
+                     c.name_en, c.description_en)
                 )
             if comp_rows:
                 await conn.executemany(
                     "INSERT INTO draft_kit_components "
-                    "(draft_part_id, component_key, article, name, quantity, description, source_url, evidence) "
-                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                    "(draft_part_id, component_key, article, name, quantity, description, source_url, evidence, "
+                    " name_en, description_en) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
                     comp_rows,
                 )
 
@@ -276,6 +320,21 @@ async def _parse_to_draft(
                     "(draft_part_id, kit_article, kit_name, source_url, evidence) "
                     "VALUES ($1,$2,$3,$4,$5)",
                     pok_rows,
+                )
+
+            # US-цены за оригинал (-> при публикации в parts_prices.market.record_price).
+            # CHECK price>0 в draft_prices — отсекаем нулевые/мусорные на всякий случай.
+            price_rows = [
+                (run_id, p.article, p.site, Decimal(str(p.price)), p.currency or "USD",
+                 p.url, p.in_stock, p.evidence)
+                for p in r.us_prices if p.price and p.price > 0
+            ]
+            if price_rows:
+                await conn.executemany(
+                    "INSERT INTO draft_prices "
+                    "(run_id, article, site, price, currency, url, in_stock, evidence) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                    price_rows,
                 )
 
 
@@ -300,6 +359,12 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
         current, last_turn = await _phase1(
             pool, run_id, article, context, session, system_prompt, exa
         )
+        # Цены не нашлись в едином turn-1 -> отдельный фокусный ценовой turn (US, полный текст).
+        if not current.us_prices:
+            last_turn += 1
+            current = await _price_fallback(
+                pool, run_id, article, context, session, system_prompt, exa, current, last_turn
+            )
         current = await _phase2(
             pool, run_id, article, context, session, system_prompt, exa, current, last_turn
         )

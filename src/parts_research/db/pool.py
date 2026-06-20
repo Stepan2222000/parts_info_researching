@@ -55,3 +55,16 @@ async def create_pool(*, min_size: int = 10, max_size: int = 60) -> asyncpg.Pool
         max_size=max_size,
         init=_init_connection,
     )
+
+
+async def create_parts_prices_pool(*, min_size: int = 0, max_size: int = 5) -> asyncpg.Pool | None:
+    """Маленький пул к БД цен (parts_prices). None, если PARTS_PRICES_DATABASE_URL
+    не задан — тогда price-запись недоступна (save_to_smart с ценами явно сообщит).
+    jsonb-codec не нужен: market.* оперирует numeric/text/bigint.
+
+    min_size=0 (ленивый): пул создаётся без немедленного коннекта, поэтому
+    недоступность БД цен на старте НЕ роняет api/curator — ошибка всплывёт только
+    при реальной записи цены (и не завалит публикацию, см. save_to_smart)."""
+    if not settings.parts_prices_url:
+        return None
+    return await asyncpg.create_pool(settings.parts_prices_url, min_size=min_size, max_size=max_size)

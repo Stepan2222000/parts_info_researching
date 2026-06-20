@@ -28,10 +28,21 @@ RULES_PATH = Path(os.environ.get("RESEARCH_RULES_PATH", _DEFAULT_RULES_PATH))
 def build_main_query(article: str) -> str:
     # Keyword-поиск Exa: номер доминирует. Нейронный режим тащил похожие номера,
     # из-за чего точное вхождение не находилось и run уходил в failed_no_data.
+    # Единый запрос turn-1: кроссы + модели/применимость + цены на US-магазинах
+    # (highlights нередко уже содержат цену; если нет — отдельный price-фолбэк).
     return (
         f"{article} OEM part number cross reference interchange supersedes superseded by "
-        "replaces replacement fitment application kit contents"
+        "replaces replacement fitment application kit contents "
+        "compatible models engines years "
+        "price buy for sale in stock USD at US online marine parts stores"
     )
+
+
+def build_price_query(article: str, hint: str) -> str:
+    # Фолбэк: фокусный ценовой запрос, засеянный кратким англ. описанием/брендом
+    # (hint, напр. "Mercury Enertia propeller") — поднимает точность товарных страниц.
+    seed = " ".join(x for x in [article, (hint or "").strip()] if x)
+    return f"{seed} OEM original part price buy for sale in stock USD US online store"
 
 
 def build_family_query(crosses: list[str]) -> str:
@@ -79,6 +90,23 @@ SCHEMA_REMINDER = """\
 - vehicle_classes — массив слагов классов техники из списка выше (можно несколько,
   в т.ч. разных типов — например, общая деталь гидроциклов и снегоходов:
   ["jetski","snowmobile"]). Не смог определить — пустой массив [].
+- name/description — на русском; name_en/description_en — ТЕ ЖЕ на английском
+  (по англоязычным источникам). Если name (или description) = null, то и
+  соответствующий *_en = null. То же для компонентов kit_contents (name_en/description_en).
+- name и name_en — КОРОТКИЕ: из них собирается title фида "<арт1> / <арт2> <name>"
+  с жёстким лимитом 50 символов. Держи name/name_en так, чтобы "<арт1> / <арт2> <name>"
+  было ≤ 47 символов (ориентир: само имя ≤ ~25 симв.). Только узел/модель/тип
+  (напр. "Сальник стакана Alpha" / "Bearing carrier seal Alpha"), БЕЗ длинных
+  расшифровок, без дублирующих скобок и без англ. вставок в русском имени.
+  description/description_en — без ограничения длины, туда выноси подробности.
+- us_prices — массив РОЗНИЧНЫХ цен за ОРИГИНАЛ на US-магазинах для входного артикула.
+  Каждый объект: {"site","price","currency","url","article","in_stock","evidence"}.
+  * site — домен магазина (напр. "partsvu.com"); url — ссылка на товарную страницу.
+  * article — наш OEM-номер, по которому найдена цена (у ритейлеров бывает с префиксом 26-/710-).
+  * price/currency — ТЕКУЩАЯ цена продажи (Price/Now) именно нашего номера; НЕ MSRP/зачёркнутая,
+    НЕ "you save", НЕ порог доставки ("over $99/$100"), НЕ баллы, НЕ цена другого/substitute товара.
+  * Бери только товар В НАЛИЧИИ и только за оригинал (не aftermarket-аналог).
+  * Нет валидной цены в источниках — us_prices=[] (дальше отработает отдельный ценовой поиск).
 - Пустые строки запрещены: если значения нет — ставь null / пустой массив, не "".
 """
 
@@ -128,7 +156,10 @@ def build_system_prompt(context: ResearchContext) -> str:
     )
     return f"""\
 Ты исследуешь OEM-запчасть по входному артикулу и собираешь о ней структурированные \
-данные строго на основании предоставленных источников. Отвечай на русском.
+данные строго на основании предоставленных источников. Текстовые поля заполняй и \
+на русском (name/description), и на английском (name_en/description_en). Дополнительно \
+ищи розничные цены за ОРИГИНАЛ на американских интернет-магазинах и заполняй us_prices \
+(правила — в блоке формата ниже).
 
 Классы техники (vehicle_classes — слаги только из этого списка):
 {classes}
@@ -193,6 +224,21 @@ def build_kit_contents_user_message(raw_json: str, current_json: str) -> str:
         "Остальные поля сохрани. Никогда не клади собственный артикул задачи "
         "или артикул из numbers.article как компонент набора. "
         "Ответ — только валидный JSON по схеме."
+    )
+
+
+def build_price_user_message(article: str, raw_json: str, current_json: str) -> str:
+    return (
+        f"Это ДОПОЛНИТЕЛЬНЫЙ поиск ЦЕН за ОРИГИНАЛ артикула {article} на американских "
+        f"магазинах (в основном поиске валидной цены не нашлось).\n\n"
+        f"Свежий Exa-поиск (url/title/полный текст товарных страниц):\n{raw_json}\n\n"
+        f"Твой текущий JSON:\n{current_json}\n\n"
+        "Заполни us_prices: по каждому магазину, где есть товарная страница НАШЕГО номера "
+        f"({article}, возможно с префиксом 26-/710-), возьми ТЕКУЩУЮ цену продажи (Price/Now), "
+        "не MSRP/зачёркнутую, не порог доставки (over $99/$100), не баллы, не цену другого/"
+        "substitute товара; только в наличии и только за оригинал. site = домен магазина, "
+        "currency как на странице, article = наш номер. Нет валидной цены — оставь us_prices=[]. "
+        "Все остальные поля JSON сохрани БЕЗ изменений. Ответ — только валидный JSON по схеме."
     )
 
 

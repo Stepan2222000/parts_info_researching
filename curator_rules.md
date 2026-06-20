@@ -19,10 +19,11 @@
 
 ## Где лежат draft-данные
 
-- `draft_parts(id, run_id, name, brand_oem TEXT[], vehicle_classes TEXT[], product_type, description, is_kit, weight_kg, weight_source_url, weight_evidence, models_text, models_source_urls TEXT[], models_evidence, needs_review_reason)` — `vehicle_classes` определяет research-агент (слаги классов техники); `product_type` — деривация из классов, только для отображения
+- `draft_parts(id, run_id, name, name_en, brand_oem TEXT[], vehicle_classes TEXT[], product_type, description, description_en, is_kit, weight_kg, weight_source_url, weight_evidence, models_text, models_source_urls TEXT[], models_evidence, needs_review_reason)` — `vehicle_classes` определяет research-агент (слаги классов техники); `product_type` — деривация из классов, только для отображения; `name_en`/`description_en` — английские версии (в `smart.parts_en`)
 - `draft_part_articles(draft_part_id, article, confidence article_confidence, source_url, evidence, why_low_confidence, why_irrelevant)`
-- `draft_kit_components(draft_part_id, component_key, article, name, quantity, description, source_url, evidence)`
+- `draft_kit_components(draft_part_id, component_key, article, name, name_en, quantity, description, description_en, source_url, evidence)`
 - `draft_part_of_kits(draft_part_id, kit_article, kit_name, source_url, evidence)`
+- `draft_prices(id, run_id, article, site, price, currency, url, in_stock, evidence)` — US-цены за оригинал, найденные research-агентом; при публикации уезжают в БД цен через поле `prices` payload'а
 - `task_runs(id, task_id, status, result_json JSONB, error, ...)`
 - `tasks(id, article, ...)`
 - `publications(id, run_id, curator_session_id, smart_id, published_at)` — что ты уже опубликовал (по parent'у)
@@ -59,20 +60,31 @@ LIMIT N;
 
 ## Маппинг draft → smart.parts
 
-| draft_parts | smart.parts |
+| draft_parts | smart.parts (+ parts_en) |
 |---|---|
 | name | name |
+| name_en | name_en (→ smart.parts_en.name) |
 | vehicle_classes | vehicle_classes (массив слагов; обязателен непустой при INSERT; при UPDATE merge-only — классы добавляются, не удаляются) |
 | weight_kg | weight_kg |
 | models_text | model |
 | description | description |
+| description_en | description_en (→ smart.parts_en.description) |
 | draft_part_articles (только confidence='confirmed', длина 4-20) | articles (TEXT[]) — порядок задаётся research'ем (новые/актуальные → старые) и принудительно восстанавливается тулом `save_to_smart` по `draft_part_articles`; сам порядок в payload можешь не выверять |
 | brand_oem (массив) | brands (массив строк в payload) |
+
+Английский всегда передавай вместе с русским: `name_en`/`description_en` из `draft_parts`. Без `name_en` строку `parts_en` создать нельзя (там `name NOT NULL`) — если англ. имени нет, EN-зеркало просто не пишется.
+
+## Цены за оригинал (US) → поле `prices`
+
+`draft_prices` хранит найденные research-агентом цены. В payload `save_to_smart.parts[i].prices` положи массив офферов из `draft_prices` этого `run_id`:
+`{site, price, currency, url, article, in_stock, evidence}`. Тул после публикации (когда у part'а есть `smart_id`) сам запишет их в БД цен (`market.record_price`), вне smart-транзакции; ошибка записи цен не валит публикацию (видна как `price_error` в ответе).
+
+Перед тем как класть цены — лёгкая проверка (мусор не передавай): отбрасывай `price<=0`, явные нечисловые выбросы и цены не нашего номера. Если что-то сомнительно или пусто — можешь перепроверить живым `web_search_exa`/`web_fetch_exa`. По умолчанию доверяй тому, что собрал research.
 
 ## Маппинг kit_contents → components
 
 Для каждого компонента из `draft_kit_components`:
-- В payload `save_to_smart.parts[i].components[j]` положи `name`, `articles`, `brands`, опц. `vehicle_classes` (пусто → наследует классы родителя-кита), `quantity`, `weight_kg`, `description`, `model`.
+- В payload `save_to_smart.parts[i].components[j]` положи `name`, `name_en`, `articles`, `brands`, опц. `vehicle_classes` (пусто → наследует классы родителя-кита), `quantity`, `weight_kg`, `description`, `description_en`, `model`.
 - Если у компонента есть артикул и он уже в Smart (`is_draft=true, is_unverified=true`) — передай его `smart_id` вместо новых полей; backend сделает patch-merge.
 - Если компонент `is_draft=false` в Smart — передай `smart_id` без других полей; саму запись не тронут, только создадут связку с parent'ом.
 

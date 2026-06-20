@@ -47,10 +47,11 @@ async def curator_event_stream(
     exa,
     session_id: int,
     user_text: str,
+    prices_pool: asyncpg.Pool | None = None,
 ) -> AsyncIterator[str]:
     """Async-генератор SSE-строк протокола v6 на один turn куратора."""
     session = PostgresSession(f"curator_{session_id}", pool)
-    ctx = CuratorRunContext(pool=pool, exa=exa, session_id=session_id)
+    ctx = CuratorRunContext(pool=pool, exa=exa, session_id=session_id, prices_pool=prices_pool)
 
     # Snapshot очереди подмешивается в начало каждого user-сообщения (как в REPL/спеке).
     snapshot = format_snapshot(await load_snapshot(pool))

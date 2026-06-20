@@ -70,13 +70,22 @@ def _canonical_hash(tool_name: str, args: dict[str, Any]) -> str:
 
 async def _call_exa(exa: AsyncExa, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     if tool_name == "web_search_exa":
+        # contents="text" -> тянем полный текст страниц (нужно ценовому фолбэку);
+        # иначе highlights-only (как в основных turn'ах). Ключ кэша = args целиком,
+        # поэтому "text"/"user_location" дают ОТДЕЛЬНЫЕ записи, не пересекаясь с main.
+        contents: dict[str, Any] = (
+            {"text": True, "highlights": True} if args.get("contents") == "text"
+            else {"highlights": True}
+        )
         search_kwargs: dict[str, Any] = {
             "num_results": int(args.get("num_results", 10)),
-            "contents": {"highlights": True},
+            "contents": contents,
         }
         # type="keyword" — точный поиск по номеру (нейронный режим тащил похожие номера).
         if args.get("type"):
             search_kwargs["type"] = args["type"]
+        if args.get("user_location"):
+            search_kwargs["user_location"] = args["user_location"]
         response = await exa.search(args["query"], **search_kwargs)
     elif tool_name == "web_fetch_exa":
         response = await exa.get_contents(args["urls"], text=True)

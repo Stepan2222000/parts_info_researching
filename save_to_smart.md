@@ -28,13 +28,16 @@
 - `run_id` (обяз.) — id research-run'а, идёт в `publications`.
 - `smart_id` (опц.) — id существующей `smart.parts`. **Есть → UPDATE.** Нет → INSERT.
 - `name`, `articles`, `vehicle_classes`, `weight_kg`, `model`, `description` — поля `smart.parts`. При INSERT обязательны `name` и непустой `vehicle_classes` (валидация тула). Остальные nullable.
+- `name_en`, `description_en` — английские версии (пишутся в `smart.parts_en`). Без `name_en` строка `parts_en` не создаётся (там `name NOT NULL`); `null` == не трогать (как и остальные поля).
 - `brands` — массив строк (например `["MERCRUISER"]`). Имена должны быть в `smart.brands`.
 - `components` — массив компонентов (если kit). Отсутствие или `[]` — состав не трогаем.
+- `prices` — массив US-офферов за оригинал `{site, price, currency, url, article, in_stock, evidence}`. Пишутся в БД цен (`parts_prices.market.record_price`) ПОСЛЕ коммита part'а (отдельная БД, вне smart-транзакции). Ошибка записи цен НЕ валит публикацию — отражается как `price_error` в ответе. `created_by='parts_research'` проставляется тулом.
 
 Поля одного `component` (run_id наследуется от parent'а):
 
 - `smart_id` (опц.) — id существующей `smart.parts`. Есть → работа с существующей записью, нет → INSERT нового.
 - `name`, `articles`, `vehicle_classes`, `weight_kg`, `model`, `description` — те же поля; `vehicle_classes` компонента опционален: пустой/отсутствует → компонент наследует классы родителя-кита.
+- `name_en`, `description_en` — английские версии компонента (в `smart.parts_en`). Для нового компонента пишутся при INSERT; для существующего draft-компонента — fill-if-empty (не перетираем уже выставленный EN).
 - `brands` — массив строк.
 - `quantity` (опц., default 1) — количество в связке `part_components`.
 

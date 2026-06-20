@@ -29,6 +29,9 @@ class CuratorRunContext:
     pool: asyncpg.Pool
     exa: AsyncExa
     session_id: int
+    # Пул к БД цен (parts_prices). None => price-запись недоступна, и
+    # save_to_smart с непустым prices в payload вернёт явную ошибку.
+    prices_pool: asyncpg.Pool | None = None
 
 
 def _parse_count(tag: str) -> int:
@@ -150,14 +153,28 @@ async def web_fetch_exa(wrapper: RunContextWrapper[CuratorRunContext], urls: lis
 # ── save_to_smart ─────────────────────────────────────────────────────────────────
 # Поля — strict + nullable: значение присутствует всегда, null == «не трогать»
 # (как в save_to_smart.md). run_id обязателен (non-null).
+class PriceOffer(BaseModel):
+    """Один найденный оффер за оригинал на US-магазине. Пишется в
+    parts_prices.market.record_price(smart_id, site, price, currency, url, note)."""
+    site: str             # магазин (домен), ключ market.sites
+    price: float
+    currency: str | None  # null -> USD
+    url: str | None
+    article: str | None   # OEM-номер, по которому найдена цена (-> note observation)
+    in_stock: bool | None
+    evidence: str | None
+
+
 class SaveComponent(BaseModel):
     smart_id: str | None
     name: str | None
+    name_en: str | None
     articles: list[str] | None
     vehicle_classes: list[str] | None  # null/[] -> наследует классы родителя-кита
     weight_kg: float | None
     model: str | None
     description: str | None
+    description_en: str | None
     brands: list[str] | None
     quantity: int | None
 
@@ -166,26 +183,51 @@ class SavePart(BaseModel):
     run_id: int
     smart_id: str | None
     name: str | None
+    name_en: str | None
     articles: list[str] | None
     vehicle_classes: list[str] | None  # обязателен непустой при INSERT новой детали
     weight_kg: float | None
     model: str | None
     description: str | None
+    description_en: str | None
     brands: list[str] | None
     components: list[SaveComponent] | None
+    prices: list[PriceOffer] | None  # US-цены за оригинал; пишутся после публикации
 
 
-async def _insert_part(conn, *, name, vehicle_classes, articles, model, weight_kg, description) -> str:
+async def _write_parts_en(conn, part_id: str, name_en, description_en) -> None:
+    """EN-зеркало в smart.parts_en (patch-семантика: null == не трогать).
+    parts_en.name NOT NULL — без name_en новую строку создать нельзя (пропускаем)."""
+    if name_en is None and description_en is None:
+        return
+    exists = await conn.fetchval("SELECT 1 FROM smart.parts_en WHERE part_id=$1", part_id)
+    if exists:
+        fields = {"name": name_en, "description": description_en}
+        upd = {k: v for k, v in fields.items() if v is not None}
+        if upd:
+            cols = list(upd)
+            set_clause = ", ".join(f"{c}=${i + 2}" for i, c in enumerate(cols))
+            await conn.execute(f"UPDATE smart.parts_en SET {set_clause} WHERE part_id=$1", part_id, *[upd[c] for c in cols])
+    elif name_en is not None:
+        await conn.execute(
+            "INSERT INTO smart.parts_en (part_id, name, description) VALUES ($1, $2, $3)",
+            part_id, name_en, description_en)
+
+
+async def _insert_part(conn, *, name, name_en, vehicle_classes, articles, model, weight_kg, description, description_en) -> str:
     """INSERT новой smart.parts с явными is_draft=true, is_unverified=true. RETURNING smart_id.
 
     vehicle_classes — массив слагов: реестр part_vehicle_classes и проекцию
     product_type дальше синхронизирует сама smart (триггеры миграций 014-015).
+    EN-зеркало (name_en/description_en) пишется в smart.parts_en тем же шагом.
     """
-    return await conn.fetchval(
+    part_id = await conn.fetchval(
         "INSERT INTO smart.parts (name, articles, vehicle_classes, model, weight_kg, description, is_draft, is_unverified) "
         "VALUES ($1, $2, $3, $4, $5, $6, true, true) RETURNING id",
         name, articles, vehicle_classes, model, _dec(weight_kg), description,
     )
+    await _write_parts_en(conn, part_id, name_en, description_en)
+    return part_id
 
 
 async def _merge_vehicle_classes(conn, part_id: str, new_classes: list[str]) -> None:
@@ -217,6 +259,7 @@ async def _update_nonempty_payload_fields(conn, part_id, part) -> None:
         await conn.execute(f"UPDATE smart.parts SET {set_clause} WHERE id=$1", part_id, *[upd[c] for c in cols])
     if part.vehicle_classes:
         await _merge_vehicle_classes(conn, part_id, part.vehicle_classes)
+    await _write_parts_en(conn, part_id, part.name_en, part.description_en)
 
 
 async def _save_component(conn, parent_id, comp: SaveComponent) -> dict:
@@ -227,8 +270,9 @@ async def _save_component(conn, parent_id, comp: SaveComponent) -> dict:
         comp_classes = list(await conn.fetchval(
             "SELECT vehicle_classes FROM smart.parts WHERE id=$1", parent_id) or [])
     if comp.smart_id is None:
-        cid = await _insert_part(conn, name=comp.name, vehicle_classes=comp_classes, articles=comp.articles,
-                                 model=comp.model, weight_kg=comp.weight_kg, description=comp.description)
+        cid = await _insert_part(conn, name=comp.name, name_en=comp.name_en, vehicle_classes=comp_classes,
+                                 articles=comp.articles, model=comp.model, weight_kg=comp.weight_kg,
+                                 description=comp.description, description_en=comp.description_en)
         if comp.brands:
             for b in comp.brands:
                 await conn.execute("INSERT INTO smart.part_brands (part_id, brand) VALUES ($1, $2)", cid, b)
@@ -266,6 +310,10 @@ async def _save_component(conn, parent_id, comp: SaveComponent) -> dict:
                     await conn.execute("INSERT INTO smart.part_brands (part_id, brand) VALUES ($1, $2)", cid, b)
         if comp_classes:
             await _merge_vehicle_classes(conn, cid, comp_classes)
+        # EN компонента — fill-if-empty: создаём parts_en, только если строки ещё нет
+        # (не перетираем уже выставленный человеком EN существующего компонента).
+        if not await conn.fetchval("SELECT 1 FROM smart.parts_en WHERE part_id=$1", cid):
+            await _write_parts_en(conn, cid, comp.name_en, comp.description_en)
     # is_draft=false → саму запись не трогаем, только создаём связку.
     await conn.execute(
         "INSERT INTO smart.part_components (parent_id, child_id, quantity, can_be_sold_separately) "
@@ -297,6 +345,61 @@ def _order_articles(articles: list[str] | None, reference: list[str]) -> list[st
     return known + unknown
 
 
+async def _record_prices(prices_pool: asyncpg.Pool | None, smart_id: str, prices: list[PriceOffer]) -> int:
+    """Пишет офферы в parts_prices.market.record_price (отдельная БД, прямое
+    подключение — НЕ через smart-FDW/транзакцию). created_by='parts_research'
+    проставляем отдельным UPDATE по id (record_price его не принимает).
+    Возвращает число записанных офферов; бросает, если пул не сконфигурирован."""
+    if prices_pool is None:
+        raise RuntimeError("PARTS_PRICES_DATABASE_URL is not configured — cannot record prices")
+    n = 0
+    async with prices_pool.acquire() as pc:
+        async with pc.transaction():
+            for off in prices:
+                obs_id = await pc.fetchval(
+                    "SELECT market.record_price($1, $2, $3, $4, $5, $6)",
+                    smart_id, off.site, _dec(off.price), off.currency or "USD", off.url, off.article,
+                )
+                await pc.execute(
+                    "UPDATE market.observations SET created_by = 'parts_research' WHERE id = $1", obs_id)
+                n += 1
+    return n
+
+
+# title фида = "<арт1> / <арт2> <name>" (articles newest-first, первые два),
+# жёсткий лимит 50 симв. в smart (RuntimeError на сборке фида). Проверяем с запасом.
+TITLE_HARD_LIMIT = 50
+TITLE_SAFETY = 3
+TITLE_LIMIT = TITLE_HARD_LIMIT - TITLE_SAFETY  # 47
+
+
+def _feed_title(articles: list[str] | None, name: str | None) -> str:
+    arts = list(articles or [])[:2]
+    prefix = " / ".join(arts)
+    name = (name or "").strip()
+    return f"{prefix} {name}".strip() if prefix else name
+
+
+async def _check_title_budget(conn, part_id: str) -> None:
+    """Не публикуем part, чей title не влезет в фид. Считаем по РЕАЛЬНОМУ
+    пост-состоянию: RU (smart.parts.name) и EN (smart.parts_en.name), формула
+    '<арт1> / <арт2> <name>', лимит TITLE_LIMIT (50 минус запас). Превышение ->
+    отказ part'а (SAVEPOINT откатится) с явной ошибкой — курятор укоротит name."""
+    row = await conn.fetchrow("SELECT name, articles FROM smart.parts WHERE id=$1", part_id)
+    arts = list(row["articles"] or [])
+    ru = _feed_title(arts, row["name"])
+    if len(ru) > TITLE_LIMIT:
+        raise ValueError(
+            f"feed title too long ({len(ru)}>{TITLE_LIMIT}): {ru!r} — укороти name в smart.parts "
+            f"(лимит фида {TITLE_HARD_LIMIT}, запас {TITLE_SAFETY})")
+    en_name = await conn.fetchval("SELECT name FROM smart.parts_en WHERE part_id=$1", part_id)
+    if en_name is not None:
+        en = _feed_title(arts, en_name)
+        if len(en) > TITLE_LIMIT:
+            raise ValueError(
+                f"EN feed title too long ({len(en)}>{TITLE_LIMIT}): {en!r} — укороти name_en в smart.parts_en")
+
+
 async def _save_one_part(conn, part: SavePart, session_id: int) -> dict:
     # Порядок articles задаёт research (новые→старые), а не куратор: берём эталон из
     # draft_part_articles этого run'а и переставляем под него. Состав не меняем.
@@ -307,9 +410,11 @@ async def _save_one_part(conn, part: SavePart, session_id: int) -> dict:
             raise ValueError(
                 "vehicle_classes is required (non-empty) when inserting a new part; "
                 "determine the vehicle class before saving to smart")
-        parent_id = await _insert_part(conn, name=part.name, vehicle_classes=part.vehicle_classes,
+        parent_id = await _insert_part(conn, name=part.name, name_en=part.name_en,
+                                       vehicle_classes=part.vehicle_classes,
                                        articles=part.articles, model=part.model,
-                                       weight_kg=part.weight_kg, description=part.description)
+                                       weight_kg=part.weight_kg, description=part.description,
+                                       description_en=part.description_en)
         if part.brands:
             await _set_brands(conn, parent_id, part.brands)
     else:
@@ -336,6 +441,7 @@ async def _save_one_part(conn, part: SavePart, session_id: int) -> dict:
             r["index"] = j
             comp_results.append(r)
 
+    await _check_title_budget(conn, parent_id)
     await conn.execute(
         "INSERT INTO publications (run_id, curator_session_id, smart_id) VALUES ($1, $2, $3)",
         part.run_id, session_id, parent_id)
@@ -348,11 +454,18 @@ async def save_to_smart(wrapper: RunContextWrapper[CuratorRunContext], parts: li
     others still persist. INSERT vs UPDATE is decided by presence of smart_id. One publications
     row is written per successful part. Full semantics: save_to_smart.md.
 
+    Russian name/description go to smart.parts; English name_en/description_en go to smart.parts_en
+    (no parts_en row is written without name_en — that column is NOT NULL). Optional `prices`
+    (US offers for the original part) are written to the prices DB via market.record_price AFTER
+    the part commits (separate DB, outside the smart transaction); a price-write failure does NOT
+    fail the publish (shown as price_error in the result).
+
     Args:
         parts: parts to publish (each a single part or a kit with components).
     """
     ctx = wrapper.context
     results: list[dict] = []
+    price_jobs: list[tuple[int, str, list[PriceOffer]]] = []  # (results-index, smart_id, prices)
     async with ctx.pool.acquire() as conn:
         async with conn.transaction():
             for i, part in enumerate(parts):
@@ -363,7 +476,16 @@ async def save_to_smart(wrapper: RunContextWrapper[CuratorRunContext], parts: li
                     await sp.commit()
                     res["part_index"] = i
                     results.append(res)
+                    if part.prices:
+                        price_jobs.append((len(results) - 1, res["smart_id"], part.prices))
                 except Exception as e:  # noqa: BLE001 — per-part откат через SAVEPOINT, ошибку показываем
                     await sp.rollback()
                     results.append({"part_index": i, "status": "error", "error": f"{type(e).__name__}: {e}"})
+    # Цены — в ОТДЕЛЬНОЙ БД (parts_prices), вне smart-транзакции, только для успешно
+    # опубликованных parts. Ошибка записи цен НЕ валит публикацию — показываем в price_error.
+    for ridx, smart_id, prices in price_jobs:
+        try:
+            results[ridx]["prices_recorded"] = await _record_prices(ctx.prices_pool, smart_id, prices)
+        except Exception as e:  # noqa: BLE001 — публикация уже прошла; цены не критичны для каталога
+            results[ridx]["price_error"] = f"{type(e).__name__}: {e}"
     return json.dumps(results, ensure_ascii=False, default=str)

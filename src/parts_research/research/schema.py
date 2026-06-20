@@ -72,10 +72,24 @@ class NumbersBlock(BaseModel):
 class KitComponent(BaseModel):
     article: NonEmptyStr | None  # null, если артикул компонента не найден
     name: NonEmptyStr
+    name_en: NonEmptyStr | None  # английское имя компонента (-> smart.parts_en)
     quantity: int | None
     description: NonEmptyStr | None
+    description_en: NonEmptyStr | None
     source_url: NonEmptyStr
     evidence: NonEmptyStr
+
+
+class PriceOffer(BaseModel):
+    """Цена за ОРИГИНАЛ на US-магазине: текущая цена продажи именно нашего номера
+    (Price/Now), не MSRP, не порог доставки, не цена другого/substitute товара."""
+    site: NonEmptyStr           # магазин (домен), напр. "partsvu.com"
+    price: float
+    currency: NonEmptyStr | None  # null -> USD
+    url: NonEmptyStr            # ссылка на товарную страницу
+    article: NonEmptyStr        # OEM-номер, по которому найдена цена
+    in_stock: bool | None
+    evidence: NonEmptyStr       # цитата-обоснование (откуда цена)
 
 
 class PartOfKit(BaseModel):
@@ -88,12 +102,15 @@ class PartOfKit(BaseModel):
 class StructuredResult(BaseModel):
     task_part_number: NonEmptyStr
     name: NonEmptyStr | None
+    name_en: NonEmptyStr | None  # английское имя (-> smart.parts_en.name)
     brand_oem: list[NonEmptyStr]
     vehicle_classes: list[NonEmptyStr]  # слаги smart.vehicle_classes; [] = не определены
     description: NonEmptyStr | None
+    description_en: NonEmptyStr | None  # английское описание (-> smart.parts_en.description)
     weight: WeightBlock | None
     models: ModelsBlock | None
     is_kit: bool
     kit_contents: list[KitComponent]
     part_of_kits: list[PartOfKit]
     numbers: NumbersBlock
+    us_prices: list[PriceOffer]  # US-цены за оригинал; [] = не найдено в turn-1 -> фолбэк
