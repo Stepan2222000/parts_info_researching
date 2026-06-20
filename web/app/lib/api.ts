@@ -92,10 +92,12 @@ export interface RunDetail {
   finished_at: string | null;
   draft: {
     name: string | null;
+    name_en: string | null;
     brand_oem: string[];
     product_type: string | null;
     vehicle_classes: string[];
     description: string | null;
+    description_en: string | null;
     is_kit: boolean;
     weight_kg: number | null;
     weight_source_url: string | null;
@@ -109,6 +111,17 @@ export interface RunDetail {
   components: ComponentRow[];
   part_of_kits: { kit_article: string | null; kit_name: string | null; source_url: string; evidence: string }[];
   publications: { id: number; smart_id: string; curator_session_id: number; published_at: string | null }[];
+  prices: PriceRow[];
+}
+
+export interface PriceRow {
+  site: string;
+  price: number;
+  currency: string;
+  url: string | null;
+  in_stock: boolean | null;
+  article: string | null;
+  evidence: string | null;
 }
 
 export interface SessionSummary {

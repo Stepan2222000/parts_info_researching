@@ -137,6 +137,12 @@ async def load_run_detail(pool: asyncpg.Pool, run_id: int) -> dict | None:
             run_id,
         )
 
+        prices = await conn.fetch(
+            "SELECT site, price, currency, url, in_stock, article, evidence "
+            "FROM draft_prices WHERE run_id = $1 ORDER BY price",
+            run_id,
+        )
+
     return {
         "run_id": run["run_id"],
         "task_id": run["task_id"],
@@ -189,16 +195,30 @@ async def load_run_detail(pool: asyncpg.Pool, run_id: int) -> dict | None:
             }
             for p in publications
         ],
+        "prices": [
+            {
+                "site": p["site"],
+                "price": float(p["price"]),
+                "currency": p["currency"],
+                "url": p["url"],
+                "in_stock": p["in_stock"],
+                "article": p["article"],
+                "evidence": p["evidence"],
+            }
+            for p in prices
+        ],
     }
 
 
 def _draft(d: asyncpg.Record) -> dict:
     return {
         "name": d["name"],
+        "name_en": d["name_en"],
         "brand_oem": list(d["brand_oem"]) if d["brand_oem"] is not None else [],
         "product_type": d["product_type"],
         "vehicle_classes": list(d["vehicle_classes"]) if d["vehicle_classes"] is not None else [],
         "description": d["description"],
+        "description_en": d["description_en"],
         "is_kit": d["is_kit"],
         "weight_kg": float(d["weight_kg"]) if d["weight_kg"] is not None else None,
         "weight_source_url": d["weight_source_url"],

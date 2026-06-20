@@ -43,6 +43,9 @@ def build_user_preamble(context: ResearchContext) -> str:
         "- Каждый номер — РОВНО в одном из numbers.article / numbers.article_low_confidence / "
         "numbers.irrelevant, без дублей между ними.\n"
         "- Пустые строки запрещены: нет значения -> null или [] (не \"\").\n\n"
+        "description / description_en: кратко ЧТО это за деталь, её НАЗНАЧЕНИЕ/функция и где применяется "
+        "(узел, тип техники). 1–2 предложения, без воды и маркетинга. НЕ пиши в описании кросс-/замен-номера, "
+        "'заменён номером X' / 'replaces X', артикулы, SKU и цены — это уже в своих полях (numbers/us_prices).\n\n"
         f"JSON Schema:\n{_STRUCT_SCHEMA_JSON}\n"
     )
 

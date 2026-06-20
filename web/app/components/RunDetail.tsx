@@ -109,6 +109,7 @@ export function RunDetail({ runId, onClose, onRetry }: {
                   <div className="section-label">Draft</div>
                   <div className="field-grid">
                     <Field k="Название" v={d.draft.name} serif />
+                    <Field k="Name (EN)" v={d.draft.name_en} serif />
                     <Field k="Классы" v={d.draft.vehicle_classes.join(", ") || null} />
                     <Field k="Тип" v={d.draft.product_type} />
                     <Field k="Бренды" v={d.draft.brand_oem.join(", ") || null} />
@@ -119,6 +120,11 @@ export function RunDetail({ runId, onClose, onRetry }: {
                   {d.draft.description && (
                     <div style={{ marginTop: 12 }}>
                       <Field k="Описание" v={d.draft.description} />
+                    </div>
+                  )}
+                  {d.draft.description_en && (
+                    <div style={{ marginTop: 12 }}>
+                      <Field k="Description (EN)" v={d.draft.description_en} />
                     </div>
                   )}
                   {d.draft.weight_evidence && (
@@ -168,6 +174,26 @@ export function RunDetail({ runId, onClose, onRetry }: {
                         <div className="ev-top"><span className="ev-art">{p.kit_article ?? "— номер неизвестен —"}</span></div>
                         <div className="ev-text">{p.kit_name}</div>
                         <div className="ev-text" style={{ opacity: 0.8 }}>{p.evidence}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {d.prices.length > 0 && (
+                <div>
+                  <div className="section-label">Цены US (за оригинал) · {d.prices.length}</div>
+                  <div className="ev-list">
+                    {d.prices.map((p, i) => (
+                      <div className="ev" key={i}>
+                        <div className="ev-top">
+                          <span className="ev-art">{p.price.toFixed(2)} {p.currency}</span>
+                          <span className="muted">{p.site}{p.in_stock === false ? " · нет в наличии" : ""}</span>
+                        </div>
+                        {p.article && <div className="ev-text" style={{ opacity: 0.8 }}>номер: {p.article}</div>}
+                        {p.url && (
+                          <a className="ev-link" href={p.url} target="_blank" rel="noreferrer">{p.url}</a>
+                        )}
                       </div>
                     ))}
                   </div>
