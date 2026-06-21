@@ -28,6 +28,10 @@ class Settings:
     exa_api_key: str
     worker_concurrency: int
     worker_stale_minutes: int
+    # Формат-валидация артикулов: 'soft' (проблемы пишем, run/part не валим — раскат и
+    # сбор бэклога правил) | 'hard' (критич.фейл на NO_RULE тоже). NOT_CANONICAL валит
+    # ВСЕГДА в обоих режимах (доказанно грязная форма).
+    format_validation_mode: str
 
 
 def load_settings() -> Settings:
@@ -41,6 +45,7 @@ def load_settings() -> Settings:
         exa_api_key=_require("EXA_API_KEY"),
         worker_concurrency=int(os.environ.get("WORKER_CONCURRENCY", "30")),
         worker_stale_minutes=int(os.environ.get("WORKER_STALE_MINUTES", "30")),
+        format_validation_mode=(os.environ.get("FORMAT_VALIDATION_MODE") or "soft").lower(),
     )
 
 

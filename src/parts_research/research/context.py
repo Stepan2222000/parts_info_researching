@@ -13,6 +13,8 @@ from typing import Any
 
 import asyncpg
 
+from ..article_format import load_ruleset
+
 SMART_PLUGIN_NAME = "smart"
 
 
@@ -30,6 +32,7 @@ class ResearchContext:
     vehicle_classes: list[VehicleClassInfo]  # справочник классов техники (по position)
     brand_aliases: dict[str, str]  # alias -> canonical (Smart-бренд)
     smart_payload: dict[str, Any] | None  # подсказка Smart-плагина или None
+    article_format_spec: str  # спека канонических форматов артикулов (для промпта модели)
 
     @property
     def allowed_vehicle_classes(self) -> list[str]:
@@ -96,7 +99,7 @@ async def smart_plugin_lookup(pool: asyncpg.Pool, article: str) -> dict[str, Any
 
 
 async def load_context(pool: asyncpg.Pool, article: str) -> ResearchContext:
-    brands, classes, aliases, smart_payload = await asyncio.gather(
+    brands, classes, aliases, smart_payload, ruleset = await asyncio.gather(
         pool.fetch("SELECT name FROM smart.brands ORDER BY name"),
         pool.fetch(
             "SELECT slug, title_ru, product_type, position "
@@ -104,6 +107,7 @@ async def load_context(pool: asyncpg.Pool, article: str) -> ResearchContext:
         ),
         pool.fetch("SELECT alias, canonical FROM brand_mapping.brand_aliases"),
         smart_plugin_lookup(pool, article),
+        load_ruleset(pool),
     )
     return ResearchContext(
         allowed_brands=[r["name"] for r in brands],
@@ -116,4 +120,6 @@ async def load_context(pool: asyncpg.Pool, article: str) -> ResearchContext:
         ],
         brand_aliases={r["alias"]: r["canonical"] for r in aliases},
         smart_payload=smart_payload,
+        # бренд запчасти на старте неизвестен (его определит модель) -> спека по всем брендам
+        article_format_spec=ruleset.format_spec(),
     )

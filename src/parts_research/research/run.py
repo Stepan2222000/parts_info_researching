@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError
 
+from ..article_format import NOT_CANONICAL, OK, load_ruleset
 from ..config import settings
 from ..db.pool import strip_nul
 from ..db.session import PostgresSession
@@ -342,6 +343,51 @@ async def _parse_to_draft(
                 )
 
 
+# ── формат-валидация артикулов (persist-then-validate) ──────────────────────────
+async def _validate_article_formats(pool: asyncpg.Pool, run_id: int) -> list[str]:
+    """Валидирует артикулы УЖЕ записанного draft по канон-правилам brand_mapping и пишет
+    проблемы в article_format_problems (FK на draft_part_articles — без дублей). Сами
+    ничего не правим. Возвращает список блокирующих confirmed-артикулов (для статуса run'а):
+    NOT_CANONICAL блокирует всегда, NO_RULE — только в hard-режиме. Бренд не определён
+    (brand_oem пуст) -> формат не гейтим (run и так уйдёт в needs_review)."""
+    async with pool.acquire() as conn:
+        dp = await conn.fetchrow("SELECT id, brand_oem FROM draft_parts WHERE run_id = $1", run_id)
+        if dp is None:
+            return []
+        brands = set(dp["brand_oem"] or [])
+        if not brands:
+            return []
+        rows = await conn.fetch(
+            "SELECT id, article, confidence FROM draft_part_articles "
+            "WHERE draft_part_id = $1 AND confidence IN ('confirmed', 'low_confidence')",
+            dp["id"],
+        )
+        ruleset = await load_ruleset(pool)
+        hard = settings.format_validation_mode == "hard"
+        blocking: list[str] = []
+        for r in rows:
+            v = ruleset.validate(r["article"], brands)
+            if v.status == OK:
+                continue
+            await conn.execute(
+                "INSERT INTO article_format_problems "
+                "(draft_article_id, reason, expected_canonical, rule_name, source) "
+                "VALUES ($1, $2, $3, $4, 'research') "
+                "ON CONFLICT (draft_article_id, source) DO UPDATE SET "
+                "  reason = EXCLUDED.reason, expected_canonical = EXCLUDED.expected_canonical, "
+                "  rule_name = EXCLUDED.rule_name, created_at = now()",
+                r["id"], v.status, v.expected, v.rule_name,
+            )
+            # блокируем только confirmed (это уходит в smart)
+            if r["confidence"] != "confirmed":
+                continue
+            if v.status == NOT_CANONICAL:
+                blocking.append(f"{r['article']} -> {v.expected}")
+            elif hard:  # NO_RULE в hard-режиме
+                blocking.append(f"{r['article']} (no rule)")
+        return blocking
+
+
 # ── главная функция ──────────────────────────────────────────────────────────────
 async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
     """Гонит run целиком. Возвращает финальный статус. Текст любой ошибки
@@ -382,10 +428,18 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
             log(f"[phase2] failed (non-fatal), keeping pre-phase2 result: {type(e).__name__}: {e}")
 
         reason = _needs_review_reason(current)
+        # persist-then-validate: сперва пишем draft (всегда), затем формат-валидация
+        # читает записанные артикулы и фиксирует проблемы (FK на draft_part_articles).
         await _parse_to_draft(
             pool, run_id, current, reason,
             derived_product_type=context.derive_product_type(list(current.vehicle_classes)),
         )
+        blocking = await _validate_article_formats(pool, run_id)
+        if blocking:
+            msg = "article format not canonical: " + "; ".join(blocking)
+            await _finish(pool, run_id, "failed_validation", msg)
+            log(f"[fail] run {run_id} -> failed_validation (format): {msg}")
+            return "failed_validation"
         status = "needs_human_review" if reason else "done"
         await _finish(pool, run_id, status, error=reason)
         log(f"[done] run {run_id} -> {status}" + (f" ({reason})" if reason else ""))

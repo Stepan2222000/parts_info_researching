@@ -21,6 +21,8 @@ from pydantic import BaseModel
 
 from agents import RunContextWrapper, function_tool
 
+from ..article_format import NOT_CANONICAL, OK, load_ruleset
+from ..config import settings
 from ..research.exa_client import _to_jsonable, pick_fetch, pick_search
 
 
@@ -448,6 +450,49 @@ async def _save_one_part(conn, part: SavePart, session_id: int) -> dict:
     return {"status": "ok", "smart_id": parent_id, "components": comp_results, "prices_recorded": prices_recorded}
 
 
+async def _validate_part_formats(conn, part: SavePart, ruleset) -> list[str]:
+    """Гейткипер smart: проверяет формат публикуемых артикулов по канон-правилам.
+    Сами не правим. Проблемы пишем в article_format_problems (source='curator') в outer-
+    транзакции — они переживут per-part SAVEPOINT-откат. Возвращает блокирующие артикулы:
+    NOT_CANONICAL блокирует ВСЕГДА, NO_RULE — только в hard. Бренд берём из payload.brands,
+    иначе из draft_parts.brand_oem; нет бренда -> не гейтим."""
+    arts = list(part.articles or [])
+    if not arts:
+        return []
+    brands = set(part.brands or [])
+    if not brands:
+        row = await conn.fetchrow("SELECT brand_oem FROM draft_parts WHERE run_id = $1", part.run_id)
+        brands = set(row["brand_oem"] or []) if row else set()
+    if not brands:
+        return []
+    hard = settings.format_validation_mode == "hard"
+    blocking: list[str] = []
+    for a in arts:
+        v = ruleset.validate(a, brands)
+        if v.status == OK:
+            continue
+        daid = await conn.fetchval(
+            "SELECT dpa.id FROM draft_part_articles dpa JOIN draft_parts dp ON dp.id = dpa.draft_part_id "
+            "WHERE dp.run_id = $1 AND dpa.article = $2 ORDER BY dpa.id LIMIT 1",
+            part.run_id, a,
+        )
+        if daid is not None:
+            await conn.execute(
+                "INSERT INTO article_format_problems "
+                "(draft_article_id, reason, expected_canonical, rule_name, source) "
+                "VALUES ($1, $2, $3, $4, 'curator') "
+                "ON CONFLICT (draft_article_id, source) DO UPDATE SET "
+                "  reason = EXCLUDED.reason, expected_canonical = EXCLUDED.expected_canonical, "
+                "  rule_name = EXCLUDED.rule_name, created_at = now()",
+                daid, v.status, v.expected, v.rule_name,
+            )
+        if v.status == NOT_CANONICAL:
+            blocking.append(f"{a} -> {v.expected}")
+        elif hard:
+            blocking.append(f"{a} (no rule)")
+    return blocking
+
+
 @function_tool
 async def save_to_smart(wrapper: RunContextWrapper[CuratorRunContext], parts: list[SavePart]) -> str:
     """Publish parts to smart_test (via FDW). Each part is its own SAVEPOINT — if one fails the
@@ -465,9 +510,19 @@ async def save_to_smart(wrapper: RunContextWrapper[CuratorRunContext], parts: li
     """
     ctx = wrapper.context
     results: list[dict] = []
+    ruleset = await load_ruleset(ctx.pool)
     async with ctx.pool.acquire() as conn:
         async with conn.transaction():
             for i, part in enumerate(parts):
+                # Гейткипер формата ДО SAVEPOINT: проблемы пишем в outer-txn (переживут per-part откат).
+                blocking = await _validate_part_formats(conn, part, ruleset)
+                if blocking:
+                    results.append({
+                        "part_index": i, "status": "error",
+                        "error": "article format not canonical (fix article to its canonical smart form): "
+                                 + "; ".join(blocking),
+                    })
+                    continue
                 sp = conn.transaction()
                 await sp.start()
                 try:
