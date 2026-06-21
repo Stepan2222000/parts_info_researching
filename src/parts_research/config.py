@@ -28,10 +28,6 @@ class Settings:
     exa_api_key: str
     worker_concurrency: int
     worker_stale_minutes: int
-    # Опционально: отдельная БД цен (схема market, record_price/min_price).
-    # Нужна только куратору для записи цен. None => price-запись недоступна
-    # (save_to_smart с ценами в payload даст явную ошибку, не молча).
-    parts_prices_url: str | None
 
 
 def load_settings() -> Settings:
@@ -45,7 +41,6 @@ def load_settings() -> Settings:
         exa_api_key=_require("EXA_API_KEY"),
         worker_concurrency=int(os.environ.get("WORKER_CONCURRENCY", "30")),
         worker_stale_minutes=int(os.environ.get("WORKER_STALE_MINUTES", "30")),
-        parts_prices_url=os.environ.get("PARTS_PRICES_DATABASE_URL") or None,
     )
 
 

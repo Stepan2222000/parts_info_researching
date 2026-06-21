@@ -29,9 +29,6 @@ class CuratorRunContext:
     pool: asyncpg.Pool
     exa: AsyncExa
     session_id: int
-    # Пул к БД цен (parts_prices). None => price-запись недоступна, и
-    # save_to_smart с непустым prices в payload вернёт явную ошибку.
-    prices_pool: asyncpg.Pool | None = None
 
 
 def _parse_count(tag: str) -> int:
@@ -345,24 +342,25 @@ def _order_articles(articles: list[str] | None, reference: list[str]) -> list[st
     return known + unknown
 
 
-async def _record_prices(prices_pool: asyncpg.Pool | None, smart_id: str, prices: list[PriceOffer]) -> int:
-    """Пишет офферы в parts_prices.market.record_price (отдельная БД, прямое
-    подключение — НЕ через smart-FDW/транзакцию). created_by='parts_research'
-    проставляем отдельным UPDATE по id (record_price его не принимает).
-    Возвращает число записанных офферов; бросает, если пул не сконфигурирован."""
-    if prices_pool is None:
-        raise RuntimeError("PARTS_PRICES_DATABASE_URL is not configured — cannot record prices")
+async def _record_prices(conn, smart_id: str, prices: list[PriceOffer]) -> int:
+    """Пишет офферы в parts_prices через FDW (market.*) В ТОЙ ЖЕ транзакции/SAVEPOINT,
+    что и smart-публикация part'а: упали цены -> откатывается и публикация этого part'а
+    (атомарно per-part). Логику market.record_price повторяем вручную (find-or-create
+    site + insert observation), т.к. удалённую функцию через FDW не вызвать; пишем через
+    write-FT без авто-колонок (id/created_at/observed_at генерит remote). Возвращает число офферов."""
     n = 0
-    async with prices_pool.acquire() as pc:
-        async with pc.transaction():
-            for off in prices:
-                obs_id = await pc.fetchval(
-                    "SELECT market.record_price($1, $2, $3, $4, $5, $6)",
-                    smart_id, off.site, _dec(off.price), off.currency or "USD", off.url, off.article,
-                )
-                await pc.execute(
-                    "UPDATE market.observations SET created_by = 'parts_research' WHERE id = $1", obs_id)
-                n += 1
+    for off in prices:
+        site = off.site.strip()
+        site_id = await conn.fetchval("SELECT id FROM market.sites WHERE name = $1", site)
+        if site_id is None:
+            await conn.execute("INSERT INTO market.sites_w (name) VALUES ($1)", site)
+            site_id = await conn.fetchval("SELECT id FROM market.sites WHERE name = $1", site)
+        await conn.execute(
+            "INSERT INTO market.observations_w (smart_part_id, site_id, price, currency, url, note, created_by) "
+            "VALUES ($1, $2, $3, $4, $5, $6, 'parts_research')",
+            smart_id, site_id, _dec(off.price), (off.currency or "USD").upper(), off.url, off.article,
+        )
+        n += 1
     return n
 
 
@@ -442,10 +440,12 @@ async def _save_one_part(conn, part: SavePart, session_id: int) -> dict:
             comp_results.append(r)
 
     await _check_title_budget(conn, parent_id)
+    # Цены — в ТОЙ ЖЕ транзакции (через FDW parts_prices): атомарно с публикацией part'а.
+    prices_recorded = await _record_prices(conn, parent_id, part.prices) if part.prices else 0
     await conn.execute(
         "INSERT INTO publications (run_id, curator_session_id, smart_id) VALUES ($1, $2, $3)",
         part.run_id, session_id, parent_id)
-    return {"status": "ok", "smart_id": parent_id, "components": comp_results}
+    return {"status": "ok", "smart_id": parent_id, "components": comp_results, "prices_recorded": prices_recorded}
 
 
 @function_tool
@@ -456,16 +456,15 @@ async def save_to_smart(wrapper: RunContextWrapper[CuratorRunContext], parts: li
 
     Russian name/description go to smart.parts; English name_en/description_en go to smart.parts_en
     (no parts_en row is written without name_en — that column is NOT NULL). Optional `prices`
-    (US offers for the original part) are written to the prices DB via market.record_price AFTER
-    the part commits (separate DB, outside the smart transaction); a price-write failure does NOT
-    fail the publish (shown as price_error in the result).
+    (US offers for the original part) are written to parts_prices via FDW (market.*) WITHIN the
+    same per-part transaction — atomic with the publish: if a price write fails, that part's whole
+    publish (smart + prices) rolls back via its SAVEPOINT; neighbouring parts still persist.
 
     Args:
         parts: parts to publish (each a single part or a kit with components).
     """
     ctx = wrapper.context
     results: list[dict] = []
-    price_jobs: list[tuple[int, str, list[PriceOffer]]] = []  # (results-index, smart_id, prices)
     async with ctx.pool.acquire() as conn:
         async with conn.transaction():
             for i, part in enumerate(parts):
@@ -476,16 +475,7 @@ async def save_to_smart(wrapper: RunContextWrapper[CuratorRunContext], parts: li
                     await sp.commit()
                     res["part_index"] = i
                     results.append(res)
-                    if part.prices:
-                        price_jobs.append((len(results) - 1, res["smart_id"], part.prices))
-                except Exception as e:  # noqa: BLE001 — per-part откат через SAVEPOINT, ошибку показываем
+                except Exception as e:  # noqa: BLE001 — per-part откат через SAVEPOINT (smart + цены вместе), ошибку показываем
                     await sp.rollback()
                     results.append({"part_index": i, "status": "error", "error": f"{type(e).__name__}: {e}"})
-    # Цены — в ОТДЕЛЬНОЙ БД (parts_prices), вне smart-транзакции, только для успешно
-    # опубликованных parts. Ошибка записи цен НЕ валит публикацию — показываем в price_error.
-    for ridx, smart_id, prices in price_jobs:
-        try:
-            results[ridx]["prices_recorded"] = await _record_prices(ctx.prices_pool, smart_id, prices)
-        except Exception as e:  # noqa: BLE001 — публикация уже прошла; цены не критичны для каталога
-            results[ridx]["price_error"] = f"{type(e).__name__}: {e}"
     return json.dumps(results, ensure_ascii=False, default=str)

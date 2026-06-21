@@ -31,7 +31,7 @@
 - `name_en`, `description_en` — английские версии (пишутся в `smart.parts_en`). Без `name_en` строка `parts_en` не создаётся (там `name NOT NULL`); `null` == не трогать (как и остальные поля).
 - `brands` — массив строк (например `["MERCRUISER"]`). Имена должны быть в `smart.brands`.
 - `components` — массив компонентов (если kit). Отсутствие или `[]` — состав не трогаем.
-- `prices` — массив US-офферов за оригинал `{site, price, currency, url, article, in_stock, evidence}`. Пишутся в БД цен (`parts_prices.market.record_price`) ПОСЛЕ коммита part'а (отдельная БД, вне smart-транзакции). Ошибка записи цен НЕ валит публикацию — отражается как `price_error` в ответе. `created_by='parts_research'` проставляется тулом.
+- `prices` — массив US-офферов за оригинал `{site, price, currency, url, article, in_stock, evidence}`. Пишутся в `parts_prices` через FDW (`market.sites`/`market.observations`) **в той же транзакции/SAVEPOINT, что и публикация part'а** — атомарно: если запись цен упала, весь part (smart + цены) откатывается по своему SAVEPOINT, соседние parts сохраняются. `created_by='parts_research'` проставляется тулом; число записанных — `prices_recorded` в ответе.
 
 Поля одного `component` (run_id наследуется от parent'а):
 

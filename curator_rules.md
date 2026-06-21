@@ -77,7 +77,7 @@ LIMIT N;
 ## Цены за оригинал (US) → поле `prices`
 
 `draft_prices` хранит найденные research-агентом цены. В payload `save_to_smart.parts[i].prices` положи массив офферов из `draft_prices` этого `run_id`:
-`{site, price, currency, url, article, in_stock, evidence}`. Тул после публикации (когда у part'а есть `smart_id`) сам запишет их в БД цен (`market.record_price`), вне smart-транзакции; ошибка записи цен не валит публикацию (видна как `price_error` в ответе).
+`{site, price, currency, url, article, in_stock, evidence}`. Тул запишет их в `parts_prices` через FDW (`market.*`) **в той же транзакции, что и публикация part'а** — атомарно: если цены упадут, откатится и публикация этого part'а (всё-или-ничего per-part). Число записанных — `prices_recorded` в ответе.
 
 Перед тем как класть цены — лёгкая проверка (мусор не передавай): отбрасывай `price<=0`, явные нечисловые выбросы и цены не нашего номера. Если что-то сомнительно или пусто — можешь перепроверить живым `web_search_exa`/`web_fetch_exa`. По умолчанию доверяй тому, что собрал research.
 

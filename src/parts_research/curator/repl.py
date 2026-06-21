@@ -19,7 +19,7 @@ from exa_py import AsyncExa
 from agents import ItemHelpers, Runner
 
 from ..config import settings
-from ..db.pool import create_parts_prices_pool, create_pool
+from ..db.pool import create_pool
 from ..db.session import PostgresSession
 from .agent_factory import build_curator_system_prompt, make_curator_agent
 from .snapshot import format_snapshot, load_snapshot
@@ -98,12 +98,11 @@ async def _build(pool: asyncpg.Pool):
 
 async def run_repl() -> None:
     pool = await create_pool(min_size=2, max_size=10)
-    prices_pool = await create_parts_prices_pool()
     try:
         agent, exa = await _build(pool)
         session_id = await _new_session(pool)
         session = PostgresSession(f"curator_{session_id}", pool)
-        ctx = CuratorRunContext(pool=pool, exa=exa, session_id=session_id, prices_pool=prices_pool)
+        ctx = CuratorRunContext(pool=pool, exa=exa, session_id=session_id)
         out(f"[curator] session={session_id}. Команды: /exit, /new. Пиши сообщение.")
         while True:
             try:
@@ -119,30 +118,25 @@ async def run_repl() -> None:
                 await pool.execute("UPDATE curator_sessions SET ended_at=now() WHERE id=$1", session_id)
                 session_id = await _new_session(pool)
                 session = PostgresSession(f"curator_{session_id}", pool)
-                ctx = CuratorRunContext(pool=pool, exa=exa, session_id=session_id, prices_pool=prices_pool)
+                ctx = CuratorRunContext(pool=pool, exa=exa, session_id=session_id)
                 out(f"[curator] new session={session_id}")
                 continue
             await _run_turn(agent, session, ctx, pool, session_id, line)
         await pool.execute("UPDATE curator_sessions SET ended_at=now() WHERE id=$1 AND ended_at IS NULL", session_id)
     finally:
         await pool.close()
-        if prices_pool is not None:
-            await prices_pool.close()
 
 
 async def run_once(message: str) -> None:
     """Неинтерактивный one-shot: одна сессия, одно сообщение, печать стрима, выход."""
     pool = await create_pool(min_size=2, max_size=10)
-    prices_pool = await create_parts_prices_pool()
     try:
         agent, exa = await _build(pool)
         session_id = await _new_session(pool)
         session = PostgresSession(f"curator_{session_id}", pool)
-        ctx = CuratorRunContext(pool=pool, exa=exa, session_id=session_id, prices_pool=prices_pool)
+        ctx = CuratorRunContext(pool=pool, exa=exa, session_id=session_id)
         out(f"[curator one-shot] session={session_id}")
         await _run_turn(agent, session, ctx, pool, session_id, message)
         await pool.execute("UPDATE curator_sessions SET ended_at=now() WHERE id=$1", session_id)
     finally:
         await pool.close()
-        if prices_pool is not None:
-            await prices_pool.close()
