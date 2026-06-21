@@ -9,6 +9,7 @@ SDK-retry не ловит (replay-safety), повторяем turn целико�
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from typing import Any
@@ -38,19 +39,26 @@ def _with_preamble(preamble: str | None, inp: Any) -> Any:
 
 def _parse_structured_result(raw: Any) -> StructuredResult:
     """Финальный вывод модели -> StructuredResult. Эндпоинт не применяет
-    response_format, поэтому модель отдаёт JSON (часто в markdown-обёртке) как
-    текст: снимаем ```-обёртку / берём объект от первой { до последней }, чистим
-    NUL и валидируем pydantic'ом. Невалид -> ValidationError -> failed_validation."""
+    response_format, поэтому модель отдаёт JSON (часто в markdown-обёртке) как текст.
+
+    ВАЖНО: текущая модель **gpt-5.5** регулярно приклеивает в конце ЛИШНИЙ мусор —
+    чаще всего лишнюю закрывающую `}` (хвосты вида `}]} }` / `}]}}\\n`), иногда текст.
+    Поэтому НЕ берём «от первой { до последней }» (rfind захватывал бы эту лишнюю
+    скобку -> pydantic json_invalid: trailing characters -> потеря валидного run'а).
+    Вместо этого: снимаем ```-обёртку, находим первую `{` и парсим ПЕРВЫЙ полный
+    JSON-объект через raw_decode — всё после него игнорируем. Чистим NUL, валидируем.
+    Реально битый JSON -> JSONDecodeError(ValueError)/ValidationError -> failed_validation."""
     if isinstance(raw, StructuredResult):
         return raw
     text = (str(raw) if raw is not None else "").replace("\x00", "").strip()
     m = _FENCED_JSON.search(text)
-    if m:
-        js = m.group(1)
-    else:
-        i, j = text.find("{"), text.rfind("}")
-        js = text[i:j + 1] if i >= 0 and j > i else text
-    return StructuredResult.model_validate_json(js)
+    candidate = m.group(1) if m else text
+    i = candidate.find("{")
+    if i < 0:
+        return StructuredResult.model_validate_json(candidate)  # нет объекта -> явная ошибка
+    # raw_decode: первый полный объект от позиции i; trailing-мусор gpt-5.5 (лишняя }) игнорируем
+    obj, _ = json.JSONDecoder().raw_decode(candidate, i)
+    return StructuredResult.model_validate(obj)
 
 
 def log(msg: str) -> None:
