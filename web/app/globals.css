@@ -234,7 +234,11 @@ button { font-family: inherit; }
 .count-row {
   display: flex; align-items: center; gap: 9px; padding: 7px 9px;
   border-radius: var(--radius-sm); font-size: 14px; color: var(--text-soft);
+  width: 100%; background: none; border: 0; text-align: left; cursor: pointer;
+  font-family: inherit; transition: background 0.12s ease;
 }
+.count-row:hover { background: var(--hover); color: var(--text-strong); }
+.count-row.active { background: var(--hover-2); color: var(--text-strong); }
 .count-row .n { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text-strong); }
 
 .backlog-chips { display: inline-flex; align-items: center; gap: 10px; }

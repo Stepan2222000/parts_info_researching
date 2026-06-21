@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getQueue, submitArticles, STATUS_LABEL, STATUS_ORDER, type QueueData, type TaskCard as TaskCardData } from "@/lib/api";
+import { getQueue, submitArticles, STATUS_LABEL, STATUS_ORDER, type QueueData, type RunStatus, type TaskCard as TaskCardData } from "@/lib/api";
 import { Rail, WorkerStatus } from "@/components/Rail";
 import { AddTasks } from "@/components/AddTasks";
 import { TaskCard } from "@/components/TaskCard";
@@ -41,6 +41,7 @@ export default function Dashboard() {
   const [err, setErr] = useState<string | null>(null);
   const [openRun, setOpenRun] = useState<number | null>(null);
   const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<RunStatus | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const refresh = useCallback(async () => {
@@ -68,8 +69,10 @@ export default function Dashboard() {
   const counts = data?.counts ?? {};
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   const cards = data?.cards ?? [];
-  const filtered = cards.filter((c) => matchesQuery(c, query));
-  const filtering = query.trim().length > 0;
+  const filtered = cards.filter(
+    (c) => matchesQuery(c, query) && (statusFilter === null || c.status === statusFilter),
+  );
+  const filtering = query.trim().length > 0 || statusFilter !== null;
 
   return (
     <div className="app">
@@ -80,11 +83,18 @@ export default function Dashboard() {
         <div className="rail-label">Статусы</div>
         <div className="counts">
           {STATUS_ORDER.filter((s) => counts[s]).map((s) => (
-            <div className="count-row" key={s}>
+            <button
+              type="button"
+              className={`count-row${statusFilter === s ? " active" : ""}`}
+              key={s}
+              onClick={() => setStatusFilter((cur) => (cur === s ? null : s))}
+              aria-pressed={statusFilter === s}
+              title={statusFilter === s ? "Снять фильтр" : `Показать только: ${STATUS_LABEL[s]}`}
+            >
               <span className={`dot bdot ${FAILED.has(s) ? "failed_no_data" : s}`} />
               {STATUS_LABEL[s]}
               <span className="n">{counts[s]}</span>
-            </div>
+            </button>
           ))}
           {total === 0 && <div className="muted" style={{ padding: "6px 9px" }}>Очередь пуста.</div>}
         </div>
@@ -130,7 +140,11 @@ export default function Dashboard() {
             {data && cards.length > 0 && filtered.length === 0 && (
               <div className="empty">
                 <div className="serif">Ничего не найдено.</div>
-                <div>По запросу «{query.trim()}» задач нет. Измени запрос или очисти поиск.</div>
+                <div>
+                  {query.trim()
+                    ? `По запросу «${query.trim()}»${statusFilter ? ` и статусу «${STATUS_LABEL[statusFilter]}»` : ""} задач нет. Измени запрос или сними фильтр.`
+                    : `Нет задач со статусом «${statusFilter ? STATUS_LABEL[statusFilter] : ""}».`}
+                </div>
               </div>
             )}
             <div className="cards">
