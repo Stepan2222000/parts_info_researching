@@ -124,6 +124,259 @@ async def mark_needs_review(wrapper: RunContextWrapper[CuratorRunContext], run_i
     return json.dumps({"run_id": run_id, "updated": _parse_count(tag), "reason": reason}, ensure_ascii=False)
 
 
+# ── get_context ───────────────────────────────────────────────────────────────────
+# Один тул вместо «модель сама сочиняет разведочный SQL»: по списку артикулов (или по
+# голове очереди) отдаёт весь нужный для публикации контекст детали. Read-only.
+def _gc_norm(articles: list[str] | None) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for a in articles or []:
+        n = (a or "").strip().upper()
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+async def _gc_existing_prices(conn, smart_id: str) -> list[dict]:
+    """Уже записанные офферы Smart-записи (по одному на магазин). Через write-FT
+    market.observations_w (read-FT в parts_research нет); observed_at недоступен,
+    поэтому отдаём distinct по магазину — достаточно, чтобы не плодить дубли цен."""
+    rows = await conn.fetch(
+        "SELECT DISTINCT s.name AS site, o.price, o.currency, o.url, o.note AS article "
+        "FROM market.observations_w o JOIN market.sites s ON s.id = o.site_id WHERE o.smart_part_id = $1",
+        smart_id,
+    )
+    return [{"site": r["site"], "price": float(r["price"]) if r["price"] is not None else None,
+             "currency": r["currency"], "url": r["url"], "article": r["article"]} for r in rows]
+
+
+async def _gc_smart_detail(conn, smart_id: str) -> dict | None:
+    """Полная Smart-запись: поля + EN + бренды + состав + уже записанные цены."""
+    p = await conn.fetchrow(
+        "SELECT id, name, articles, model, weight_kg, description, is_draft, is_unverified, vehicle_classes "
+        "FROM smart.parts WHERE id = $1", smart_id)
+    if p is None:
+        return None
+    en = await conn.fetchrow("SELECT name, description FROM smart.parts_en WHERE part_id = $1", smart_id)
+    brands = [r["brand"] for r in await conn.fetch("SELECT brand FROM smart.part_brands WHERE part_id = $1", smart_id)]
+    comps = await conn.fetch(
+        "SELECT pc.child_id, pc.quantity, c.name AS child_name, c.articles AS child_articles "
+        "FROM smart.part_components pc LEFT JOIN smart.parts c ON c.id = pc.child_id WHERE pc.parent_id = $1", smart_id)
+    return {
+        "id": p["id"], "name": p["name"], "articles": list(p["articles"] or []), "model": p["model"],
+        "weight_kg": float(p["weight_kg"]) if p["weight_kg"] is not None else None,
+        "description": p["description"], "is_draft": p["is_draft"], "is_unverified": p["is_unverified"],
+        "vehicle_classes": list(p["vehicle_classes"] or []),
+        "name_en": en["name"] if en else None, "description_en": en["description"] if en else None,
+        "brands": brands,
+        "components": [{"child_id": c["child_id"], "quantity": c["quantity"], "name": c["child_name"],
+                       "articles": list(c["child_articles"] or [])} for c in comps],
+        "existing_prices": await _gc_existing_prices(conn, smart_id),
+    }
+
+
+async def _gc_smart_match(conn, articles: list[str]) -> list[dict]:
+    """Smart-записи, пересекающиеся по любому из articles (полный контекст каждой)."""
+    if not articles:
+        return []
+    ids = [r["id"] for r in await conn.fetch(
+        "SELECT id FROM smart.parts WHERE articles && $1::text[] ORDER BY id", list(articles))]
+    res = []
+    for sid in ids:
+        d = await _gc_smart_detail(conn, sid)
+        if d is not None:
+            res.append(d)
+    return res
+
+
+async def _gc_build_part(conn, ruleset, task_id: int, task_article: str, latest_run: int,
+                         matched_inputs: list[dict]) -> dict | None:
+    dp = await conn.fetchrow(
+        "SELECT id, name, name_en, brand_oem, vehicle_classes, product_type, is_kit, weight_kg, "
+        "weight_source_url, weight_evidence, models_text, models_source_urls, models_evidence, "
+        "description, description_en, needs_review_reason FROM draft_parts WHERE run_id = $1", latest_run)
+    if dp is None:
+        return None
+    arts = await conn.fetch(
+        "SELECT article, confidence::text AS confidence, source_url, evidence, why_low_confidence, why_irrelevant "
+        "FROM draft_part_articles WHERE draft_part_id = $1 ORDER BY id", dp["id"])
+    latest_articles = {a["article"].upper() for a in arts}
+    confirmed = [a["article"] for a in arts if a["confidence"] == "confirmed" and 4 <= len(a["article"]) <= 20]
+    brands = set(dp["brand_oem"] or [])
+    formats = []
+    for a in confirmed:
+        v = ruleset.validate(a, brands)
+        formats.append({"article": a, "status": v.status, "expected_canonical": v.expected,
+                        "rule_name": v.rule_name, "ok": v.status == OK})
+    comps = await conn.fetch(
+        "SELECT component_key, article, name, name_en, quantity, description, description_en, source_url, evidence "
+        "FROM draft_kit_components WHERE draft_part_id = $1 ORDER BY id", dp["id"])
+    comp_out = []
+    for c in comps:
+        cm = await _gc_smart_match(conn, [c["article"].upper()]) if c["article"] else []
+        comp_out.append({**{k: c[k] for k in ("component_key", "article", "name", "name_en", "quantity",
+                                              "description", "description_en", "source_url", "evidence")},
+                         "smart_match": cm})
+    pofk = await conn.fetch(
+        "SELECT kit_article, kit_name, source_url, evidence FROM draft_part_of_kits WHERE draft_part_id = $1 ORDER BY id",
+        dp["id"])
+    prices = await conn.fetch(
+        "SELECT article, site, price, currency, url, in_stock, evidence FROM draft_prices WHERE run_id = $1 ORDER BY id",
+        latest_run)
+    # already_published — на уровне задачи (публикация могла быть со старого рана).
+    pub = await conn.fetchrow(
+        "SELECT p.smart_id, p.published_at FROM publications p JOIN task_runs r ON r.id = p.run_id "
+        "WHERE r.task_id = $1 ORDER BY p.id DESC LIMIT 1", task_id)
+    smart_match = await _gc_smart_match(conn, [a.upper() for a in confirmed])
+    return {
+        "task_article": task_article, "run_id": latest_run, "run_status": "done",
+        "matched_input_articles": [{**m, "in_latest_draft": m["article"] in latest_articles} for m in matched_inputs],
+        "already_published": ({"published": True, "smart_id": pub["smart_id"], "published_at": pub["published_at"]}
+                              if pub else {"published": False}),
+        "draft": {
+            "name": dp["name"], "name_en": dp["name_en"], "brand_oem": list(dp["brand_oem"] or []),
+            "vehicle_classes": list(dp["vehicle_classes"] or []), "class_count": len(dp["vehicle_classes"] or []),
+            "product_type": dp["product_type"], "is_kit": dp["is_kit"],
+            "weight_kg": float(dp["weight_kg"]) if dp["weight_kg"] is not None else None,
+            "weight_source_url": dp["weight_source_url"], "weight_evidence": dp["weight_evidence"],
+            "models_text": dp["models_text"], "models_source_urls": list(dp["models_source_urls"] or []),
+            "models_evidence": dp["models_evidence"], "description": dp["description"],
+            "description_en": dp["description_en"], "needs_review_reason": dp["needs_review_reason"],
+        },
+        "articles": [dict(a) for a in arts],
+        "confirmed_articles": confirmed,
+        "article_formats": formats,
+        "components": comp_out,
+        "part_of_kits": [dict(p) for p in pofk],
+        "prices": [dict(p) for p in prices],
+        "smart_match": smart_match,
+    }
+
+
+@function_tool
+async def get_context(wrapper: RunContextWrapper[CuratorRunContext],
+                      articles: list[str] | None = None, limit: int | None = None) -> str:
+    """Fetch the full publish-ready context for parts in one call (read-only).
+
+    Two mutually-exclusive modes:
+      * articles=[...] — resolve each article (matched against tasks.article AND any
+        draft number of any confidence, so cross-/superseded numbers also resolve).
+        One article may resolve to several parts (different tasks) — all are returned
+        and flagged `ambiguous`. Per task only the LATEST done run is returned.
+      * limit=N — no articles: take the head of the queue (first N done + unpublished
+        runs, oldest first) and return the same context. Use for "process first N".
+
+    Per part you get: the draft card (name/EN, brands, vehicle_classes, weight, models,
+    description/EN, ...), every draft number with confidence/source/evidence,
+    confirmed_articles (publish-eligible), article_formats (canonical-format verdict per
+    confirmed number — fix BEFORE save_to_smart rejects it), kit components (each with its
+    own smart_match), part_of_kits, draft prices, already_published (task-level), and
+    smart_match: existing smart.parts overlapping the FULL confirmed number set (with EN,
+    brands, current composition and already-recorded prices) so you don't create duplicates.
+
+    Articles with no research data go to no_research_data with a status and any smart record
+    that already exists for them. Above settings.curator_get_context_max_parts the result is
+    truncated with a `truncated` marker (never silently).
+
+    Args:
+        articles: part numbers to fetch context for (mutually exclusive with limit).
+        limit: take the first N unpublished done-runs from the queue head instead.
+    """
+    ctx = wrapper.context
+    max_parts = settings.curator_get_context_max_parts
+    log_id = await ctx.pool.fetchval(
+        "INSERT INTO agent_sql_log (session_id, sql_text) VALUES ($1, $2) RETURNING id",
+        ctx.session_id, f"-- get_context articles={articles!r} limit={limit!r}")
+    norm = _gc_norm(articles)
+    error: str | None = None
+    out: dict = {}
+    try:
+        async with ctx.pool.acquire() as conn:
+            ruleset = await load_ruleset(conn)
+
+            if not norm and limit is not None:
+                n = max(1, min(int(limit), max_parts))
+                rows = await conn.fetch(
+                    "SELECT r.id AS run_id, r.task_id, t.article FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+                    "WHERE r.status = 'done' AND NOT EXISTS (SELECT 1 FROM publications p WHERE p.run_id = r.id) "
+                    "ORDER BY r.id LIMIT $1", n)
+                parts = []
+                for row in rows:
+                    part = await _gc_build_part(conn, ruleset, row["task_id"], row["article"], row["run_id"], [])
+                    if part is not None:
+                        parts.append(part)
+                out = {"mode": "queue", "limit": n, "parts": parts, "no_research_data": []}
+            else:
+                draft_hits = await conn.fetch(
+                    "SELECT upper(a.article) AS input_article, t.id AS task_id, t.article AS task_article "
+                    "FROM draft_part_articles a JOIN draft_parts dp ON dp.id = a.draft_part_id "
+                    "JOIN task_runs r ON r.id = dp.run_id JOIN tasks t ON t.id = r.task_id "
+                    "WHERE upper(a.article) = ANY($1::text[])", norm)
+                task_hits = await conn.fetch(
+                    "SELECT id AS task_id, article AS task_article FROM tasks WHERE upper(article) = ANY($1::text[])", norm)
+
+                art_to_tasks: dict[str, set] = {}
+                task_article: dict[int, str] = {}
+                for r in draft_hits:
+                    art_to_tasks.setdefault(r["input_article"], set()).add(r["task_id"])
+                    task_article[r["task_id"]] = r["task_article"]
+                for r in task_hits:
+                    art_to_tasks.setdefault(r["task_article"].upper(), set()).add(r["task_id"])
+                    task_article[r["task_id"]] = r["task_article"]
+
+                ambiguous = {a for a, ts in art_to_tasks.items() if len(ts) > 1}
+                matched = set(art_to_tasks)
+                task_ids = sorted({tid for ts in art_to_tasks.values() for tid in ts})
+
+                parts, no_research, ready_tasks = [], [], []
+                for tid in task_ids:
+                    latest = await conn.fetchval(
+                        "SELECT id FROM task_runs WHERE task_id = $1 AND status = 'done' ORDER BY id DESC LIMIT 1", tid)
+                    if latest is None:
+                        last = await conn.fetchrow(
+                            "SELECT id, status::text AS status FROM task_runs WHERE task_id = $1 ORDER BY id DESC LIMIT 1", tid)
+                        sm = await _gc_smart_match(conn, [task_article[tid].upper()])
+                        no_research.append({"article": task_article[tid], "status": "no_done_run",
+                                            "detail": f"latest run {last['id']} status={last['status']}" if last else "no runs",
+                                            "smart": sm[0] if sm else None})
+                        continue
+                    ready_tasks.append((tid, latest))
+
+                truncated = None
+                if len(ready_tasks) > max_parts:
+                    truncated = {"returned": max_parts, "total": len(ready_tasks), "limit": max_parts}
+                    ready_tasks = ready_tasks[:max_parts]
+
+                for tid, latest in ready_tasks:
+                    inputs = [{"article": a, "ambiguous": a in ambiguous}
+                              for a in matched if tid in art_to_tasks.get(a, set())]
+                    part = await _gc_build_part(conn, ruleset, tid, task_article[tid], latest, inputs)
+                    if part is None:
+                        no_research.append({"article": task_article[tid], "status": "no_draft",
+                                            "detail": f"done run {latest} has no draft", "smart": None})
+                    else:
+                        parts.append(part)
+
+                for a in norm:
+                    if a not in matched:
+                        sm = await _gc_smart_match(conn, [a])
+                        no_research.append({"article": a, "status": "in_smart_only" if sm else "not_found",
+                                            "detail": "no research data" + ("" if sm else "; not in smart either"),
+                                            "smart": sm[0] if sm else None})
+
+                out = {"mode": "articles", "requested": norm, "parts": parts, "no_research_data": no_research}
+                if truncated:
+                    out["truncated"] = truncated
+    except Exception as e:  # noqa: BLE001 — ошибку показываем, не глотаем
+        error = f"{type(e).__name__}: {e}"
+        out = {"error": error}
+    await ctx.pool.execute(
+        "UPDATE agent_sql_log SET rows_affected=$2, error=$3, finished_at=now() WHERE id=$1",
+        log_id, len(out.get("parts", [])), error)
+    return json.dumps(out, ensure_ascii=False, default=str)
+
+
 # ── Exa без кэша ──────────────────────────────────────────────────────────────────
 @function_tool
 async def web_search_exa(wrapper: RunContextWrapper[CuratorRunContext], query: str, num_results: int = 10) -> str:

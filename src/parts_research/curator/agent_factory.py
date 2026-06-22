@@ -23,6 +23,7 @@ from agents.model_settings import ModelRetrySettings
 from ..config import settings
 from .tools import (
     execute_sql,
+    get_context,
     mark_needs_review,
     save_to_smart,
     web_fetch_exa,
@@ -58,5 +59,5 @@ def make_curator_agent(system_prompt: str) -> Agent:
         instructions=system_prompt,
         model=_model,
         model_settings=_retry,
-        tools=[execute_sql, save_to_smart, mark_needs_review, web_search_exa, web_fetch_exa],
+        tools=[get_context, execute_sql, save_to_smart, mark_needs_review, web_search_exa, web_fetch_exa],
     )

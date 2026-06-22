@@ -32,6 +32,9 @@ class Settings:
     # сбор бэклога правил) | 'hard' (критич.фейл на NO_RULE тоже). NOT_CANONICAL валит
     # ВСЕГДА в обоих режимах (доказанно грязная форма).
     format_validation_mode: str
+    # Потолок числа деталей, которые curator-тул get_context разворачивает за один вызов
+    # (защита от раздувания контекста). Превышение -> усечение с пометкой truncated.
+    curator_get_context_max_parts: int
 
 
 def load_settings() -> Settings:
@@ -46,6 +49,7 @@ def load_settings() -> Settings:
         worker_concurrency=int(os.environ.get("WORKER_CONCURRENCY", "30")),
         worker_stale_minutes=int(os.environ.get("WORKER_STALE_MINUTES", "30")),
         format_validation_mode=(os.environ.get("FORMAT_VALIDATION_MODE") or "soft").lower(),
+        curator_get_context_max_parts=int(os.environ.get("CURATOR_GET_CONTEXT_MAX_PARTS", "25")),
     )
 
 
