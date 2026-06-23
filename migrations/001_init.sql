@@ -45,7 +45,8 @@ CREATE TYPE task_run_status AS ENUM (
     'failed_no_data',
     'failed_validation',
     'failed_crashed',
-    'needs_human_review'
+    'needs_human_review',
+    'skipped_smart_approved'
 );
 
 CREATE TYPE article_confidence AS ENUM (

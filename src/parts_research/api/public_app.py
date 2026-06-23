@@ -104,7 +104,7 @@ async def post_research(body: ResearchBody) -> dict:
       needs_review_reason, worker_alive, timed_out.
 
     status: invalid | refused | queued | running | done | needs_human_review |
-            failed_no_data | failed_validation | failed_crashed.
+            failed_no_data | failed_validation | failed_crashed | skipped_smart_approved.
     Нет живого воркера на старте → не виснем, сразу отдаём queued + worker_alive=false.
     """
     pool = app.state.pool

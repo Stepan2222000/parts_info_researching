@@ -36,6 +36,9 @@ def format_snapshot(snap: dict) -> str:
     pending = snap["pending"]
     lines = ["<queue>"]
     lines.append("statuses: " + (", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "—"))
+    nr = counts.get("needs_human_review", 0)
+    if nr:
+        lines.append(f"needs_review: {nr} (припарковано — разбираем по твоей команде «разобрать»)")
     suffix = f" (показаны первые {PENDING_LIMIT})" if len(pending) == PENDING_LIMIT else ""
     lines.append(f"done без публикации: {len(pending)}{suffix}")
     for p in pending:

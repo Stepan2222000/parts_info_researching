@@ -23,6 +23,7 @@ TERMINAL_STATUSES = (
     "failed_no_data",
     "failed_validation",
     "failed_crashed",
+    "skipped_smart_approved",
 )
 
 

@@ -287,6 +287,7 @@ button { font-family: inherit; }
 .badge.running { color: var(--info); background: rgba(91, 155, 213, 0.14); }
 .badge.done { color: var(--success); background: rgba(93, 184, 114, 0.14); }
 .badge.needs_human_review { color: var(--warning); background: rgba(212, 160, 23, 0.14); }
+.badge.skipped_smart_approved { color: var(--slate-600); background: rgba(128, 128, 128, 0.12); }
 .badge.failed_no_data,
 .badge.failed_validation,
 .badge.failed_crashed { color: var(--error); background: rgba(191, 77, 67, 0.14); }
@@ -297,6 +298,7 @@ button { font-family: inherit; }
 .bdot.running { background: var(--info); }
 .bdot.done { background: var(--success); }
 .bdot.needs_human_review { background: var(--warning); }
+.bdot.skipped_smart_approved { background: var(--slate-600); }
 .bdot.pending { background: var(--accent-purple); }
 .bdot.failed_no_data, .bdot.failed_validation, .bdot.failed_crashed { background: var(--error); }
 

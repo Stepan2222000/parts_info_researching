@@ -71,6 +71,21 @@ async def _finish(pool: asyncpg.Pool, run_id: int, status: str, error: str | Non
     )
 
 
+async def _smart_already_approved(pool: asyncpg.Pool, article: str) -> str | None:
+    """Гейт: если артикул уже есть в smart.parts с is_unverified=false (состав сверён
+    человеком) или is_draft=false (запись финализирована) — research не нужен, задачу
+    закрываем. Возвращает причину (с matched smart_id) либо None. Регистронезависимо."""
+    row = await pool.fetchrow(
+        "SELECT id, is_draft, is_unverified FROM smart.parts "
+        "WHERE upper($1) = ANY(ARRAY(SELECT upper(x) FROM unnest(articles) x)) "
+        "AND (is_unverified = false OR is_draft = false) ORDER BY id LIMIT 1",
+        article,
+    )
+    if row is None:
+        return None
+    return f"smart_already_approved: {row['id']} (is_draft={row['is_draft']}, is_unverified={row['is_unverified']})"
+
+
 def _needs_review_reason(r: StructuredResult) -> str | None:
     reasons: list[str] = []
     if not r.vehicle_classes:
@@ -393,6 +408,12 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
     """Гонит run целиком. Возвращает финальный статус. Текст любой ошибки
     записан в task_runs.error и пробрасывается наверх (failed_crashed) либо
     отражён в статусе (failed_no_data/failed_validation)."""
+    # Гейт «smart уже утверждён»: закрываем до запуска research, без траты модели.
+    gate = await _smart_already_approved(pool, article)
+    if gate is not None:
+        await _finish(pool, run_id, "skipped_smart_approved", gate)
+        log(f"[skip] run {run_id} -> skipped_smart_approved ({gate})")
+        return "skipped_smart_approved"
     await _set_running(pool, run_id)
     try:
         context = await load_context(pool, article)

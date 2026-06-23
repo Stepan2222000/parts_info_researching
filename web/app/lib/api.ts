@@ -4,10 +4,10 @@
 export type RunStatus =
   | "queued" | "running" | "done"
   | "failed_no_data" | "failed_validation" | "failed_crashed"
-  | "needs_human_review";
+  | "needs_human_review" | "skipped_smart_approved";
 
 export const STATUS_ORDER: RunStatus[] = [
-  "queued", "running", "done", "needs_human_review",
+  "queued", "running", "done", "needs_human_review", "skipped_smart_approved",
   "failed_no_data", "failed_validation", "failed_crashed",
 ];
 
@@ -16,6 +16,7 @@ export const STATUS_LABEL: Record<string, string> = {
   running: "В работе",
   done: "Готово",
   needs_human_review: "Нужен человек",
+  skipped_smart_approved: "Smart утверждён",
   failed_no_data: "Нет данных",
   failed_validation: "Ошибка валидации",
   failed_crashed: "Сбой",
@@ -23,7 +24,8 @@ export const STATUS_LABEL: Record<string, string> = {
 
 // Терминальные статусы — на них доступен ретрай (повторный submit → новый run).
 export const TERMINAL_STATUSES: RunStatus[] = [
-  "done", "needs_human_review", "failed_no_data", "failed_validation", "failed_crashed",
+  "done", "needs_human_review", "skipped_smart_approved",
+  "failed_no_data", "failed_validation", "failed_crashed",
 ];
 export const isTerminal = (s: string): boolean => (TERMINAL_STATUSES as string[]).includes(s);
 
