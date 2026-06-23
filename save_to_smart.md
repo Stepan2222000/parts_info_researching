@@ -26,6 +26,7 @@
 Поля одного `part`:
 
 - `run_id` (обяз.) — id research-run'а, идёт в `publications`.
+- `also_run_ids` (опц.) — другие раны ТОЙ ЖЕ физической детали (дубли по другим номерам, сведённые в эту запись из `group` в `get_context`). На каждый пишется отдельная строка `publications` → этот же `smart_id`, чтобы они ушли из очереди. Раны разных деталей сюда класть нельзя.
 - `smart_id` (опц.) — id существующей `smart.parts`. **Есть → UPDATE.** Нет → INSERT.
 - `name`, `articles`, `vehicle_classes`, `weight_kg`, `model`, `description` — поля `smart.parts`. При INSERT обязательны `name` и непустой `vehicle_classes` (валидация тула). Остальные nullable.
 - `name_en`, `description_en` — английские версии (пишутся в `smart.parts_en`). Без `name_en` строка `parts_en` не создаётся (там `name NOT NULL`); `null` == не трогать (как и остальные поля).
