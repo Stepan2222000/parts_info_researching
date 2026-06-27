@@ -368,6 +368,34 @@ button { font-family: inherit; }
 .ev-link { font-size: 13px; color: var(--brand-coral); word-break: break-all; }
 .ev-link:hover { text-decoration: underline; text-underline-offset: 2px; }
 .ev-why { font-size: 13px; color: var(--warning); line-height: 1.45; }
+.ev-note { font-size: 13.5px; color: var(--accent-amber); line-height: 1.5; }
+.badge-current {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.3px;
+  color: var(--accent-teal); background: rgba(63, 158, 140, 0.14);
+  border-radius: var(--radius-pill); padding: 2px 9px;
+}
+
+/* ---------- Difference / nuances ---------- */
+.nuance {
+  border: 1px solid rgba(207, 138, 60, 0.32);
+  background: rgba(207, 138, 60, 0.08);
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+}
+.nuance .section-label { margin-bottom: 12px; }
+.nuance-chain { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-bottom: 10px; }
+.nuance-chain .lead { color: var(--text-faint); font-size: 13px; margin-right: 2px; }
+.chain-seg { display: inline-flex; align-items: center; gap: 7px; }
+.chain-chip {
+  font-family: var(--font-mono); font-size: 13px; color: var(--text-strong);
+  background: var(--hover-2); border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm); padding: 2px 8px;
+}
+.chain-chip.current { color: var(--accent-teal); border-color: rgba(63, 158, 140, 0.4); background: rgba(63, 158, 140, 0.12); }
+.chain-arrow { color: var(--text-faint); }
+.nuance-cav { display: flex; flex-direction: column; gap: 9px; }
+.nuance-cav .cav-text { font-size: 14.5px; color: var(--text); line-height: 1.5; }
+.nuance-cav .cav-ev { font-size: 12.5px; color: var(--text-faint); line-height: 1.45; margin-top: 2px; }
 
 pre.json {
   background: var(--code-bg); border: 1px solid var(--stroke); border-radius: var(--radius-md);

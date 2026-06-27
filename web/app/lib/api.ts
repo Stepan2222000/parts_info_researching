@@ -63,6 +63,12 @@ export interface SubmitResult {
   reused: boolean;
 }
 
+export interface CaveatNote {
+  text: string;
+  source_url: string;
+  evidence: string;
+}
+
 export interface ArticleRow {
   article: string;
   confidence: "confirmed" | "low_confidence" | "irrelevant";
@@ -70,6 +76,20 @@ export interface ArticleRow {
   evidence: string;
   why_low_confidence: string | null;
   why_irrelevant: string | null;
+  note: CaveatNote | null;
+}
+
+export interface PartCaveat {
+  caveat: string;
+  source_url: string;
+  evidence: string;
+}
+
+export interface SupersessionEdge {
+  newer: string;
+  older: string;
+  source_url: string;
+  evidence: string;
 }
 
 export interface ComponentRow {
@@ -110,6 +130,8 @@ export interface RunDetail {
     needs_review_reason: string | null;
   } | null;
   articles: ArticleRow[];
+  caveats: PartCaveat[];
+  supersession: SupersessionEdge[];
   components: ComponentRow[];
   part_of_kits: { kit_article: string | null; kit_name: string | null; source_url: string; evidence: string }[];
   publications: { id: number; smart_id: string; curator_session_id: number; published_at: string | null }[];

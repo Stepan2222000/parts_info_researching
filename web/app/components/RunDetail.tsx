@@ -20,13 +20,24 @@ function Field({ k, v, serif }: { k: string; v: React.ReactNode; serif?: boolean
   );
 }
 
-function Evidence({ rows }: { rows: ArticleRow[] }) {
+function Evidence({ rows, current }: { rows: ArticleRow[]; current?: string | null }) {
   return (
     <div className="ev-list">
       {rows.map((a, i) => (
         <div className="ev" key={i}>
-          <div className="ev-top"><span className="ev-art">{a.article}</span></div>
+          <div className="ev-top">
+            <span className="ev-art">{a.article}</span>
+            {current && a.article === current && <span className="badge-current">текущий</span>}
+          </div>
           <div className="ev-text">{a.evidence}</div>
+          {a.note && (
+            <div className="ev-note">
+              ⚠ Нюанс: {a.note.text}{" "}
+              {a.note.source_url && (
+                <a className="ev-link" href={a.note.source_url} target="_blank" rel="noreferrer">пруф ↗</a>
+              )}
+            </div>
+          )}
           {a.why_low_confidence && <div className="ev-why">⚠ {a.why_low_confidence}</div>}
           {a.why_irrelevant && <div className="ev-why">⚠ {a.why_irrelevant}</div>}
           {a.source_url && (
@@ -34,6 +45,84 @@ function Evidence({ rows }: { rows: ArticleRow[] }) {
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+type SupEdge = Detail["supersession"][number];
+
+// «Текущий» = номер, кого никто не заменял (вершина), если он единственный.
+function currentNumber(sup: SupEdge[]): string | null {
+  if (!sup.length) return null;
+  const olders = new Set(sup.map((s) => s.older));
+  const all = new Set(sup.flatMap((s) => [s.newer, s.older]));
+  const tops = [...all].filter((n) => !olders.has(n));
+  return tops.length === 1 ? tops[0] : null;
+}
+
+// Складываем пары в одну линию старый→новый; не получилось чисто (развилка/цикл) → null.
+function buildChain(sup: SupEdge[]): string[] | null {
+  if (!sup.length) return null;
+  const newerOf = new Map<string, string>();
+  const olderOf = new Map<string, string>();
+  const nodes = new Set<string>();
+  for (const s of sup) {
+    nodes.add(s.older);
+    nodes.add(s.newer);
+    if (newerOf.has(s.older) || olderOf.has(s.newer)) return null; // развилка
+    newerOf.set(s.older, s.newer);
+    olderOf.set(s.newer, s.older);
+  }
+  const oldest = [...nodes].filter((n) => !olderOf.has(n));
+  if (oldest.length !== 1) return null;
+  const chain: string[] = [];
+  const seen = new Set<string>();
+  let cur: string | undefined = oldest[0];
+  while (cur !== undefined) {
+    if (seen.has(cur)) return null; // цикл
+    seen.add(cur);
+    chain.push(cur);
+    cur = newerOf.get(cur);
+  }
+  return chain.length === nodes.size ? chain : null;
+}
+
+function Nuances({ d }: { d: Detail }) {
+  const sup = d.supersession ?? [];
+  const cav = d.caveats ?? [];
+  if (!sup.length && !cav.length) return null;
+  const chain = buildChain(sup);
+  return (
+    <div className="nuance">
+      <div className="section-label">Отличия и нюансы</div>
+      {sup.length > 0 && (
+        <div className="nuance-chain">
+          <span className="lead">порядок (старый → новый):</span>
+          {chain
+            ? chain.map((n, i) => (
+                <span key={n} className="chain-seg">
+                  {i > 0 && <span className="chain-arrow">→</span>}
+                  <span className={`chain-chip${i === chain.length - 1 ? " current" : ""}`}>{n}</span>
+                </span>
+              ))
+            : sup.map((s, i) => (
+                <span key={i} className="chain-chip">{s.newer} ← {s.older}</span>
+              ))}
+        </div>
+      )}
+      {cav.length > 0 && (
+        <div className="nuance-cav">
+          {cav.map((c, i) => (
+            <div key={i}>
+              <div className="cav-text">• {c.caveat}</div>
+              {c.evidence && <div className="cav-ev">{c.evidence}</div>}
+              {c.source_url && (
+                <a className="ev-link" href={c.source_url} target="_blank" rel="noreferrer">пруф ↗</a>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -135,11 +224,13 @@ export function RunDetail({ runId, onClose, onRetry }: {
                 </div>
               )}
 
+              <Nuances d={d} />
+
               {(["confirmed", "low_confidence", "irrelevant"] as const).map((c) =>
                 grouped(c).length ? (
                   <div key={c}>
                     <div className="section-label">{CONF_LABEL[c]} · {grouped(c).length}</div>
-                    <Evidence rows={grouped(c)} />
+                    <Evidence rows={grouped(c)} current={c === "confirmed" ? currentNumber(d.supersession ?? []) : null} />
                   </div>
                 ) : null
               )}
