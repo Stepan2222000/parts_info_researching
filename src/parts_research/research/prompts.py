@@ -33,7 +33,7 @@ def build_user_preamble(context: ResearchContext) -> str:
         "ФОРМАТ ОТВЕТА (ОБЯЗАТЕЛЬНО): верни РОВНО один JSON-объект строго по JSON Schema ниже. "
         "Имена полей — ТОЧНО: task_part_number, name, name_en, brand_oem, vehicle_classes, "
         "description, description_en, weight, models, is_kit, kit_contents, part_of_kits, numbers, "
-        "us_prices, part_caveats, supersession. НЕ придумывай свои поля (никаких input_article/"
+        "us_prices, nuances, supersession. НЕ придумывай свои поля (никаких input_article/"
         "oem_part_number/pricing/sources/replaces/applications). БЕЗ markdown-обёртки (никаких ```), "
         "без текста до/после — только JSON.\n\n"
         f"brand_oem — ТОЛЬКО из этого списка Smart-брендов (UPPER_SNAKE_CASE): {', '.join(context.allowed_brands)}\n"
@@ -183,9 +183,9 @@ SCHEMA_REMINDER = """\
   * Бери только товар В НАЛИЧИИ и только за оригинал (не aftermarket-аналог).
   * Нет валидной цены в источниках — us_prices=[] (дальше отработает отдельный ценовой поиск).
 - Пустые строки запрещены: если значения нет — ставь null / пустой массив, не "".
-- numbers.article[].note, part_caveats, supersession — заполняет ТОЛЬКО финальный
-  difference-turn (по своему сообщению). До него и когда нюансов нет: note=null,
-  part_caveats=[], supersession=[]. Не выдумывай их без источника.
+- nuances, supersession — заполняет ТОЛЬКО финальный difference-turn (по своему
+  сообщению). До него и когда нюансов нет: nuances=[], supersession=[].
+  Не выдумывай их без источника.
 """
 
 
@@ -365,18 +365,24 @@ def build_difference_user_message(article: str, raw_json: str, current_json: str
         "confirmed-кроссов уже собран — теперь по ним достаём НЮАНСЫ между номерами.\n\n"
         f"Свежий Exa-поиск (url/title/highlights):\n{raw_json}\n\n"
         f"Твой текущий JSON:\n{current_json}\n\n"
-        "ЗАПОЛНИ три вещи (каждая запись — с source_url и evidence-цитатой):\n"
-        "1) supersession — рёбра цепочки замен: {newer, older, source_url, evidence}, "
-        "порядок новое→старое (кто кого заменил).\n"
-        "2) part_caveats — границы/нюансы ВСЕЙ детали (например «wet-joint vs dry-joint — "
-        "не взаимозаменяемы», «E-coated только пресная вода»): {caveat, source_url, evidence}.\n"
-        "3) numbers.article[].note — нюанс по КОНКРЕТНОМУ номеру (например «Gen 2-внутренности», "
-        "«нужна дилерская перепрошивка»): {text, source_url, evidence}; нет нюанса — note=null.\n\n"
+        "ЗАПОЛНИ две вещи (каждая запись — с source_url и evidence-цитатой):\n"
+        "1) nuances — список отличий/нюансов: {text, articles, source_url, evidence}. "
+        "text — человеческим языком, ЧЕМ отличается/на что смотреть. articles — номера, "
+        "к которым нюанс относится: если он про КОНКРЕТНЫЕ номера (например «нужен отдельный "
+        "Smart-Lok install kit» — это про тот номер, чья страница это пишет) → перечисли их; "
+        "если про ВСЮ деталь (например «wet-joint и dry-joint не взаимозаменяемы», «E-coated — "
+        "только пресная вода») → articles=[]. Примеры text: «у новых металлические шайбы вместо "
+        "пластиковых», «Gen 2 — другие внутренние шестерни», «нужна дилерская перепрошивка».\n"
+        "2) supersession — рёбра порядка замен {newer, older, source_url, evidence}, новое→старое. "
+        f"ТОЛЬКО среди уже подтверждённых номеров детали (из numbers.article вокруг {article}). "
+        "НЕ вводи в порядок НОВЫЙ номер, которого нет в numbers.article (особенно из тюнинг-"
+        "магазинов вроде Weddle) — если видишь «возможно есть новее, номер X», напиши это как "
+        "nuance с articles=[], а в supersession его НЕ клади.\n\n"
         "ИСТОЧНИКИ (жёстко):\n"
-        "- AFTERMARKET ЗАПРЕЩЁН полностью — ни кросс, ни caveat, ни порядок, ни note. Грубо "
-        "распознавай aftermarket по бренду ДЕТАЛИ (Sierra, CDI, Barr, GLM, Osco, EMP, WSM, "
-        "Caltric, Dayco, Kimpex, Mallory) или само-пометке «aftermarket/replacement». Гейт по "
-        "бренду ДЕТАЛИ, не по магазину: genuine Mercury/Quicksilver/BRP/Yamaha с любого магазина — ок.\n"
+        "- AFTERMARKET ЗАПРЕЩЁН полностью — ни кросс, ни нюанс, ни порядок. Грубо распознавай "
+        "aftermarket по бренду ДЕТАЛИ (Sierra, CDI, Barr, GLM, Osco, EMP, WSM, Caltric, Dayco, "
+        "Kimpex, Mallory, Weddle) или само-пометке «aftermarket/replacement». Гейт по бренду "
+        "ДЕТАЛИ, не по магазину: genuine Mercury/Quicksilver/BRP/Yamaha с любого магазина — ок.\n"
         "- OEM/каталог/дилер — твёрдый пруф; форум — мягкий (в одиночку не двигает номер в irrelevant).\n"
         "- Нет пруфа из разрешённого источника — НЕ пиши нюанс (молча пропусти).\n\n"
         "РАСКЛАДКА НОМЕРОВ (правило «в numbers.article нет плохих номеров»):\n"

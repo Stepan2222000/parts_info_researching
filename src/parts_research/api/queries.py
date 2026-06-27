@@ -112,18 +112,18 @@ async def load_run_detail(pool: asyncpg.Pool, run_id: int) -> dict | None:
         articles: list[asyncpg.Record] = []
         components: list[asyncpg.Record] = []
         part_of_kits: list[asyncpg.Record] = []
-        caveats: list[asyncpg.Record] = []
+        nuances: list[asyncpg.Record] = []
         supersession: list[asyncpg.Record] = []
         if draft is not None:
             dpid = draft["id"]
             articles = await conn.fetch(
                 "SELECT article, confidence::text AS confidence, source_url, evidence, "
-                "why_low_confidence, why_irrelevant, note_text, note_source_url, note_evidence "
-                "FROM draft_part_articles WHERE draft_part_id = $1 ORDER BY id",
+                "why_low_confidence, why_irrelevant FROM draft_part_articles "
+                "WHERE draft_part_id = $1 ORDER BY id",
                 dpid,
             )
-            caveats = await conn.fetch(
-                "SELECT caveat, source_url, evidence FROM draft_part_caveats "
+            nuances = await conn.fetch(
+                "SELECT text, articles, source_url, evidence FROM draft_nuances "
                 "WHERE draft_part_id = $1 ORDER BY id",
                 dpid,
             )
@@ -174,21 +174,17 @@ async def load_run_detail(pool: asyncpg.Pool, run_id: int) -> dict | None:
                 "evidence": a["evidence"],
                 "why_low_confidence": a["why_low_confidence"],
                 "why_irrelevant": a["why_irrelevant"],
-                "note": (
-                    {
-                        "text": a["note_text"],
-                        "source_url": a["note_source_url"],
-                        "evidence": a["note_evidence"],
-                    }
-                    if a["note_text"]
-                    else None
-                ),
             }
             for a in articles
         ],
-        "caveats": [
-            {"caveat": c["caveat"], "source_url": c["source_url"], "evidence": c["evidence"]}
-            for c in caveats
+        "nuances": [
+            {
+                "text": n["text"],
+                "articles": list(n["articles"]) if n["articles"] is not None else [],
+                "source_url": n["source_url"],
+                "evidence": n["evidence"],
+            }
+            for n in nuances
         ],
         "supersession": [
             {"newer": s["newer"], "older": s["older"], "source_url": s["source_url"], "evidence": s["evidence"]}

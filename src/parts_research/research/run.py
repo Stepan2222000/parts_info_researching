@@ -308,6 +308,13 @@ async def _difference_turn(
     picked = json.dumps(pick_search(raw), ensure_ascii=False)
     msg = build_difference_user_message(article, picked, current.model_dump_json(indent=2))
     result = await run_streamed_and_persist(agent, msg, session, pool, run_id, turn, preamble=preamble)
+    # Порядок замен — ТОЛЬКО среди подтверждённых номеров: режем рёбра, у которых
+    # любой конец вне numbers.article (так из порядка выпадают сомнительные выкопанные
+    # номера, напр. SKU тюнинг-магазинов вроде Weddle).
+    confirmed_set = {a.article for a in result.numbers.article}
+    result.supersession = [
+        e for e in result.supersession if e.newer in confirmed_set and e.older in confirmed_set
+    ]
     await _write_result(pool, run_id, result)
     post_validate(
         result,
@@ -315,9 +322,7 @@ async def _difference_turn(
         allowed_brands=context.allowed_brands,
         allowed_vehicle_classes=context.allowed_vehicle_classes,
     )
-    log(f"[difference] supersession={len(result.supersession)} "
-        f"part_caveats={len(result.part_caveats)} "
-        f"notes={sum(1 for a in result.numbers.article if a.note)}")
+    log(f"[difference] nuances={len(result.nuances)} supersession={len(result.supersession)}")
     return result
 
 
@@ -353,26 +358,20 @@ async def _parse_to_draft(
 
             article_rows = []
             for a in r.numbers.article:
-                note = (a.note.text, a.note.source_url, a.note.evidence) if a.note else (None, None, None)
-                article_rows.append(
-                    (draft_part_id, a.article, "confirmed", a.source_url, a.evidence, None, None, *note)
-                )
+                article_rows.append((draft_part_id, a.article, "confirmed", a.source_url, a.evidence, None, None))
             for a in r.numbers.article_low_confidence:
                 article_rows.append(
-                    (draft_part_id, a.article, "low_confidence", a.source_url, a.evidence,
-                     a.why_low_confidence, None, None, None, None)
+                    (draft_part_id, a.article, "low_confidence", a.source_url, a.evidence, a.why_low_confidence, None)
                 )
             for a in r.numbers.irrelevant:
                 article_rows.append(
-                    (draft_part_id, a.article, "irrelevant", a.source_url, a.evidence,
-                     None, a.why_irrelevant, None, None, None)
+                    (draft_part_id, a.article, "irrelevant", a.source_url, a.evidence, None, a.why_irrelevant)
                 )
             if article_rows:
                 await conn.executemany(
                     "INSERT INTO draft_part_articles "
-                    "(draft_part_id, article, confidence, source_url, evidence, why_low_confidence, why_irrelevant, "
-                    " note_text, note_source_url, note_evidence) "
-                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                    "(draft_part_id, article, confidence, source_url, evidence, why_low_confidence, why_irrelevant) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                     article_rows,
                 )
 
@@ -424,15 +423,15 @@ async def _parse_to_draft(
                     price_rows,
                 )
 
-            # difference-turn: границы детали и цепочка замен (с пруфом).
-            caveat_rows = [
-                (draft_part_id, c.caveat, c.source_url, c.evidence) for c in r.part_caveats
+            # difference-turn: нюансы (опц. привязка к номерам) и цепочка замен.
+            nuance_rows = [
+                (draft_part_id, n.text, list(n.articles), n.source_url, n.evidence) for n in r.nuances
             ]
-            if caveat_rows:
+            if nuance_rows:
                 await conn.executemany(
-                    "INSERT INTO draft_part_caveats (draft_part_id, caveat, source_url, evidence) "
-                    "VALUES ($1,$2,$3,$4)",
-                    caveat_rows,
+                    "INSERT INTO draft_nuances (draft_part_id, text, articles, source_url, evidence) "
+                    "VALUES ($1,$2,$3,$4,$5)",
+                    nuance_rows,
                 )
 
             supersession_rows = [

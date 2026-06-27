@@ -396,6 +396,9 @@ button { font-family: inherit; }
 .nuance-cav { display: flex; flex-direction: column; gap: 9px; }
 .nuance-cav .cav-text { font-size: 14.5px; color: var(--text); line-height: 1.5; }
 .nuance-cav .cav-ev { font-size: 12.5px; color: var(--text-faint); line-height: 1.45; margin-top: 2px; }
+.nuance-cav .cav-for { color: var(--accent-teal); font-size: 13.5px; }
+.nuance-groups { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.sup-group { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
 
 pre.json {
   background: var(--code-bg); border: 1px solid var(--stroke); border-radius: var(--radius-md);

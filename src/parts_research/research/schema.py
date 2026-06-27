@@ -43,20 +43,10 @@ class ModelsBlock(BaseModel):
         return self
 
 
-class CaveatNote(BaseModel):
-    """Пер-артикульная заметка-нюанс (Gen2-внутренности, needs-reflash, …).
-    Заполняется финальным difference-turn'ом ТОЛЬКО из genuine-OEM/дилер/форум-
-    источника (aftermarket запрещён). null, если по номеру нюансов нет."""
-    text: NonEmptyStr
-    source_url: NonEmptyStr
-    evidence: NonEmptyStr
-
-
 class ArticleItem(BaseModel):
     article: NonEmptyStr
     source_url: NonEmptyStr
     evidence: NonEmptyStr
-    note: CaveatNote | None  # нюанс по этому конкретному номеру; null = нет
 
 
 class LowConfidenceItem(BaseModel):
@@ -79,17 +69,19 @@ class NumbersBlock(BaseModel):
     irrelevant: list[IrrelevantItem]
 
 
-class PartCaveat(BaseModel):
-    """Граница/нюанс ВСЕЙ детали (wet-joint vs dry-joint, freshwater-only, …) —
-    то, что покупателю надо учесть при подборе. С source_url+evidence,
-    только из genuine-OEM/дилер/форум-источника."""
-    caveat: NonEmptyStr
+class Nuance(BaseModel):
+    """Один нюанс/отличие между номерами одной детали. articles — номера, к которым
+    он относится (ПУСТО = ко всей детали целиком). С source_url+evidence, только из
+    genuine-OEM/дилер/форум-источника (aftermarket запрещён)."""
+    text: NonEmptyStr
+    articles: list[NonEmptyStr]  # [] = вся деталь; иначе — конкретные номера
     source_url: NonEmptyStr
     evidence: NonEmptyStr
 
 
 class SupersessionEdge(BaseModel):
-    """Ребро цепочки замен: newer заменяет older (порядок новое→старое), с пруфом."""
+    """Ребро цепочки замен: newer заменяет older (порядок новое→старое), с пруфом.
+    Только среди ПОДТВЕРЖДЁННЫХ номеров детали (новые выкопанные в порядок не идут)."""
     newer: NonEmptyStr
     older: NonEmptyStr
     source_url: NonEmptyStr
@@ -141,5 +133,5 @@ class StructuredResult(BaseModel):
     part_of_kits: list[PartOfKit]
     numbers: NumbersBlock
     us_prices: list[PriceOffer]  # US-цены за оригинал; [] = не найдено в turn-1 -> фолбэк
-    part_caveats: list[PartCaveat]      # границы/нюансы всей детали; заполняет difference-turn
-    supersession: list[SupersessionEdge]  # порядок замен новое→старое с пруфом; difference-turn
+    nuances: list[Nuance]                 # отличия/нюансы (опц. привязка к номерам); difference-turn
+    supersession: list[SupersessionEdge]  # порядок замен новое→старое; только confirmed-номера

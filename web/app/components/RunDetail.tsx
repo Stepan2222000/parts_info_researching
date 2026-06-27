@@ -30,14 +30,6 @@ function Evidence({ rows, current }: { rows: ArticleRow[]; current?: string | nu
             {current && a.article === current && <span className="badge-current">текущий</span>}
           </div>
           <div className="ev-text">{a.evidence}</div>
-          {a.note && (
-            <div className="ev-note">
-              ⚠ Нюанс: {a.note.text}{" "}
-              {a.note.source_url && (
-                <a className="ev-link" href={a.note.source_url} target="_blank" rel="noreferrer">пруф ↗</a>
-              )}
-            </div>
-          )}
           {a.why_low_confidence && <div className="ev-why">⚠ {a.why_low_confidence}</div>}
           {a.why_irrelevant && <div className="ev-why">⚠ {a.why_irrelevant}</div>}
           {a.source_url && (
@@ -87,37 +79,60 @@ function buildChain(sup: SupEdge[]): string[] | null {
   return chain.length === nodes.size ? chain : null;
 }
 
+// Развилка (порядок не одна линия) → группируем по новому: «<новый> заменяет <старые>».
+function groupByNewer(sup: SupEdge[]): { newer: string; olders: string[] }[] {
+  const m = new Map<string, string[]>();
+  for (const s of sup) {
+    const arr = m.get(s.newer) ?? [];
+    if (!arr.includes(s.older)) arr.push(s.older);
+    m.set(s.newer, arr);
+  }
+  return [...m.entries()].map(([newer, olders]) => ({ newer, olders }));
+}
+
 function Nuances({ d }: { d: Detail }) {
   const sup = d.supersession ?? [];
-  const cav = d.caveats ?? [];
-  if (!sup.length && !cav.length) return null;
+  const nu = d.nuances ?? [];
+  if (!sup.length && !nu.length) return null;
   const chain = buildChain(sup);
   return (
     <div className="nuance">
       <div className="section-label">Отличия и нюансы</div>
-      {sup.length > 0 && (
-        <div className="nuance-chain">
-          <span className="lead">порядок (старый → новый):</span>
-          {chain
-            ? chain.map((n, i) => (
-                <span key={n} className="chain-seg">
-                  {i > 0 && <span className="chain-arrow">→</span>}
-                  <span className={`chain-chip${i === chain.length - 1 ? " current" : ""}`}>{n}</span>
-                </span>
-              ))
-            : sup.map((s, i) => (
-                <span key={i} className="chain-chip">{s.newer} ← {s.older}</span>
-              ))}
-        </div>
-      )}
-      {cav.length > 0 && (
+      {sup.length > 0 &&
+        (chain ? (
+          <div className="nuance-chain">
+            <span className="lead">порядок (старый → новый):</span>
+            {chain.map((n, i) => (
+              <span key={n} className="chain-seg">
+                {i > 0 && <span className="chain-arrow">→</span>}
+                <span className={`chain-chip${i === chain.length - 1 ? " current" : ""}`}>{n}</span>
+              </span>
+            ))}
+          </div>
+        ) : (
+          <div className="nuance-groups">
+            {groupByNewer(sup).map((g) => (
+              <div key={g.newer} className="sup-group">
+                <span className="chain-chip current">{g.newer}</span>
+                <span className="chain-arrow">заменяет</span>
+                {g.olders.map((o) => (
+                  <span key={o} className="chain-chip">{o}</span>
+                ))}
+              </div>
+            ))}
+          </div>
+        ))}
+      {nu.length > 0 && (
         <div className="nuance-cav">
-          {cav.map((c, i) => (
+          {nu.map((n, i) => (
             <div key={i}>
-              <div className="cav-text">• {c.caveat}</div>
-              {c.evidence && <div className="cav-ev">{c.evidence}</div>}
-              {c.source_url && (
-                <a className="ev-link" href={c.source_url} target="_blank" rel="noreferrer">пруф ↗</a>
+              <div className="cav-text">
+                • {n.text}
+                {n.articles.length > 0 && <span className="cav-for"> — касается: {n.articles.join(", ")}</span>}
+              </div>
+              {n.evidence && <div className="cav-ev">{n.evidence}</div>}
+              {n.source_url && (
+                <a className="ev-link" href={n.source_url} target="_blank" rel="noreferrer">пруф ↗</a>
               )}
             </div>
           ))}
