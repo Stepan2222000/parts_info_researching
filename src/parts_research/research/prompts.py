@@ -220,6 +220,31 @@ def format_smart_hint(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_ebay_hint(listings: list[dict[str, Any]]) -> str:
+    """Валидные eBay-объявления по детали для system-prompt (подсказка, не истина).
+
+    Это рыночные US/EN-объявления, прошедшие нашу валидацию соответствия детали.
+    Данные продавцов часто врут (ложный OEM, путаница бренда/совместимости) —
+    подаём строго как наводку, не как доказательство."""
+    lines = [
+        "--- СПРАВОЧНАЯ подсказка: валидные eBay-объявления по этой детали — ЭТО НЕ ДОКАЗАТЕЛЬСТВО ---",
+        "Это рыночные объявления (US/EN), прошедшие нашу валидацию соответствия детали.",
+        "ВНИМАНИЕ: данные продавцов часто НЕВЕРНЫ (ложный OEM, путаница бренда/совместимости,",
+        "маркетинг). Используй ТОЛЬКО как наводку (бренд, OEM-номера, назначение, состав) и",
+        "подтверждай каждое поле независимым Exa-источником. Ничего отсюда не копируй в результат",
+        "вслепую: номер из объявления без подтверждения источником — максимум article_low_confidence.",
+        f"объявлений: {len(listings)}",
+    ]
+    for lst in listings:
+        lines.append(f"• eBay item {lst['item_id']}: {lst['title']}")
+        for spec in lst["specifics"]:
+            lines.append(f"    {spec['name']}: {spec['value']}")
+        if lst["description"]:
+            lines.append(f"    описание: {lst['description']}")
+    lines.append("--- Конец eBay-подсказки (подсказка ≠ доказательство, всё проверяй по источникам) ---")
+    return "\n".join(lines)
+
+
 def build_system_prompt(context: ResearchContext) -> str:
     rules = RULES_PATH.read_text(encoding="utf-8")
     aliases = "\n".join(
@@ -228,6 +253,10 @@ def build_system_prompt(context: ResearchContext) -> str:
     smart_hint = ""
     if context.smart_payload is not None:
         smart_hint = "\n" + format_smart_hint(context.smart_payload) + "\n"
+
+    ebay_hint = ""
+    if context.ebay_listings:
+        ebay_hint = "\n" + format_ebay_hint(context.ebay_listings) + "\n"
 
     classes = "\n".join(
         f"  {vc.slug} — {vc.title_ru}" for vc in context.vehicle_classes
@@ -247,7 +276,7 @@ def build_system_prompt(context: ResearchContext) -> str:
 
 Алиасы OEM-брендов → Smart-бренд (нормализуй найденные бренды к правой части):
 {aliases}
-{smart_hint}
+{smart_hint}{ebay_hint}
 --- Правила работы (research_rules.md) ---
 {rules}
 --- Конец правил ---

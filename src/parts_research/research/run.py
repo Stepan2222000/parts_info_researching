@@ -22,7 +22,7 @@ from ..config import settings
 from ..db.pool import strip_nul
 from ..db.session import PostgresSession
 from .agent_factory import make_research_agent
-from .context import SMART_PLUGIN_NAME, load_context
+from .context import EBAY_PLUGIN_NAME, SMART_PLUGIN_NAME, load_context
 from .errors import NoExactDataError
 from .exa_client import cached_exa_call, pick_fetch, pick_search
 from .prompts import (
@@ -509,6 +509,13 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
             await pool.execute(
                 "INSERT INTO plugin_payloads (run_id, plugin_name, payload) VALUES ($1,$2,$3)",
                 run_id, SMART_PLUGIN_NAME, context.smart_payload,
+            )
+        # Аудит: что за eBay-подсказку увидела модель (для разбора «почему сказал X»).
+        if context.ebay_listings:
+            await pool.execute(
+                "INSERT INTO plugin_payloads (run_id, plugin_name, payload) VALUES ($1,$2,$3)",
+                run_id, EBAY_PLUGIN_NAME,
+                {"smart_id": context.smart_payload["id"], "listings": context.ebay_listings},
             )
 
         session = PostgresSession(f"research_run_{run_id}", pool)
