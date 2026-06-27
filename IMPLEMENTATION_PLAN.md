@@ -236,7 +236,7 @@
 После того как `worker` и `curator` REPL работают локально на нескольких реальных артикулах, поднимаем prod-деплой по шаблону `DEPLOY_TEMPLATE.md`:
 
 - GHA workflow собирает Docker-образ через Docker Build Cloud, пушит в ghcr.io.
-- SSH-деплой на `194.164.245.107`: `docker compose pull && docker compose up -d`.
+- SSH-деплой на `2.27.20.221`: `docker compose pull && docker compose up -d`.
 - `parts_research_worker` и `parts_research_curator` поднимаются в `db_default` Docker-сети рядом с Postgres-контейнерами.
 - Никаких volume'ов не нужно (диск не используется).
 - env-переменные кладутся через `.env` в директорию деплоя.

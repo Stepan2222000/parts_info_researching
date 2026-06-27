@@ -1,4 +1,4 @@
--- brands_mapping DB (194.164.245.107:5411) — расширение под формат-валидацию артикулов
+-- brands_mapping DB (2.27.20.221:5411) — расширение под формат-валидацию артикулов
 -- для parts_research (research/curator). ОБЩАЯ БД: её также читают ebay_orders/matching.py
 -- (ungated finditer по титулам) и ebay_validation_item/evi (gated по бренду эталона).
 --

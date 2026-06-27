@@ -76,7 +76,7 @@
 
 ### `brands_mapping`
 
-`brands_mapping` — отдельная база на хосте `194.164.245.107:5411`, db `brands_mapping`. Это reusable справочник, который будет использоваться и в других проектах.
+`brands_mapping` — отдельная база на хосте `2.27.20.221:5411`, db `brands_mapping`. Это reusable справочник, который будет использоваться и в других проектах.
 
 В ней лежит таблица `brand_aliases(alias TEXT PRIMARY KEY, canonical TEXT NOT NULL)`. Значения `canonical` всегда соответствуют названиям из Smart `brands.name`.
 
@@ -188,7 +188,7 @@ End-to-end Python.
 
 Используется OpenAI-совместимый Chat Completions эндпоинт:
 
-- Base URL: `http://194.164.245.107:8317/v1`
+- Base URL: `http://2.27.20.221:8317/v1`
 - API key: `cliproxy-e2602729e9e53a01885c91350fb852f735ce` (Bearer-токен)
 - Модель research-агента: `cursor-gpt55(high)` (gpt-5.5 с high reasoning)
 - Модель куратора: `cursor-gpt55(high)`
@@ -603,7 +603,7 @@ UI должен показывать:
 
 ## Deploy
 
-Деплой идет по тому же шаблону, что описан в `DEPLOY_TEMPLATE.md`: GHA + Docker Build Cloud + ghcr.io + SSH на `194.164.245.107`. Все три Postgres-контейнера (`parts_research`, `smart_test`, `brands_mapping`) уже подняты на сервере, висят в Docker-сети `db_default`. Новый Postgres поднимать не надо.
+Деплой идет по тому же шаблону, что описан в `DEPLOY_TEMPLATE.md`: GHA + Docker Build Cloud + ghcr.io + SSH на `2.27.20.221`. Все три Postgres-контейнера (`parts_research`, `smart_test`, `brands_mapping`) уже подняты на сервере, висят в Docker-сети `db_default`. Новый Postgres поднимать не надо.
 
 Поднимаем только наши процессы:
 
@@ -630,7 +630,7 @@ SQL tool куратора технически не ограничен по ти
 
 - `parts_research` — основная рабочая база ресерча. Сбрасываем и пересоздаём с новой DDL под Python-реализацию.
 - `smart_test` — база чистых Smart-результатов (используем именно эту, не prod Smart).
-- `brands_mapping` — отдельная reusable база на `194.164.245.107:5411`.
+- `brands_mapping` — отдельная reusable база на `2.27.20.221:5411`.
 - Smart и brand_mapping доступны из `parts_research` через `postgres_fdw`.
 - **Никаких файлов на диске**: финальный JSON в `task_runs.result_json`, stream — в `agent_stream_events`, история — в `agent_history`.
 - Raw Exa-ответы хранятся только в БД-кэше.
@@ -651,7 +651,7 @@ SQL tool куратора технически не ограничен по ти
 - **`kit_contents` — массив объектов** без поля `key`. `article: string | null`. `component_key` для `draft_kit_components` генерирует backend при парсинге.
 - **Substring-check** в backend-Exa фазы 1 — без OEM-нормализации (дефисы/префиксы передаются как пришли). Артикулы, по которым Exa нормализует дефисы иначе, могут попадать в `failed_no_data` — известное поведение.
 - **В фазе 2 backend substring-check не делает** — релевантность контролирует модель через инструкцию в промпте «используй только источники, где явно встречается артикул задачи».
-- **LLM-эндпоинт** OpenAI-совместимый: `http://194.164.245.107:8317/v1`, ключ `cliproxy-e2602729e9e53a01885c91350fb852f735ce`, модель `cursor-gpt55(high)` для обоих агентов. Параметры через env.
+- **LLM-эндпоинт** OpenAI-совместимый: `http://2.27.20.221:8317/v1`, ключ `cliproxy-e2602729e9e53a01885c91350fb852f735ce`, модель `cursor-gpt55(high)` для обоих агентов. Параметры через env.
 - **Только один curator** на всю систему. Реализован на Agents SDK; тулы курсора — `@function_tool` в коде того же процесса. У курсора **нет фаз** — он сразу видит тулы.
 - На этапе 3 общение с куратором — CLI REPL в `parts_research_curator`. На этапе 4 — веб-чат: Next.js + Vercel AI SDK v6 → наш FastAPI-эндпоинт `POST /curator/message` → `Runner.run_streamed` курсор-агента. MCP-сервера ни у курсора, ни у research-агента нет.
 - Curator запускается только когда пользователь пишет ему в чат «обработай».
