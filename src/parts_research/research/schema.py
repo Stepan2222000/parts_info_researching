@@ -43,10 +43,20 @@ class ModelsBlock(BaseModel):
         return self
 
 
+class CaveatNote(BaseModel):
+    """Пер-артикульная заметка-нюанс (Gen2-внутренности, needs-reflash, …).
+    Заполняется финальным difference-turn'ом ТОЛЬКО из genuine-OEM/дилер/форум-
+    источника (aftermarket запрещён). null, если по номеру нюансов нет."""
+    text: NonEmptyStr
+    source_url: NonEmptyStr
+    evidence: NonEmptyStr
+
+
 class ArticleItem(BaseModel):
     article: NonEmptyStr
     source_url: NonEmptyStr
     evidence: NonEmptyStr
+    note: CaveatNote | None  # нюанс по этому конкретному номеру; null = нет
 
 
 class LowConfidenceItem(BaseModel):
@@ -67,6 +77,23 @@ class NumbersBlock(BaseModel):
     article: list[ArticleItem]
     article_low_confidence: list[LowConfidenceItem]
     irrelevant: list[IrrelevantItem]
+
+
+class PartCaveat(BaseModel):
+    """Граница/нюанс ВСЕЙ детали (wet-joint vs dry-joint, freshwater-only, …) —
+    то, что покупателю надо учесть при подборе. С source_url+evidence,
+    только из genuine-OEM/дилер/форум-источника."""
+    caveat: NonEmptyStr
+    source_url: NonEmptyStr
+    evidence: NonEmptyStr
+
+
+class SupersessionEdge(BaseModel):
+    """Ребро цепочки замен: newer заменяет older (порядок новое→старое), с пруфом."""
+    newer: NonEmptyStr
+    older: NonEmptyStr
+    source_url: NonEmptyStr
+    evidence: NonEmptyStr
 
 
 class KitComponent(BaseModel):
@@ -114,3 +141,5 @@ class StructuredResult(BaseModel):
     part_of_kits: list[PartOfKit]
     numbers: NumbersBlock
     us_prices: list[PriceOffer]  # US-цены за оригинал; [] = не найдено в turn-1 -> фолбэк
+    part_caveats: list[PartCaveat]      # границы/нюансы всей детали; заполняет difference-turn
+    supersession: list[SupersessionEdge]  # порядок замен новое→старое с пруфом; difference-turn

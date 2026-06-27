@@ -33,8 +33,9 @@ def build_user_preamble(context: ResearchContext) -> str:
         "ФОРМАТ ОТВЕТА (ОБЯЗАТЕЛЬНО): верни РОВНО один JSON-объект строго по JSON Schema ниже. "
         "Имена полей — ТОЧНО: task_part_number, name, name_en, brand_oem, vehicle_classes, "
         "description, description_en, weight, models, is_kit, kit_contents, part_of_kits, numbers, "
-        "us_prices. НЕ придумывай свои поля (никаких input_article/oem_part_number/pricing/sources/"
-        "replaces/applications). БЕЗ markdown-обёртки (никаких ```), без текста до/после — только JSON.\n\n"
+        "us_prices, part_caveats, supersession. НЕ придумывай свои поля (никаких input_article/"
+        "oem_part_number/pricing/sources/replaces/applications). БЕЗ markdown-обёртки (никаких ```), "
+        "без текста до/после — только JSON.\n\n"
         f"brand_oem — ТОЛЬКО из этого списка Smart-брендов (UPPER_SNAKE_CASE): {', '.join(context.allowed_brands)}\n"
         f"Нормализуй найденные бренды по алиасам (левое -> правое), не пиши display-имена:\n{aliases}\n\n"
         f"vehicle_classes — ТОЛЬКО слаги из списка (можно несколько; [] если не определил):\n{classes}\n\n"
@@ -119,6 +120,26 @@ def build_kit_contents_query(article: str, articles: list[str]) -> str:
     )
 
 
+def build_difference_query(numbers: list[str]) -> str:
+    # Финальный difference-turn: на ПОДТВЕРЖДЁННЫХ кроссах одной детали ищем нюансы
+    # (порядок замен, что менялось, границы фита). Упор на genuine/OEM/дилер/форум,
+    # aftermarket просим игнорить (он всё равно бан в правилах turn'а).
+    nums = ", ".join(numbers)
+    return (
+        "Genuine OEM / factory parts-catalog supersession notes, manufacturer service "
+        "bulletins, and dealer or owner-forum threads about these related OEM part "
+        f"numbers for one and the same part: {nums} — plus any newer or older related "
+        "OEM numbers not in this list. Focus on genuine factory/OEM parts and OEM "
+        "supersession; ignore aftermarket replacement brands and aftermarket "
+        "cross-reference listings (such as Sierra, CDI, Dayco, WSM, Caltric). Explain "
+        "which OEM number superseded which and the chronological order from newest to "
+        "oldest, what was redesigned or changed in the part at each step (material, "
+        "shape, mounting, dimensions, internal parts), what to watch out for when using "
+        "an older versus a newer version, and which model years or production period "
+        "each number covers."
+    )
+
+
 # ── системный промпт ───────────────────────────────────────────────────────────
 SCHEMA_REMINDER = """\
 Формат ответа — РОВНО один JSON-объект по схеме, без markdown-обёртки и комментариев.
@@ -162,6 +183,9 @@ SCHEMA_REMINDER = """\
   * Бери только товар В НАЛИЧИИ и только за оригинал (не aftermarket-аналог).
   * Нет валидной цены в источниках — us_prices=[] (дальше отработает отдельный ценовой поиск).
 - Пустые строки запрещены: если значения нет — ставь null / пустой массив, не "".
+- numbers.article[].note, part_caveats, supersession — заполняет ТОЛЬКО финальный
+  difference-turn (по своему сообщению). До него и когда нюансов нет: note=null,
+  part_caveats=[], supersession=[]. Не выдумывай их без источника.
 """
 
 
@@ -303,4 +327,36 @@ def build_phase2_user_message(article: str, current_json: str, limit: int) -> st
         f"Используй ТОЛЬКО источники, где явно встречается артикул задачи {article}. "
         "Если есть пустые или сомнительные поля — попробуй их закрыть через поиск. "
         "Когда удовлетворён результатом — ответь РОВНО валидным JSON по схеме, без вызова тулов."
+    )
+
+
+def build_difference_user_message(article: str, raw_json: str, current_json: str) -> str:
+    return (
+        f"ФИНАЛЬНЫЙ difference-turn по детали с входным артикулом {article}. Набор "
+        "confirmed-кроссов уже собран — теперь по ним достаём НЮАНСЫ между номерами.\n\n"
+        f"Свежий Exa-поиск (url/title/highlights):\n{raw_json}\n\n"
+        f"Твой текущий JSON:\n{current_json}\n\n"
+        "ЗАПОЛНИ три вещи (каждая запись — с source_url и evidence-цитатой):\n"
+        "1) supersession — рёбра цепочки замен: {newer, older, source_url, evidence}, "
+        "порядок новое→старое (кто кого заменил).\n"
+        "2) part_caveats — границы/нюансы ВСЕЙ детали (например «wet-joint vs dry-joint — "
+        "не взаимозаменяемы», «E-coated только пресная вода»): {caveat, source_url, evidence}.\n"
+        "3) numbers.article[].note — нюанс по КОНКРЕТНОМУ номеру (например «Gen 2-внутренности», "
+        "«нужна дилерская перепрошивка»): {text, source_url, evidence}; нет нюанса — note=null.\n\n"
+        "ИСТОЧНИКИ (жёстко):\n"
+        "- AFTERMARKET ЗАПРЕЩЁН полностью — ни кросс, ни caveat, ни порядок, ни note. Грубо "
+        "распознавай aftermarket по бренду ДЕТАЛИ (Sierra, CDI, Barr, GLM, Osco, EMP, WSM, "
+        "Caltric, Dayco, Kimpex, Mallory) или само-пометке «aftermarket/replacement». Гейт по "
+        "бренду ДЕТАЛИ, не по магазину: genuine Mercury/Quicksilver/BRP/Yamaha с любого магазина — ок.\n"
+        "- OEM/каталог/дилер — твёрдый пруф; форум — мягкий (в одиночку не двигает номер в irrelevant).\n"
+        "- Нет пруфа из разрешённого источника — НЕ пиши нюанс (молча пропусти).\n\n"
+        "РАСКЛАДКА НОМЕРОВ (правило «в numbers.article нет плохих номеров»):\n"
+        f"- ЯКОРЬ: входной артикул {article} ВСЕГДА остаётся в numbers.article — не трогай его.\n"
+        "- Если confirmed-номер ДОКАЗАННО (OEM/дилер-пруф) оказался ДРУГОЙ деталью (например "
+        "dry-joint против нашего wet-joint) → перенеси его в numbers.irrelevant с why_irrelevant.\n"
+        "- Если только ПОДОЗРЕНИЕ что чужой, без твёрдого OEM-пруфа (или только форум) → перенеси "
+        "в numbers.article_low_confidence с why_low_confidence (буфер сомнения).\n"
+        "- Чистый, та же деталь → остаётся в numbers.article.\n\n"
+        "Не выдумывай номера/нюансы без источника. Все ОСТАЛЬНЫЕ поля JSON сохрани без изменений. "
+        "Один номер — только в одном массиве numbers.*. Ответ — только валидный JSON по схеме."
     )

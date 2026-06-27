@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import traceback
 from decimal import Decimal
 
@@ -25,6 +26,8 @@ from .context import SMART_PLUGIN_NAME, load_context
 from .errors import NoExactDataError
 from .exa_client import cached_exa_call, pick_fetch, pick_search
 from .prompts import (
+    build_difference_query,
+    build_difference_user_message,
     build_family_query,
     build_family_user_message,
     build_kit_contents_query,
@@ -260,6 +263,64 @@ async def _phase2(
     return result
 
 
+# ── финальный difference-turn ───────────────────────────────────────────────────
+def _distinct_numbers(arts: list[str]) -> list[str]:
+    """Точный дедуп (case-insensitive по полной строке), сохраняя порядок.
+    Дефисы/символы НЕ трогаем: убираем только буквальные повторы, разные номера
+    (66015 vs 66015-1) остаются раздельными. Confirmed уже в канон-форме."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for a in arts:
+        key = a.strip().upper()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(a)
+    return out
+
+
+async def _difference_turn(
+    pool: asyncpg.Pool,
+    run_id: int,
+    article: str,
+    context,
+    session: PostgresSession,
+    system_prompt: str,
+    exa: AsyncExa,
+    current: StructuredResult,
+    turn: int,
+) -> StructuredResult:
+    """На ПОДТВЕРЖДЁННЫХ кроссах ищем нюансы между номерами: порядок замен
+    (supersession), границы детали (part_caveats), пер-артикульные note. И при OEM-
+    пруфе разводим случайно смешанные чужие номера (confirmed -> irrelevant/low).
+    Запускается, только если есть что сравнивать (>=2 различных confirmed-номера)."""
+    confirmed = _distinct_numbers([a.article for a in current.numbers.article])
+    if len(confirmed) < 2:
+        log("[difference] <2 distinct confirmed numbers — нечего сравнивать, пропуск")
+        return current
+    log(f"[difference] turn {turn} — {len(confirmed)} distinct confirmed")
+    agent = make_research_agent(system_prompt)
+    preamble = build_user_preamble(context)
+    raw = await cached_exa_call(
+        pool, exa, "web_search_exa",
+        {"query": build_difference_query(confirmed), "num_results": 10},
+        run_id=run_id, phase="difference",
+    )
+    picked = json.dumps(pick_search(raw), ensure_ascii=False)
+    msg = build_difference_user_message(article, picked, current.model_dump_json(indent=2))
+    result = await run_streamed_and_persist(agent, msg, session, pool, run_id, turn, preamble=preamble)
+    await _write_result(pool, run_id, result)
+    post_validate(
+        result,
+        expected_part_number=article,
+        allowed_brands=context.allowed_brands,
+        allowed_vehicle_classes=context.allowed_vehicle_classes,
+    )
+    log(f"[difference] supersession={len(result.supersession)} "
+        f"part_caveats={len(result.part_caveats)} "
+        f"notes={sum(1 for a in result.numbers.article if a.note)}")
+    return result
+
+
 # ── парсинг финального JSON -> draft-таблицы ───────────────────────────────────
 async def _parse_to_draft(
     pool: asyncpg.Pool, run_id: int, r: StructuredResult, needs_review_reason: str | None,
@@ -292,20 +353,26 @@ async def _parse_to_draft(
 
             article_rows = []
             for a in r.numbers.article:
-                article_rows.append((draft_part_id, a.article, "confirmed", a.source_url, a.evidence, None, None))
+                note = (a.note.text, a.note.source_url, a.note.evidence) if a.note else (None, None, None)
+                article_rows.append(
+                    (draft_part_id, a.article, "confirmed", a.source_url, a.evidence, None, None, *note)
+                )
             for a in r.numbers.article_low_confidence:
                 article_rows.append(
-                    (draft_part_id, a.article, "low_confidence", a.source_url, a.evidence, a.why_low_confidence, None)
+                    (draft_part_id, a.article, "low_confidence", a.source_url, a.evidence,
+                     a.why_low_confidence, None, None, None, None)
                 )
             for a in r.numbers.irrelevant:
                 article_rows.append(
-                    (draft_part_id, a.article, "irrelevant", a.source_url, a.evidence, None, a.why_irrelevant)
+                    (draft_part_id, a.article, "irrelevant", a.source_url, a.evidence,
+                     None, a.why_irrelevant, None, None, None)
                 )
             if article_rows:
                 await conn.executemany(
                     "INSERT INTO draft_part_articles "
-                    "(draft_part_id, article, confidence, source_url, evidence, why_low_confidence, why_irrelevant) "
-                    "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                    "(draft_part_id, article, confidence, source_url, evidence, why_low_confidence, why_irrelevant, "
+                    " note_text, note_source_url, note_evidence) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
                     article_rows,
                 )
 
@@ -355,6 +422,27 @@ async def _parse_to_draft(
                     "(run_id, article, site, price, currency, url, in_stock, evidence) "
                     "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
                     price_rows,
+                )
+
+            # difference-turn: границы детали и цепочка замен (с пруфом).
+            caveat_rows = [
+                (draft_part_id, c.caveat, c.source_url, c.evidence) for c in r.part_caveats
+            ]
+            if caveat_rows:
+                await conn.executemany(
+                    "INSERT INTO draft_part_caveats (draft_part_id, caveat, source_url, evidence) "
+                    "VALUES ($1,$2,$3,$4)",
+                    caveat_rows,
+                )
+
+            supersession_rows = [
+                (draft_part_id, s.newer, s.older, s.source_url, s.evidence) for s in r.supersession
+            ]
+            if supersession_rows:
+                await conn.executemany(
+                    "INSERT INTO draft_supersession (draft_part_id, newer, older, source_url, evidence) "
+                    "VALUES ($1,$2,$3,$4,$5)",
+                    supersession_rows,
                 )
 
 
@@ -447,6 +535,16 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
             )
         except Exception as e:  # noqa: BLE001 — best-effort, оставляем результат фазы 1
             log(f"[phase2] failed (non-fatal), keeping pre-phase2 result: {type(e).__name__}: {e}")
+
+        # Финальный difference-turn — нюансы между подтверждёнными кроссами
+        # (supersession/part_caveats/note + разводка чужих номеров). Best-effort:
+        # падение НЕ теряет готовый результат.
+        try:
+            current = await _difference_turn(
+                pool, run_id, article, context, session, system_prompt, exa, current, last_turn + 2
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort
+            log(f"[difference] failed (non-fatal), keeping prior result: {type(e).__name__}: {e}")
 
         reason = _needs_review_reason(current)
         # persist-then-validate: сперва пишем draft (всегда), затем формат-валидация

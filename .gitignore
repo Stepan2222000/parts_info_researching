@@ -21,3 +21,4 @@ test_runs/
 .claude/
 test_runs_*/
 price_probe/
+supersession_probe/
