@@ -747,6 +747,87 @@ def _order_articles(articles: list[str] | None, reference: list[str]) -> list[st
     return known + unknown
 
 
+def _apply_supersession_order(reference: list[str], edges: list[tuple[str, str]]) -> list[str]:
+    """Уточнить research-порядок ДОКАЗАННЫМИ парами замен (draft_supersession,
+    difference-turn): номера цепочки идут новейший→старейший, номера вне цепочки —
+    после, в исходном research-порядке. Состав не меняется."""
+    if not edges:
+        return reference
+    newer_of = {older: newer for newer, older in edges}   # older -> newer
+    olders = set(newer_of)
+    in_chain = olders | {newer for newer, _ in edges}
+    chain: list[str] = []
+    for top in (n for n in reference if n in in_chain and n not in olders):
+        cur: str | None = top
+        while cur is not None and cur not in chain:       # защита от цикла в данных
+            chain.append(cur)
+            nxt = [o for o, nw in newer_of.items() if nw == cur]
+            cur = nxt[0] if nxt else None
+    ordered = [n for n in chain if n in reference]
+    return ordered + [n for n in reference if n not in ordered]
+
+
+async def _supersession_edges(conn, run_id: int) -> list[tuple[str, str]]:
+    """Пары замен (newer, older) из draft_supersession run'а (difference-turn,
+    только confirmed-номера)."""
+    rows = await conn.fetch(
+        "SELECT s.newer, s.older FROM draft_supersession s "
+        "JOIN draft_parts d ON d.id = s.draft_part_id WHERE d.run_id = $1 ORDER BY s.id",
+        run_id)
+    return [(r["newer"], r["older"]) for r in rows]
+
+
+def _fact_body(text: str, evidence: str, source_url: str) -> str:
+    return f"{text}\n\nПруф: «{evidence}»\nИсточник: {source_url}"
+
+
+async def _record_facts(conn, smart_id: str, main_run_id: int, pub_run_ids: list[int]) -> int:
+    """Пишет нюансы (draft_nuances всех ранов записи) фактами в knowledge.knowledge_facts
+    (part_knowledge, через FDW) В ТОЙ ЖЕ транзакции/SAVEPOINT, что и публикация part'а:
+    упали факты -> откатывается и публикация (атомарно per-part).
+
+    Маппинг: нюанс с articles -> строка на КАЖДЫЙ номер (scope_type='article');
+    без articles -> одна строка на деталь (scope_type='part', scope_ref=smart_id).
+    Одинаковые (scope, body) между ранами группы схлопываются. Нюансов нет -> базу
+    знаний НЕ трогаем (страховка: пустота может значить упавший difference-turn).
+    Перед вставкой гасим (is_active=false) прежние research-факты ЭТОЙ детали/её
+    номеров — по принадлежности, не по ярлыку (пере-публикация новым run_id тоже
+    гасит старое); ручные факты (source='manual' и пр.) не трогаем. Возвращает N."""
+    nuances = await conn.fetch(
+        "SELECT n.text, n.articles, n.source_url, n.evidence FROM draft_nuances n "
+        "JOIN draft_parts d ON d.id = n.draft_part_id WHERE d.run_id = ANY($1::bigint[]) ORDER BY n.id",
+        pub_run_ids)
+    rows: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for n in nuances:
+        body = _fact_body(n["text"], n["evidence"], n["source_url"])
+        targets = [("article", a) for a in (n["articles"] or [])] or [("part", smart_id)]
+        for scope_type, scope_ref in targets:
+            key = (scope_type, scope_ref, body)
+            if key not in seen:
+                seen.add(key)
+                rows.append(key)
+    if not rows:
+        return 0
+    # Гасим старые авто-факты по принадлежности: сама запись + её номера (пост-состояние
+    # smart) + номера, на которые ссылаются свежие факты (покрывает убранные из записи).
+    published = list(await conn.fetchval("SELECT articles FROM smart.parts WHERE id=$1", smart_id) or [])
+    fact_numbers = [ref for st, ref, _ in rows if st == "article"]
+    numbers = list(dict.fromkeys(published + fact_numbers))
+    await conn.execute(
+        "UPDATE knowledge.knowledge_facts SET is_active = false "
+        "WHERE source LIKE 'research:%' AND is_active AND ("
+        "  (scope_type = 'part' AND scope_ref = $1) OR "
+        "  (scope_type = 'article' AND scope_ref = ANY($2::text[])))",
+        smart_id, numbers)
+    source = f"research:difference_turn:{main_run_id}"
+    await conn.executemany(
+        "INSERT INTO knowledge.knowledge_facts (scope_type, scope_ref, body, source, is_active) "
+        "VALUES ($1, $2, $3, $4, true)",
+        [(st, ref, body, source) for st, ref, body in rows])
+    return len(rows)
+
+
 async def _record_prices(conn, smart_id: str, prices: list[PriceOffer]) -> int:
     """Пишет офферы в parts_prices через FDW (market.*) В ТОЙ ЖЕ транзакции/SAVEPOINT,
     что и smart-публикация part'а: упали цены -> откатывается и публикация этого part'а
@@ -805,8 +886,12 @@ async def _check_title_budget(conn, part_id: str) -> None:
 
 async def _save_one_part(conn, part: SavePart, session_id: int) -> dict:
     # Порядок articles задаёт research (новые→старые), а не куратор: берём эталон из
-    # draft_part_articles этого run'а и переставляем под него. Состав не меняем.
-    part.articles = _order_articles(part.articles, await _confirmed_article_order(conn, part.run_id))
+    # draft_part_articles этого run'а, уточняем ДОКАЗАННЫМИ парами замен difference-turn
+    # (draft_supersession: новейший первым) и переставляем под него. Состав не меняем.
+    reference = _apply_supersession_order(
+        await _confirmed_article_order(conn, part.run_id),
+        await _supersession_edges(conn, part.run_id))
+    part.articles = _order_articles(part.articles, reference)
 
     if part.smart_id is None:
         if not part.vehicle_classes:
@@ -847,13 +932,16 @@ async def _save_one_part(conn, part: SavePart, session_id: int) -> dict:
     await _check_title_budget(conn, parent_id)
     # Цены — в ТОЙ ЖЕ транзакции (через FDW parts_prices): атомарно с публикацией part'а.
     prices_recorded = await _record_prices(conn, parent_id, part.prices) if part.prices else 0
-    # На вошедшие в запись раны (основной + сведённые дубли) — по строке publications -> один smart_id.
     pub_run_ids = list(dict.fromkeys([part.run_id, *(part.also_run_ids or [])]))
+    # Факты-нюансы — в part_knowledge (FDW), тоже атомарно с публикацией part'а.
+    facts_recorded = await _record_facts(conn, parent_id, part.run_id, pub_run_ids)
+    # На вошедшие в запись раны (основной + сведённые дубли) — по строке publications -> один smart_id.
     await conn.executemany(
         "INSERT INTO publications (run_id, curator_session_id, smart_id) VALUES ($1, $2, $3)",
         [(rid, session_id, parent_id) for rid in pub_run_ids])
     return {"status": "ok", "smart_id": parent_id, "components": comp_results,
-            "prices_recorded": prices_recorded, "published_run_ids": pub_run_ids}
+            "prices_recorded": prices_recorded, "facts_recorded": facts_recorded,
+            "published_run_ids": pub_run_ids}
 
 
 async def _validate_part_formats(conn, part: SavePart, ruleset) -> list[str]:
@@ -910,6 +998,13 @@ async def save_to_smart(wrapper: RunContextWrapper[CuratorRunContext], parts: li
     (US offers for the original part) are written to parts_prices via FDW (market.*) WITHIN the
     same per-part transaction — atomic with the publish: if a price write fails, that part's whole
     publish (smart + prices) rolls back via its SAVEPOINT; neighbouring parts still persist.
+
+    Difference-turn data is applied automatically: articles are re-ordered newest-first by the
+    proven supersession chain (draft_supersession), and nuances (draft_nuances of all published
+    runs) are written as facts to part_knowledge (knowledge.knowledge_facts via FDW) in the SAME
+    per-part transaction — a facts failure rolls back that part's publish. Prior research-sourced
+    facts of the same part/numbers are deactivated first; manual facts are never touched.
+    `facts_recorded` in the result shows how many facts were written.
 
     Args:
         parts: parts to publish (each a single part or a kit with components).
