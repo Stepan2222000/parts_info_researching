@@ -51,6 +51,9 @@ app = FastAPI(title="parts_research_public_api", lifespan=lifespan)
 
 class ResearchBody(BaseModel):
     articles: list[str]
+    # wait=false — только поставить в очередь и сразу вернуть run_id (без ожидания);
+    # результат клиент дозапрашивает GET /research/{run_id}.
+    wait: bool = True
 
 
 def _apply_row(entry: dict, row, *, worker_alive: bool, timed_out: bool = False) -> None:
@@ -99,6 +102,10 @@ async def get_research(run_id: int) -> dict:
 async def post_research(body: ResearchBody) -> dict:
     """Ставит артикулы в очередь и СИНХРОННО ждёт результат (до WAIT_TIMEOUT_SECONDS).
 
+    wait=false в теле — не ждать: сразу вернуть run_id и текущий статус
+    (queued/running), результат дозапрашивается GET /research/{run_id}.
+    Для клиентов, которым нельзя держать долгие соединения.
+
     Возвращает {worker_alive, results:[entry, ...]}. Каждый entry:
       article, task_id, run_id, reused, status, result_json, error,
       needs_review_reason, worker_alive, timed_out.
@@ -142,13 +149,14 @@ async def post_research(body: ResearchBody) -> dict:
 
     # 2) Ожидание результата(ов).
     if run_to_entries:
-        if not worker_alive:
-            # Обрабатывать некому — отдаём текущий статус сразу, не виснем.
+        if not body.wait or not worker_alive:
+            # wait=false (клиент дозапрашивает GET /research/{run_id}) либо
+            # обрабатывать некому — отдаём текущий статус сразу, не виснем.
             for run_id, es in run_to_entries.items():
                 row = await pool.fetchrow(
                     "SELECT status, error, result_json FROM task_runs WHERE id = $1", run_id)
                 for e in es:
-                    _apply_row(e, row, worker_alive=False)
+                    _apply_row(e, row, worker_alive=worker_alive)
         else:
             pending = set(run_to_entries)
             deadline = time.monotonic() + WAIT_TIMEOUT_SECONDS

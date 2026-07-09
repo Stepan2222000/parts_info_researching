@@ -23,11 +23,17 @@
 
 Тело:
 ```json
-{ "articles": ["817373A1", "865496A01"] }
+{ "articles": ["817373A1", "865496A01"], "wait": true }
 ```
 
 Блокируется до готовности **всех** артикулов или до потолка ожидания
-(по умолчанию **600 сек**, см. `PARTS_RESEARCH_WAIT_TIMEOUT`). Ответ:
+(по умолчанию **600 сек**, см. `PARTS_RESEARCH_WAIT_TIMEOUT`).
+
+`"wait": false` — **не ждать**: поставить в очередь и сразу вернуть `run_id`
+с текущим статусом (`queued`/`running`); результат дозапрашивается
+`GET /research/{run_id}`. Для клиентов, которым нельзя держать долгие
+соединения (NAT/файрволы по пути режут молчащие соединения — например,
+ровно через 60 сек). Ответ:
 
 ```json
 {
@@ -126,6 +132,17 @@ for e in r.json()["results"]:
         print(e["article"], "still", later["status"])
     else:
         print(e["article"], e["status"], e["error"])
+
+# submit-and-poll (wait=false): без долгих соединений — submit мгновенный,
+# дальше опрашиваем GET; терминальные статусы — все, кроме queued/running.
+import time
+
+r = httpx.post(f"{BASE}/research", json={"articles": ["817373A1"], "wait": False}, timeout=30)
+for e in r.json()["results"]:
+    while e["status"] in ("queued", "running"):
+        time.sleep(15)
+        e = httpx.get(f"{BASE}/research/{e['run_id']}", timeout=10).json()
+    print(e["article"], e["status"])
 ```
 
 > Совет: клиентский таймаут HTTP должен быть **больше** серверного потолка
