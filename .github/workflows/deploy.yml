@@ -90,6 +90,6 @@ jobs:
             export GHCR_OWNER=stepan2222000
             export TAG=latest
             docker compose pull
-            docker compose up -d --remove-orphans worker api app
+            docker compose up -d --remove-orphans worker api public-api app
             docker image prune -f
             docker compose ps
