@@ -18,7 +18,8 @@ FROM (
 GROUP BY status
 """
 
-# Карточки задач: последний run каждой задачи + краткие draft-поля + флаг публикации.
+# Карточки задач: последний run каждой задачи + краткие draft-поля + флаг публикации
+# + профиль и текущий этап (для чипа прогресса у running-карточек).
 # Отдаём ВСЕ задачи без лимита: UI держит полный список и ищет по нему на клиенте
 # (поиск живёт в одном месте — на фронте). Очередь небольшая (десятки задач).
 _CARDS_SQL = """
@@ -29,6 +30,7 @@ SELECT * FROM (
         r.id            AS run_id,
         r.status::text  AS status,
         r.error,
+        r.profile,
         r.created_at,
         r.started_at,
         r.finished_at,
@@ -37,7 +39,10 @@ SELECT * FROM (
         dp.vehicle_classes,
         dp.is_kit,
         dp.brand_oem,
-        EXISTS (SELECT 1 FROM publications p WHERE p.run_id = r.id) AS published
+        EXISTS (SELECT 1 FROM publications p WHERE p.run_id = r.id) AS published,
+        (SELECT rt.stage FROM run_turns rt
+         WHERE rt.run_id = r.id AND rt.status = 'running'
+         ORDER BY rt.turn_idx DESC LIMIT 1) AS current_stage
     FROM tasks t
     JOIN task_runs r ON r.task_id = t.id
     LEFT JOIN draft_parts dp ON dp.run_id = r.id
@@ -84,6 +89,8 @@ def _card(r: asyncpg.Record) -> dict:
         "run_id": r["run_id"],
         "status": r["status"],
         "error": r["error"],
+        "profile": r["profile"],
+        "current_stage": r["current_stage"],
         "created_at": _iso(r["created_at"]),
         "started_at": _iso(r["started_at"]),
         "finished_at": _iso(r["finished_at"]),
@@ -101,6 +108,7 @@ async def load_run_detail(pool: asyncpg.Pool, run_id: int) -> dict | None:
     async with pool.acquire() as conn:
         run = await conn.fetchrow(
             "SELECT r.id AS run_id, r.task_id, r.status::text AS status, r.error, "
+            "r.profile, r.stage_outcomes, "
             "r.result_json, r.created_at, r.started_at, r.finished_at, t.article "
             "FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE r.id = $1",
             run_id,
@@ -161,6 +169,8 @@ async def load_run_detail(pool: asyncpg.Pool, run_id: int) -> dict | None:
         "article": run["article"],
         "status": run["status"],
         "error": run["error"],
+        "profile": run["profile"],
+        "stage_outcomes": run["stage_outcomes"],
         "result_json": run["result_json"],
         "created_at": _iso(run["created_at"]),
         "started_at": _iso(run["started_at"]),

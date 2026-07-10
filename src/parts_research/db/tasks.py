@@ -28,18 +28,20 @@ TERMINAL_STATUSES = (
 
 
 # ── постановка в очередь ─────────────────────────────────────────────────────────
-async def submit_article(pool: asyncpg.Pool, article: str) -> dict:
-    """Атомарно ставит артикул в общую очередь.
+async def submit_article(pool: asyncpg.Pool, article: str, profile: dict) -> dict:
+    """Атомарно ставит артикул в общую очередь с профилем этапов.
 
     Per-article transaction-level advisory-lock (`pg_advisory_xact_lock(hashtext)`)
     сериализует параллельные submit одного и того же артикула, поэтому дедуп
     работает без гонки. Модель «один task на артикул»:
 
     - find-or-create `task` по артикулу;
-    - если есть активный (`queued`/`running`) run — переиспользуем его (reused=True);
-    - иначе создаём новый `queued` run под этим task.
+    - если есть активный (`queued`/`running`) run — переиспользуем его (reused=True),
+      профиль активного НЕ меняем (он уже мог начать исполняться);
+    - иначе создаём новый `queued` run с переданным профилем.
 
-    Возвращает {"task_id", "run_id", "reused"}.
+    Возвращает {"task_id", "run_id", "reused", "profile"} — profile того рана,
+    который реально будет исполняться (у reused — его собственный).
     """
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -53,19 +55,34 @@ async def submit_article(pool: asyncpg.Pool, article: str) -> dict:
                     "INSERT INTO tasks (article) VALUES ($1) RETURNING id", article
                 )
 
-            active = await conn.fetchval(
-                "SELECT id FROM task_runs WHERE task_id = $1 "
+            active = await conn.fetchrow(
+                "SELECT id, profile FROM task_runs WHERE task_id = $1 "
                 "AND status IN ('queued', 'running') ORDER BY id DESC LIMIT 1",
                 task_id,
             )
             if active is not None:
-                return {"task_id": task_id, "run_id": active, "reused": True}
+                return {
+                    "task_id": task_id, "run_id": active["id"], "reused": True,
+                    "profile": active["profile"],
+                }
 
             run_id = await conn.fetchval(
-                "INSERT INTO task_runs (task_id, status) VALUES ($1, 'queued') RETURNING id",
-                task_id,
+                "INSERT INTO task_runs (task_id, status, profile) "
+                "VALUES ($1, 'queued', $2) RETURNING id",
+                task_id, profile,
             )
-            return {"task_id": task_id, "run_id": run_id, "reused": False}
+            return {"task_id": task_id, "run_id": run_id, "reused": False, "profile": profile}
+
+
+async def latest_run_for_article(pool: asyncpg.Pool, article: str) -> asyncpg.Record | None:
+    """Последний ран артикула (для reuse-решений и GET /research/by-article)."""
+    return await pool.fetchrow(
+        "SELECT r.id AS run_id, r.task_id, r.status::text AS status, r.profile, "
+        "r.result_json, r.error, t.article "
+        "FROM tasks t JOIN task_runs r ON r.task_id = t.id "
+        "WHERE t.article = $1 ORDER BY r.id DESC LIMIT 1",
+        article,
+    )
 
 
 # ── dequeue воркером ──────────────────────────────────────────────────────────────

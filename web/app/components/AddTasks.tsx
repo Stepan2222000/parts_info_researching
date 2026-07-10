@@ -10,8 +10,16 @@ const FB_LABEL: Record<string, string> = {
   refused: "уже в Smart",
 };
 
+// Пресеты профиля этапов: применяются ко ВСЕМУ отправляемому списку.
+const PRESETS: { value: string; label: string; hint: string }[] = [
+  { value: "default", label: "Стандарт", hint: "все этапы, кроме свободного добора (phase2); ~5–7 мин" },
+  { value: "full", label: "Полный", hint: "все этапы, включая свободный добор (phase2); ~8–10 мин" },
+  { value: "fast", label: "Быстрый", hint: "только основной поиск и состав набора; ~2–3 мин" },
+];
+
 export function AddTasks({ onSubmitted }: { onSubmitted: () => void }) {
   const [raw, setRaw] = useState("");
+  const [preset, setPreset] = useState("default");
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState<SubmitResult[]>([]);
 
@@ -21,7 +29,7 @@ export function AddTasks({ onSubmitted }: { onSubmitted: () => void }) {
     if (!articles.length || busy) return;
     setBusy(true);
     try {
-      const res = await submitArticles(articles);
+      const res = await submitArticles(articles, preset);
       setFeedback(res.results);
       setRaw("");
       onSubmitted();
@@ -42,6 +50,20 @@ export function AddTasks({ onSubmitted }: { onSubmitted: () => void }) {
           if ((e.metaKey || e.ctrlKey) && e.key === "Enter") submit();
         }}
       />
+      <div className="profile-seg" role="radiogroup" aria-label="Профиль этапов">
+        {PRESETS.map((p) => (
+          <button
+            type="button"
+            key={p.value}
+            className={`profile-opt${preset === p.value ? " active" : ""}`}
+            title={p.hint}
+            aria-pressed={preset === p.value}
+            onClick={() => setPreset(p.value)}
+          >
+            {p.label}
+          </button>
+        ))}
+      </div>
       <button className="btn-primary" onClick={submit} disabled={!articles.length || busy}>
         <IconPlus />
         {busy ? "Отправляю…" : articles.length ? `Добавить ${articles.length}` : "Добавить в очередь"}

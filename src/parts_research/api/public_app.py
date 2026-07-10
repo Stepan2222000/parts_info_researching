@@ -1,13 +1,20 @@
 """Публичный HTTP-API для внешних систем (на других серверах): постановка
-артикулов в общую очередь ресерча и СИНХРОННОЕ ожидание результата.
+артикулов в общую очередь ресерча и получение результата — синхронно
+(submit-and-wait) либо прогрессивно (submit + поллинг турнов с курсором).
 
 Отдельное приложение/процесс, НАМЕРЕННО без эндпоинтов куратора и UI-выборок:
 наружу выставляется только ресерч (куратор умеет SQL и запись в Smart — его
 наружу не пускаем). Аутентификации нет — по требованию (обращаться может кто
 угодно из доступной сети).
 
-Контракт машиночитаемый: на каждый артикул возвращается status + result_json.
-Логика постановки/ожидания переиспользует те же helpers, что и `cli.research`.
+Контракт машиночитаемый: на каждый артикул возвращается status + result_json /
+дельты по турнам. Семантика профилей и reuse:
+  - профиль этапов фиксируется на ране; активный ран артикула переиспользуется
+    (covers_requested показывает, покрывает ли его профиль запрошенный);
+  - готовый done-ран с покрывающим профилем отдаётся сразу (is_final=true),
+    новый ран НЕ ставится; принудительный пере-ресерч — force=true;
+  - force при активном ране НЕ ставит параллельный ран (инвариант «один активный
+    ран на артикул») — честно возвращается активный + force_ignored.
 
 Принцип проекта — ошибки не скрываем: исключения летят наверх как HTTP-ошибки с
 текстом, маскирующих фолбеков нет."""
@@ -23,13 +30,22 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from ..db.pool import create_pool
-from ..db.tasks import TERMINAL_STATUSES, count_live_workers, submit_article
+from ..db.tasks import (
+    ACTIVE_STATUSES,
+    TERMINAL_STATUSES,
+    count_live_workers,
+    latest_run_for_article,
+    submit_article,
+)
+from ..research.profiles import covers, resolve_profile
 from ..research.validation import pre_validate_article
+from .progress import load_progress, load_turns_payload
 
-# Потолок синхронного ожидания одного запроса (сек). 10 минут по умолчанию;
-# переопределяется PARTS_RESEARCH_WAIT_TIMEOUT. По достижении — отдаём run_id +
-# текущий статус, клиент дозапрашивает GET /research/{run_id}.
-WAIT_TIMEOUT_SECONDS = float(os.environ.get("PARTS_RESEARCH_WAIT_TIMEOUT", "600"))
+# Потолок синхронного ожидания одного запроса (сек). 20 минут по умолчанию
+# (полный ран с phase2 занимает ~10 мин, дефолтный — меньше); переопределяется
+# PARTS_RESEARCH_WAIT_TIMEOUT. По достижении — отдаём run_id + текущий статус,
+# клиент дозапрашивает GET /research/{run_id} или поллит /turns.
+WAIT_TIMEOUT_SECONDS = float(os.environ.get("PARTS_RESEARCH_WAIT_TIMEOUT", "1200"))
 POLL_SECONDS = 1.5
 
 # submit-guard: артикул уже финализирован человеком в Smart → ресерч бессмысленен.
@@ -51,15 +67,38 @@ app = FastAPI(title="parts_research_public_api", lifespan=lifespan)
 
 class ResearchBody(BaseModel):
     articles: list[str]
-    # wait=false — только поставить в очередь и сразу вернуть run_id (без ожидания);
-    # результат клиент дозапрашивает GET /research/{run_id}.
+    # Пресет ('fast'|'default'|'full') либо {"stages": [...]}; None = default.
+    profile: str | dict | None = None
+    # Принудительный пере-ресерч, если последний ран терминален. Активный ран
+    # force НЕ дублирует (см. модульный docstring).
+    force: bool = False
+    # wait=false в POST /research — только поставить и сразу вернуть run_id (без
+    # ожидания); для клиентов за NAT/файрволами, режущими молчащие соединения.
+    # Эквивалент POST /research/submit (там wait игнорируется).
     wait: bool = True
+
+
+def _resolve_profile_or_400(raw: str | dict | None) -> dict:
+    try:
+        return resolve_profile(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _base_entry(article: str) -> dict:
+    return {
+        "article": article, "task_id": None, "run_id": None, "reused": False,
+        "profile": None, "covers_requested": None, "force_ignored": False,
+        "status": None, "is_final": False, "result_json": None, "error": None,
+        "needs_review_reason": None, "worker_alive": None, "timed_out": False,
+    }
 
 
 def _apply_row(entry: dict, row, *, worker_alive: bool, timed_out: bool = False) -> None:
     """Заполняет статус/результат записи из строки task_runs (status/error/result_json)."""
     status = row["status"]
     entry["status"] = status
+    entry["is_final"] = status in TERMINAL_STATUSES
     entry["result_json"] = row["result_json"]
     entry["worker_alive"] = worker_alive
     entry["timed_out"] = timed_out
@@ -72,6 +111,70 @@ def _apply_row(entry: dict, row, *, worker_alive: bool, timed_out: bool = False)
         entry["error"] = row["error"]
 
 
+async def _submit_entry(pool, raw_article: str, requested_profile: dict, force: bool) -> dict:
+    """Решение по одному артикулу: invalid / refused (+ last_run) / готовый done-ран
+    (is_final) / reuse активного / новый ран. Общая логика sync- и submit-эндпоинтов."""
+    entry = _base_entry(raw_article)
+    try:
+        article = pre_validate_article(raw_article)
+    except ValueError as e:
+        entry.update(status="invalid", error=str(e))
+        return entry
+    entry["article"] = article
+
+    finalized = await pool.fetchval(_GUARD_SQL, article)
+    if finalized:
+        entry.update(
+            status="refused",
+            error="already finalized in Smart (is_draft=false); research skipped",
+        )
+        # Прикладываем последний ран, если был: отказ — не тупик для потребителя.
+        latest = await latest_run_for_article(pool, article)
+        if latest is not None:
+            entry["last_run"] = {
+                "run_id": latest["run_id"], "status": latest["status"],
+                "profile": latest["profile"], "result_json": latest["result_json"],
+                "error": latest["error"],
+            }
+        return entry
+
+    latest = await latest_run_for_article(pool, article)
+
+    # Активный ран: переиспользуем всегда (параллельный ран того же артикула не
+    # ставим даже при force — это молча удвоило бы траты LLM).
+    if latest is not None and latest["status"] in ACTIVE_STATUSES:
+        entry.update(
+            task_id=latest["task_id"], run_id=latest["run_id"], reused=True,
+            profile=latest["profile"], status=latest["status"],
+            covers_requested=covers(latest["profile"], requested_profile),
+            force_ignored=force,
+        )
+        return entry
+
+    # Готовый done-ран с покрывающим профилем: отдаём сразу, без нового рана.
+    if (
+        not force
+        and latest is not None
+        and latest["status"] == "done"
+        and covers(latest["profile"], requested_profile)
+    ):
+        entry.update(
+            task_id=latest["task_id"], run_id=latest["run_id"], reused=True,
+            profile=latest["profile"], status="done", is_final=True,
+            covers_requested=True, result_json=latest["result_json"],
+        )
+        return entry
+
+    sub = await submit_article(pool, article, requested_profile)
+    entry.update(
+        task_id=sub["task_id"], run_id=sub["run_id"], reused=sub["reused"],
+        profile=sub["profile"], status="queued",
+        # При гонке submit мог вернуть чужой активный ран — покрытие считаем по факту.
+        covers_requested=covers(sub["profile"], requested_profile),
+    )
+    return entry
+
+
 @app.get("/health")
 async def health() -> dict:
     """Liveness для внешнего процесса: жив ли API, есть ли живой воркер, глубина очереди."""
@@ -81,21 +184,83 @@ async def health() -> dict:
     return {"ok": True, "worker_alive": live > 0, "live_workers": live, "queued": queued}
 
 
+@app.get("/research/by-article/{article}")
+async def get_by_article(article: str) -> dict:
+    """Последний ран артикула — «вернуться к задаче», не зная run_id.
+    Дальше потребитель работает через /research/{run_id}/turns."""
+    pool = app.state.pool
+    try:
+        normalized = pre_validate_article(article)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    latest = await latest_run_for_article(pool, normalized)
+    if latest is None:
+        raise HTTPException(status_code=404, detail=f"no runs for article {normalized!r}")
+    return {
+        "article": latest["article"],
+        "task_id": latest["task_id"],
+        "run_id": latest["run_id"],
+        "status": latest["status"],
+        "is_final": latest["status"] in TERMINAL_STATUSES,
+        "profile": latest["profile"],
+        "error": latest["error"],
+    }
+
+
 @app.get("/research/{run_id}")
 async def get_research(run_id: int) -> dict:
-    """Дозапрос результата по run_id (для timed_out-случая или асинхронного использования)."""
+    """Статус/результат по run_id + профиль, исходы этапов и прогресс.
+    result_json у неготового рана — ПРОМЕЖУТОЧНЫЙ (растёт по турнам)."""
     pool = app.state.pool
     row = await pool.fetchrow(
-        "SELECT r.id, r.status::text AS status, r.error, r.result_json, t.article "
+        "SELECT r.id, r.status::text AS status, r.error, r.result_json, r.profile, "
+        "r.stage_outcomes, t.article, r.task_id "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE r.id = $1",
         run_id,
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"run {run_id} not found")
     live = await count_live_workers(pool)
-    entry: dict = {"article": row["article"], "run_id": run_id}
+    entry: dict = {"article": row["article"], "task_id": row["task_id"], "run_id": run_id}
     _apply_row(entry, row, worker_alive=live > 0)
+    entry["profile"] = row["profile"]
+    entry["stage_outcomes"] = row["stage_outcomes"]
+    entry["progress"] = await load_progress(pool, run_id, status=row["status"])
     return entry
+
+
+@app.get("/research/{run_id}/turns")
+async def get_research_turns(run_id: int, since: int = 0, mode: str = "delta") -> dict:
+    """Прогрессивная выдача: новые турны после курсора `since` + дельта/снапшот.
+
+    mode=delta (дефолт) — только изменившиеся секции JSON от состояния на турне
+    `since` к текущему (слитая дельта) + русская сводка. mode=snapshot — полный
+    текущий снапшот. Курсор следующего запроса = latest_turn из ответа.
+    """
+    pool = app.state.pool
+    try:
+        payload = await load_turns_payload(pool, run_id, since=since, mode=mode)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+    return payload
+
+
+@app.post("/research/submit")
+async def post_research_submit(body: ResearchBody) -> dict:
+    """Fire-and-forget постановка с профилем: мгновенный ответ по каждому артикулу.
+
+    Дальше потребитель поллит GET /research/{run_id}/turns?since=<cursor>.
+    Семантика reuse/force — см. модульный docstring. Невалидный артикул не валит
+    остальных (status=invalid у конкретной записи)."""
+    pool = app.state.pool
+    requested = _resolve_profile_or_400(body.profile)
+    entries = [await _submit_entry(pool, raw, requested, body.force) for raw in body.articles]
+    worker_alive = await count_live_workers(pool) > 0
+    for e in entries:
+        e["worker_alive"] = worker_alive
+    return {"worker_alive": worker_alive, "requested_profile": requested, "results": entries}
 
 
 @app.post("/research")
@@ -103,47 +268,29 @@ async def post_research(body: ResearchBody) -> dict:
     """Ставит артикулы в очередь и СИНХРОННО ждёт результат (до WAIT_TIMEOUT_SECONDS).
 
     wait=false в теле — не ждать: сразу вернуть run_id и текущий статус
-    (queued/running), результат дозапрашивается GET /research/{run_id}.
-    Для клиентов, которым нельзя держать долгие соединения.
+    (queued/running), результат дозапрашивается GET /research/{run_id} или
+    поллингом /turns. Для клиентов, которым нельзя держать долгие соединения.
 
-    Возвращает {worker_alive, results:[entry, ...]}. Каждый entry:
-      article, task_id, run_id, reused, status, result_json, error,
-      needs_review_reason, worker_alive, timed_out.
-
+    Возвращает {worker_alive, requested_profile, results:[entry, ...]}.
     status: invalid | refused | queued | running | done | needs_human_review |
             failed_no_data | failed_validation | failed_crashed | skipped_smart_approved.
-    Нет живого воркера на старте → не виснем, сразу отдаём queued + worker_alive=false.
+    Готовый done-ран с покрывающим профилем возвращается сразу (reused, is_final);
+    force=true запускает пере-ресерч. Нет живого воркера на старте → не виснем,
+    сразу отдаём queued + worker_alive=false.
     """
     pool = app.state.pool
+    requested = _resolve_profile_or_400(body.profile)
+
     entries: list[dict] = []
     run_to_entries: dict[int, list[dict]] = {}
 
     # 1) Постановка в очередь (каждый артикул независимо; невалидный не валит остальных).
     for raw in body.articles:
-        entry: dict = {
-            "article": raw, "task_id": None, "run_id": None, "reused": False,
-            "status": None, "result_json": None, "error": None,
-            "needs_review_reason": None, "worker_alive": None, "timed_out": False,
-        }
+        entry = await _submit_entry(pool, raw, requested, body.force)
         entries.append(entry)
-        try:
-            article = pre_validate_article(raw)
-        except ValueError as e:
-            entry.update(status="invalid", error=str(e))
-            continue
-        entry["article"] = article
-
-        finalized = await pool.fetchval(_GUARD_SQL, article)
-        if finalized:
-            entry.update(
-                status="refused",
-                error="already finalized in Smart (is_draft=false); research skipped",
-            )
-            continue
-
-        sub = await submit_article(pool, article)
-        entry.update(task_id=sub["task_id"], run_id=sub["run_id"], reused=sub["reused"], status="queued")
-        run_to_entries.setdefault(sub["run_id"], []).append(entry)
+        # Ждать нужно только раны, которые ещё не терминальны.
+        if entry["run_id"] is not None and not entry["is_final"]:
+            run_to_entries.setdefault(entry["run_id"], []).append(entry)
 
     worker_alive = await count_live_workers(pool) > 0
 
@@ -187,4 +334,4 @@ async def post_research(body: ResearchBody) -> dict:
                     break
                 await asyncio.sleep(POLL_SECONDS)
 
-    return {"worker_alive": worker_alive, "results": entries}
+    return {"worker_alive": worker_alive, "requested_profile": requested, "results": entries}

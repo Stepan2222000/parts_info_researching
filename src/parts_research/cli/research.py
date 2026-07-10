@@ -20,6 +20,7 @@ import sys
 
 from ..db.pool import create_pool
 from ..db.tasks import TERMINAL_STATUSES, count_live_workers, submit_article
+from ..research.profiles import resolve_profile
 from ..research.validation import pre_validate_article
 
 POLL_SECONDS = 1.0
@@ -79,7 +80,7 @@ async def _amain(articles: list[str]) -> None:
                 )
                 continue
 
-            sub = await submit_article(pool, article)
+            sub = await submit_article(pool, article, resolve_profile(None))
             entry.update(
                 article=article, task_id=sub["task_id"], run_id=sub["run_id"],
                 reused=sub["reused"],

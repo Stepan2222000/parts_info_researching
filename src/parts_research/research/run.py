@@ -1,15 +1,25 @@
-"""execute_run — полный research-pipeline одного run'а (фаза 1: 1-3 turn'а,
-фаза 2: агентская). Детерминированный парсинг финального JSON в draft-таблицы.
+"""execute_run — полный research-pipeline одного run'а по профилю этапов:
 
+    main -> family_expansion -> low_confidence -> kit_contents ->
+    price_fallback -> difference -> phase2 (опционален, по умолчанию выключен)
+
+Ядро (main + kit_contents + валидации) не отключается; опциональные этапы
+включает task_runs.profile (см. research/profiles.py). Каждый этап ведёт
+бухгалтерию прогрессивной выдачи: строка в run_turns на старте (running),
+снапшот StructuredResult при успехе (ok) либо текст ошибки (failed), плюс
+исход в task_runs.stage_outcomes — ошибки этапов не скрываем, best-effort
+провал виден потребителю, а не только в логах.
+
+Детерминированный парсинг финального JSON в draft-таблицы — в конце.
 Ошибки не скрываем: каждое исключение -> понятный текст в task_runs.error +
 соответствующий failure-статус. Никаких маскирующих фолбеков."""
 
 from __future__ import annotations
 
 import json
-import re
 import traceback
 from decimal import Decimal
+from typing import Awaitable, Callable
 
 import asyncpg
 from exa_py import AsyncExa
@@ -25,6 +35,7 @@ from .agent_factory import make_research_agent
 from .context import EBAY_PLUGIN_NAME, SMART_PLUGIN_NAME, load_context
 from .errors import NoExactDataError
 from .exa_client import cached_exa_call, pick_fetch, pick_search
+from .profiles import ALL_STAGES, resolve_profile, stage_enabled
 from .prompts import (
     build_difference_query,
     build_difference_user_message,
@@ -74,6 +85,62 @@ async def _finish(pool: asyncpg.Pool, run_id: int, status: str, error: str | Non
     )
 
 
+# ── бухгалтерия прогрессивной выдачи (run_turns + stage_outcomes) ───────────────
+async def _load_profile(pool: asyncpg.Pool, run_id: int) -> dict:
+    """Профиль рана из task_runs.profile. NULL (ран поставлен до деплоя профилей) ->
+    резолвим дефолт и записываем обратно, чтобы ран был самоописанным. Мусор в
+    колонке НЕ глотаем — ValueError уронит ран с текстом (failed_crashed)."""
+    raw = await pool.fetchval("SELECT profile FROM task_runs WHERE id = $1", run_id)
+    profile = resolve_profile(raw)
+    if raw is None:
+        await pool.execute("UPDATE task_runs SET profile = $1 WHERE id = $2", profile, run_id)
+    return profile
+
+
+async def _init_stage_outcomes(pool: asyncpg.Pool, run_id: int, profile: dict) -> None:
+    outcomes = {
+        s: ("pending" if stage_enabled(profile, s) else "skipped_by_profile")
+        for s in ALL_STAGES
+    }
+    await pool.execute(
+        "UPDATE task_runs SET stage_outcomes = $1 WHERE id = $2", outcomes, run_id
+    )
+
+
+async def _set_outcome(pool: asyncpg.Pool, run_id: int, stage: str, outcome: str) -> None:
+    await pool.execute(
+        "UPDATE task_runs SET stage_outcomes = coalesce(stage_outcomes, '{}'::jsonb) || $1 "
+        "WHERE id = $2",
+        {stage: outcome},
+        run_id,
+    )
+
+
+async def _turn_start(pool: asyncpg.Pool, run_id: int, turn_idx: int, stage: str) -> None:
+    await pool.execute(
+        "INSERT INTO run_turns (run_id, turn_idx, stage, status) VALUES ($1, $2, $3, 'running')",
+        run_id, turn_idx, stage,
+    )
+
+
+async def _turn_ok(pool: asyncpg.Pool, run_id: int, turn_idx: int, result: StructuredResult) -> None:
+    await pool.execute(
+        "UPDATE run_turns SET status = 'ok', finished_at = now(), result_json = $1 "
+        "WHERE run_id = $2 AND turn_idx = $3",
+        result.model_dump(mode="json"), run_id, turn_idx,
+    )
+
+
+async def _turn_failed(pool: asyncpg.Pool, run_id: int, turn_idx: int, error: str) -> None:
+    # result_json НЕ трогаем: если этап упал на валидации после снапшота,
+    # снапшот остаётся видимым рядом с текстом ошибки.
+    await pool.execute(
+        "UPDATE run_turns SET status = 'failed', finished_at = now(), error = $1 "
+        "WHERE run_id = $2 AND turn_idx = $3",
+        error, run_id, turn_idx,
+    )
+
+
 async def _smart_already_approved(pool: asyncpg.Pool, article: str) -> str | None:
     """Гейт: если артикул уже есть в smart.parts с is_unverified=false (состав сверён
     человеком) или is_draft=false (запись финализирована) — research не нужен, задачу
@@ -90,180 +157,13 @@ async def _smart_already_approved(pool: asyncpg.Pool, article: str) -> str | Non
 
 
 def _needs_review_reason(r: StructuredResult) -> str | None:
-    reasons: list[str] = []
+    # kit-без-состава больше НЕ needs_review — это критический failed_validation
+    # (см. kit-гейт в execute_run).
     if not r.vehicle_classes:
-        reasons.append("vehicle_classes_unknown")
-    if r.is_kit and not r.kit_contents:
-        reasons.append("kit_without_contents")
-    return "; ".join(reasons) if reasons else None
+        return "vehicle_classes_unknown"
+    return None
 
 
-# ── фаза 1 ──────────────────────────────────────────────────────────────────────
-async def _phase1(
-    pool: asyncpg.Pool,
-    run_id: int,
-    article: str,
-    context,
-    session: PostgresSession,
-    system_prompt: str,
-    exa: AsyncExa,
-) -> tuple[StructuredResult, int]:
-    agent = make_research_agent(system_prompt)
-    preamble = build_user_preamble(context)
-
-    def validate(r: StructuredResult) -> None:
-        post_validate(
-            r,
-            expected_part_number=article,
-            allowed_brands=context.allowed_brands,
-            allowed_vehicle_classes=context.allowed_vehicle_classes,
-        )
-
-    # Turn 1 — основной Exa.
-    log("[phase1] turn 1 — main Exa")
-    raw = await cached_exa_call(
-        pool, exa, "web_search_exa",
-        {"query": build_main_query(article), "num_results": 10},
-        run_id=run_id, phase="main",
-    )
-    picked = json.dumps(pick_search(raw), ensure_ascii=False)
-    substring_check(article, picked)
-    current = await run_streamed_and_persist(
-        agent, build_main_user_message(article, picked), session, pool, run_id, 1, preamble=preamble
-    )
-    await _write_result(pool, run_id, current)
-    validate(current)
-    turn = 1
-
-    # Turn 2 — family-expansion (если у turn 1 есть подтверждённые кроссы):
-    # засеваем поиск самими ПОДТВЕРЖДЁННЫМИ кроссами (не входным артикулом), чтобы
-    # добрать пропущенных «соседей» по семейству преемственности. substring_check на
-    # входной артикул тут НЕ зовём — на страницах-родственниках его законно может не
-    # быть. Highlights only: полный текст при нужде дотянет агент в фазе 2.
-    crosses = [a.article for a in current.numbers.article if a.article != article]
-    if crosses:
-        turn += 1
-        log(f"[phase1] turn {turn} — family_expansion: {crosses}")
-        raw_fam = await cached_exa_call(
-            pool, exa, "web_search_exa",
-            {"query": build_family_query(crosses), "num_results": 10},
-            run_id=run_id, phase="family_expansion",
-        )
-        picked_fam = json.dumps(pick_search(raw_fam), ensure_ascii=False)
-        msg_fam = build_family_user_message(article, picked_fam, current.model_dump_json(indent=2))
-        current = await run_streamed_and_persist(agent, msg_fam, session, pool, run_id, turn, preamble=preamble)
-        await _write_result(pool, run_id, current)
-        validate(current)
-
-    # low_confidence (если есть): пере-классификация уже известных сомнительных
-    # номеров — список берём из ОБНОВЛЁННОГО после family результата.
-    low_conf = [a.article for a in current.numbers.article_low_confidence]
-    if low_conf:
-        turn += 1
-        log(f"[phase1] turn {turn} — low_confidence: {low_conf}")
-        raw2 = await cached_exa_call(
-            pool, exa, "web_search_exa",
-            {"query": build_low_confidence_query(article, low_conf), "num_results": 10},
-            run_id=run_id, phase="low_confidence",
-        )
-        picked2 = json.dumps(pick_search(raw2), ensure_ascii=False)
-        msg2 = build_low_confidence_user_message(picked2, current.model_dump_json(indent=2))
-        current = await run_streamed_and_persist(agent, msg2, session, pool, run_id, turn, preamble=preamble)
-        await _write_result(pool, run_id, current)
-        validate(current)
-
-    # kit_contents (если is_kit).
-    if current.is_kit:
-        turn += 1
-        log(f"[phase1] turn {turn} — kit_contents")
-        confirmed = [a.article for a in current.numbers.article]
-        raw3 = await cached_exa_call(
-            pool, exa, "web_search_exa",
-            {"query": build_kit_contents_query(article, confirmed), "num_results": 10},
-            run_id=run_id, phase="kit_contents",
-        )
-        picked3 = json.dumps(pick_search(raw3), ensure_ascii=False)
-        substring_check(article, picked3)
-        msg3 = build_kit_contents_user_message(picked3, current.model_dump_json(indent=2))
-        current = await run_streamed_and_persist(agent, msg3, session, pool, run_id, turn, preamble=preamble)
-        await _write_result(pool, run_id, current)
-        validate(current)
-
-    return current, turn
-
-
-# ── ценовой фолбэк (если в turn-1 валидных us_prices не нашлось) ─────────────────
-async def _price_fallback(
-    pool: asyncpg.Pool,
-    run_id: int,
-    article: str,
-    context,
-    session: PostgresSession,
-    system_prompt: str,
-    exa: AsyncExa,
-    current: StructuredResult,
-    turn: int,
-) -> StructuredResult:
-    """Отдельный ценовой turn: фокусный US-запрос с полным текстом страниц
-    (user_location=US, contents=text) -> агент заполняет us_prices. Не трогает кэш
-    основного поиска (отдельный ключ). Остальные поля JSON агент сохраняет."""
-    log("[price] fallback price search (turn-1 us_prices пуст)")
-    agent = make_research_agent(system_prompt)
-    preamble = build_user_preamble(context)
-    hint = current.name_en or (current.brand_oem[0] if current.brand_oem else "")
-    raw = await cached_exa_call(
-        pool, exa, "web_search_exa",
-        {"query": build_price_query(article, hint), "num_results": 8,
-         "type": "keyword", "contents": "text", "user_location": "US"},
-        run_id=run_id, phase="price_fallback",
-    )
-    picked = json.dumps(pick_fetch(raw, 4000), ensure_ascii=False)
-    msg = build_price_user_message(article, picked, current.model_dump_json(indent=2))
-    result = await run_streamed_and_persist(agent, msg, session, pool, run_id, turn, preamble=preamble)
-    await _write_result(pool, run_id, result)
-    post_validate(
-        result,
-        expected_part_number=article,
-        allowed_brands=context.allowed_brands,
-        allowed_vehicle_classes=context.allowed_vehicle_classes,
-    )
-    log(f"[price] us_prices after fallback: {len(result.us_prices)}")
-    return result
-
-
-# ── фаза 2 ──────────────────────────────────────────────────────────────────────
-async def _phase2(
-    pool: asyncpg.Pool,
-    run_id: int,
-    article: str,
-    context,
-    session: PostgresSession,
-    system_prompt: str,
-    exa: AsyncExa,
-    current: StructuredResult,
-    last_turn: int,
-) -> StructuredResult:
-    log("[phase2] agent-driven free search")
-    agent = make_research_agent(system_prompt, tools=[web_search_exa, web_fetch_exa])
-    ctx = Phase2Ctx(pool=pool, exa=exa, run_id=run_id)
-    preamble = build_user_preamble(context)
-    msg = build_phase2_user_message(article, current.model_dump_json(indent=2), PHASE2_EXA_LIMIT)
-    turn = last_turn + 1
-    result = await run_streamed_and_persist(
-        agent, msg, session, pool, run_id, turn, context=ctx, max_turns=PHASE2_MAX_TURNS, preamble=preamble
-    )
-    await _write_result(pool, run_id, result)
-    log(f"[phase2] exa_calls used: {ctx.exa_calls}/{ctx.limit}")
-    post_validate(
-        result,
-        expected_part_number=article,
-        allowed_brands=context.allowed_brands,
-        allowed_vehicle_classes=context.allowed_vehicle_classes,
-    )
-    return result
-
-
-# ── финальный difference-turn ───────────────────────────────────────────────────
 def _distinct_numbers(arts: list[str]) -> list[str]:
     """Точный дедуп (case-insensitive по полной строке), сохраняя порядок.
     Дефисы/символы НЕ трогаем: убираем только буквальные повторы, разные номера
@@ -276,54 +176,6 @@ def _distinct_numbers(arts: list[str]) -> list[str]:
             seen.add(key)
             out.append(a)
     return out
-
-
-async def _difference_turn(
-    pool: asyncpg.Pool,
-    run_id: int,
-    article: str,
-    context,
-    session: PostgresSession,
-    system_prompt: str,
-    exa: AsyncExa,
-    current: StructuredResult,
-    turn: int,
-) -> StructuredResult:
-    """На ПОДТВЕРЖДЁННЫХ кроссах ищем нюансы между номерами: порядок замен
-    (supersession), границы детали (part_caveats), пер-артикульные note. И при OEM-
-    пруфе разводим случайно смешанные чужие номера (confirmed -> irrelevant/low).
-    Запускается, только если есть что сравнивать (>=2 различных confirmed-номера)."""
-    confirmed = _distinct_numbers([a.article for a in current.numbers.article])
-    if len(confirmed) < 2:
-        log("[difference] <2 distinct confirmed numbers — нечего сравнивать, пропуск")
-        return current
-    log(f"[difference] turn {turn} — {len(confirmed)} distinct confirmed")
-    agent = make_research_agent(system_prompt)
-    preamble = build_user_preamble(context)
-    raw = await cached_exa_call(
-        pool, exa, "web_search_exa",
-        {"query": build_difference_query(confirmed), "num_results": 10},
-        run_id=run_id, phase="difference",
-    )
-    picked = json.dumps(pick_search(raw), ensure_ascii=False)
-    msg = build_difference_user_message(article, picked, current.model_dump_json(indent=2))
-    result = await run_streamed_and_persist(agent, msg, session, pool, run_id, turn, preamble=preamble)
-    # Порядок замен — ТОЛЬКО среди подтверждённых номеров: режем рёбра, у которых
-    # любой конец вне numbers.article (так из порядка выпадают сомнительные выкопанные
-    # номера, напр. SKU тюнинг-магазинов вроде Weddle).
-    confirmed_set = {a.article for a in result.numbers.article}
-    result.supersession = [
-        e for e in result.supersession if e.newer in confirmed_set and e.older in confirmed_set
-    ]
-    await _write_result(pool, run_id, result)
-    post_validate(
-        result,
-        expected_part_number=article,
-        allowed_brands=context.allowed_brands,
-        allowed_vehicle_classes=context.allowed_vehicle_classes,
-    )
-    log(f"[difference] nuances={len(result.nuances)} supersession={len(result.supersession)}")
-    return result
 
 
 # ── парсинг финального JSON -> draft-таблицы ───────────────────────────────────
@@ -492,8 +344,8 @@ async def _validate_article_formats(pool: asyncpg.Pool, run_id: int) -> list[str
 
 # ── главная функция ──────────────────────────────────────────────────────────────
 async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
-    """Гонит run целиком. Возвращает финальный статус. Текст любой ошибки
-    записан в task_runs.error и пробрасывается наверх (failed_crashed) либо
+    """Гонит run целиком по профилю этапов. Возвращает финальный статус. Текст любой
+    ошибки записан в task_runs.error и пробрасывается наверх (failed_crashed) либо
     отражён в статусе (failed_no_data/failed_validation)."""
     # Гейт «smart уже утверждён»: закрываем до запуска research, без траты модели.
     gate = await _smart_already_approved(pool, article)
@@ -501,7 +353,11 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
         await _finish(pool, run_id, "skipped_smart_approved", gate)
         log(f"[skip] run {run_id} -> skipped_smart_approved ({gate})")
         return "skipped_smart_approved"
+
+    profile = await _load_profile(pool, run_id)
+    await _init_stage_outcomes(pool, run_id, profile)
     await _set_running(pool, run_id)
+    log(f"[run {run_id}] profile={profile['preset']} stages={profile['stages']}")
     try:
         context = await load_context(pool, article)
         if context.smart_payload is not None:
@@ -520,38 +376,216 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
         session = PostgresSession(f"research_run_{run_id}", pool)
         system_prompt = build_system_prompt(context)
         exa = AsyncExa(api_key=settings.exa_api_key)
+        agent = make_research_agent(system_prompt)
+        preamble = build_user_preamble(context)
 
-        current, last_turn = await _phase1(
-            pool, run_id, article, context, session, system_prompt, exa
-        )
-        # Фаза 1 — ядро (результат уже валиден и записан). Ценовой фолбэк и фаза 2 —
-        # best-effort дозаполнение: их падение (квота/лимит провайдера, обрыв тулов и т.п.)
-        # НЕ должно терять готовый результат фазы 1 — ловим и идём дальше с current.
-        if not current.us_prices:
-            last_turn += 1
+        current: StructuredResult | None = None
+        turn = 0
+
+        def validate(r: StructuredResult) -> None:
+            post_validate(
+                r,
+                expected_part_number=article,
+                allowed_brands=context.allowed_brands,
+                allowed_vehicle_classes=context.allowed_vehicle_classes,
+            )
+
+        async def run_stage(
+            stage: str,
+            fn: Callable[[int], Awaitable[StructuredResult]],
+            *,
+            best_effort: bool,
+        ) -> bool:
+            """Один этап с бухгалтерией: run_turns (running -> ok+snapshot / failed+error)
+            и stage_outcomes. persist-then-validate: снапшот и result_json пишутся ДО
+            post_validate, провал валидации помечает этап failed (снапшот остаётся видим).
+            best_effort=True — провал не валит ран, но исход виден как 'failed: ...'."""
+            nonlocal current, turn
+            turn += 1
+            await _turn_start(pool, run_id, turn, stage)
+            await _set_outcome(pool, run_id, stage, "running")
+            log(f"[{stage}] turn {turn}")
             try:
-                current = await _price_fallback(
-                    pool, run_id, article, context, session, system_prompt, exa, current, last_turn
+                result = await fn(turn)
+                await _turn_ok(pool, run_id, turn, result)
+                await _write_result(pool, run_id, result)
+                validate(result)
+                current = result
+                await _set_outcome(pool, run_id, stage, "ok")
+                return True
+            except Exception as e:  # noqa: BLE001 — исход этапа фиксируем всегда
+                msg = f"{type(e).__name__}: {e}"
+                await _turn_failed(pool, run_id, turn, msg)
+                await _set_outcome(pool, run_id, stage, f"failed: {msg}")
+                if not best_effort:
+                    raise
+                log(f"[{stage}] failed (non-fatal, keeping prior result): {msg}")
+                return False
+
+        # ── main (ядро, всегда) ────────────────────────────────────────────────
+        async def stage_main(turn_idx: int) -> StructuredResult:
+            raw = await cached_exa_call(
+                pool, exa, "web_search_exa",
+                {"query": build_main_query(article), "num_results": 10},
+                run_id=run_id, phase="main",
+            )
+            picked = json.dumps(pick_search(raw), ensure_ascii=False)
+            substring_check(article, picked)
+            return await run_streamed_and_persist(
+                agent, build_main_user_message(article, picked), session, pool, run_id,
+                turn_idx, preamble=preamble,
+            )
+
+        await run_stage("main", stage_main, best_effort=False)
+        assert current is not None  # main строг: сюда доходим только с результатом
+
+        # ── family_expansion (если есть подтверждённые кроссы) ────────────────
+        # Засеваем поиск самими ПОДТВЕРЖДЁННЫМИ кроссами (не входным артикулом),
+        # чтобы добрать пропущенных «соседей» по семейству. substring_check на
+        # входной артикул тут НЕ зовём — на страницах-родственниках его законно
+        # может не быть.
+        if stage_enabled(profile, "family_expansion"):
+            crosses = [a.article for a in current.numbers.article if a.article != article]
+            if not crosses:
+                await _set_outcome(pool, run_id, "family_expansion", "not_applicable")
+            else:
+                async def stage_family(turn_idx: int) -> StructuredResult:
+                    raw = await cached_exa_call(
+                        pool, exa, "web_search_exa",
+                        {"query": build_family_query(crosses), "num_results": 10},
+                        run_id=run_id, phase="family_expansion",
+                    )
+                    picked = json.dumps(pick_search(raw), ensure_ascii=False)
+                    msg = build_family_user_message(article, picked, current.model_dump_json(indent=2))
+                    return await run_streamed_and_persist(
+                        agent, msg, session, pool, run_id, turn_idx, preamble=preamble
+                    )
+
+                await run_stage("family_expansion", stage_family, best_effort=False)
+
+        # ── low_confidence (если есть сомнительные номера) ─────────────────────
+        if stage_enabled(profile, "low_confidence"):
+            low_conf = [a.article for a in current.numbers.article_low_confidence]
+            if not low_conf:
+                await _set_outcome(pool, run_id, "low_confidence", "not_applicable")
+            else:
+                async def stage_low_conf(turn_idx: int) -> StructuredResult:
+                    raw = await cached_exa_call(
+                        pool, exa, "web_search_exa",
+                        {"query": build_low_confidence_query(article, low_conf), "num_results": 10},
+                        run_id=run_id, phase="low_confidence",
+                    )
+                    picked = json.dumps(pick_search(raw), ensure_ascii=False)
+                    msg = build_low_confidence_user_message(picked, current.model_dump_json(indent=2))
+                    return await run_streamed_and_persist(
+                        agent, msg, session, pool, run_id, turn_idx, preamble=preamble
+                    )
+
+                await run_stage("low_confidence", stage_low_conf, best_effort=False)
+
+        # ── kit_contents (ядро; гонится только для наборов) ───────────────────
+        if not current.is_kit:
+            await _set_outcome(pool, run_id, "kit_contents", "not_applicable")
+        else:
+            async def stage_kit(turn_idx: int) -> StructuredResult:
+                confirmed = [a.article for a in current.numbers.article]
+                raw = await cached_exa_call(
+                    pool, exa, "web_search_exa",
+                    {"query": build_kit_contents_query(article, confirmed), "num_results": 10},
+                    run_id=run_id, phase="kit_contents",
                 )
-            except Exception as e:  # noqa: BLE001 — best-effort, не валим run
-                log(f"[price] fallback failed (non-fatal): {type(e).__name__}: {e}")
-        try:
-            current = await _phase2(
-                pool, run_id, article, context, session, system_prompt, exa, current, last_turn
-            )
-        except Exception as e:  # noqa: BLE001 — best-effort, оставляем результат фазы 1
-            log(f"[phase2] failed (non-fatal), keeping pre-phase2 result: {type(e).__name__}: {e}")
+                picked = json.dumps(pick_search(raw), ensure_ascii=False)
+                substring_check(article, picked)
+                msg = build_kit_contents_user_message(picked, current.model_dump_json(indent=2))
+                return await run_streamed_and_persist(
+                    agent, msg, session, pool, run_id, turn_idx, preamble=preamble
+                )
 
-        # Финальный difference-turn — нюансы между подтверждёнными кроссами
-        # (supersession/part_caveats/note + разводка чужих номеров). Best-effort:
-        # падение НЕ теряет готовый результат.
-        try:
-            current = await _difference_turn(
-                pool, run_id, article, context, session, system_prompt, exa, current, last_turn + 2
-            )
-        except Exception as e:  # noqa: BLE001 — best-effort
-            log(f"[difference] failed (non-fatal), keeping prior result: {type(e).__name__}: {e}")
+            await run_stage("kit_contents", stage_kit, best_effort=False)
 
+        # Kit-гейт: набор без состава — критический фейл рана (НЕ needs_review).
+        if current.is_kit and not current.kit_contents:
+            raise ValueError(
+                "kit without contents: is_kit=true, but kit_contents is empty after kit_contents stage"
+            )
+
+        # ── price_fallback (если включён и turn-цены пусты) ────────────────────
+        # Отдельный ценовой turn: фокусный US-запрос с полным текстом страниц
+        # (user_location=US, contents=text) -> агент заполняет us_prices. Не трогает
+        # кэш основного поиска (отдельный ключ). Best-effort: провал не валит ран.
+        if stage_enabled(profile, "price_fallback"):
+            if current.us_prices:
+                await _set_outcome(pool, run_id, "price_fallback", "not_applicable")
+            else:
+                async def stage_price(turn_idx: int) -> StructuredResult:
+                    hint = current.name_en or (current.brand_oem[0] if current.brand_oem else "")
+                    raw = await cached_exa_call(
+                        pool, exa, "web_search_exa",
+                        {"query": build_price_query(article, hint), "num_results": 8,
+                         "type": "keyword", "contents": "text", "user_location": "US"},
+                        run_id=run_id, phase="price_fallback",
+                    )
+                    picked = json.dumps(pick_fetch(raw, 4000), ensure_ascii=False)
+                    msg = build_price_user_message(article, picked, current.model_dump_json(indent=2))
+                    return await run_streamed_and_persist(
+                        agent, msg, session, pool, run_id, turn_idx, preamble=preamble
+                    )
+
+                if await run_stage("price_fallback", stage_price, best_effort=True):
+                    log(f"[price_fallback] us_prices: {len(current.us_prices)}")
+
+        # ── difference (если включён и есть что сравнивать) ────────────────────
+        # На ПОДТВЕРЖДЁННЫХ кроссах ищем нюансы между номерами: порядок замен
+        # (supersession), нюансы (nuances) и разводку случайно смешанных чужих
+        # номеров. Идёт ДО phase2 — нюансы уходят потребителю раньше; phase2 —
+        # чистое дозаполнение. Best-effort.
+        if stage_enabled(profile, "difference"):
+            confirmed_distinct = _distinct_numbers([a.article for a in current.numbers.article])
+            if len(confirmed_distinct) < 2:
+                await _set_outcome(pool, run_id, "difference", "not_applicable")
+                log("[difference] <2 distinct confirmed numbers — нечего сравнивать, пропуск")
+            else:
+                async def stage_difference(turn_idx: int) -> StructuredResult:
+                    raw = await cached_exa_call(
+                        pool, exa, "web_search_exa",
+                        {"query": build_difference_query(confirmed_distinct), "num_results": 10},
+                        run_id=run_id, phase="difference",
+                    )
+                    picked = json.dumps(pick_search(raw), ensure_ascii=False)
+                    msg = build_difference_user_message(article, picked, current.model_dump_json(indent=2))
+                    result = await run_streamed_and_persist(
+                        agent, msg, session, pool, run_id, turn_idx, preamble=preamble
+                    )
+                    # Порядок замен — ТОЛЬКО среди подтверждённых номеров: режем рёбра,
+                    # у которых любой конец вне numbers.article (сомнительные выкопанные
+                    # номера, напр. SKU тюнинг-магазинов, в порядок не идут).
+                    confirmed_set = {a.article for a in result.numbers.article}
+                    result.supersession = [
+                        e for e in result.supersession
+                        if e.newer in confirmed_set and e.older in confirmed_set
+                    ]
+                    return result
+
+                if await run_stage("difference", stage_difference, best_effort=True):
+                    log(f"[difference] nuances={len(current.nuances)} supersession={len(current.supersession)}")
+
+        # ── phase2 (опционален, по умолчанию выключен) ─────────────────────────
+        # Агентский свободный добор пробелов со своими Exa-тулами. Best-effort.
+        if stage_enabled(profile, "phase2"):
+            async def stage_phase2(turn_idx: int) -> StructuredResult:
+                phase2_agent = make_research_agent(system_prompt, tools=[web_search_exa, web_fetch_exa])
+                ctx = Phase2Ctx(pool=pool, exa=exa, run_id=run_id)
+                msg = build_phase2_user_message(article, current.model_dump_json(indent=2), PHASE2_EXA_LIMIT)
+                result = await run_streamed_and_persist(
+                    phase2_agent, msg, session, pool, run_id, turn_idx,
+                    context=ctx, max_turns=PHASE2_MAX_TURNS, preamble=preamble,
+                )
+                log(f"[phase2] exa_calls used: {ctx.exa_calls}/{ctx.limit}")
+                return result
+
+            await run_stage("phase2", stage_phase2, best_effort=True)
+
+        # ── финализация: draft + формат-валидация + статус ─────────────────────
         reason = _needs_review_reason(current)
         # persist-then-validate: сперва пишем draft (всегда), затем формат-валидация
         # читает записанные артикулы и фиксирует проблемы (FK на draft_part_articles).
