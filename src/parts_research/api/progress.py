@@ -46,13 +46,18 @@ _FIELD_RU = {
 
 
 def sections_of(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Снапшот StructuredResult -> плоский словарь секций (numbers.* отдельно)."""
+    """Снапшот StructuredResult -> плоский словарь секций (numbers.* отдельно).
+
+    Списковые секции нормализуются: отсутствие секции == пустой список — иначе
+    дельта от пустого baseline ({}) помечала бы пустые списки как «изменение»."""
     out: dict[str, Any] = {}
-    for k in SCALAR_SECTIONS + OBJECT_SECTIONS + LIST_SECTIONS:
+    for k in SCALAR_SECTIONS + OBJECT_SECTIONS:
         out[k] = snapshot.get(k)
+    for k in LIST_SECTIONS:
+        out[k] = snapshot.get(k) or []
     numbers = snapshot.get("numbers") or {}
     for b in NUMBER_BUCKETS:
-        out[f"numbers.{b}"] = numbers.get(b, [])
+        out[f"numbers.{b}"] = numbers.get(b) or []
     return out
 
 
@@ -182,8 +187,9 @@ async def load_turns_payload(
     mode='delta'    — изменившиеся секции от состояния на турне `since` к последнему
                       ok-снапшоту (слитая дельта; since=0 — от пустого состояния).
     mode='snapshot' — полный текущий снапшот.
-    Курсор потребителя = latest_turn из ответа (макс. turn_idx, включая failed-турны,
-    чтобы упавший последним этап не отдавался бесконечно).
+    Курсор потребителя = latest_turn из ответа: макс. turn_idx ЗАВЕРШЁННЫХ турнов
+    (ok И failed — чтобы упавший последним этап не отдавался бесконечно; running
+    не входит — его снапшота ещё нет, курсор не должен его перепрыгивать).
 
     Legacy-раны (до run_turns): turns=[], latest_turn=0, снапшот — финальный
     result_json рана, дельта считается от пустого состояния к нему.
@@ -199,7 +205,12 @@ async def load_turns_payload(
     turn_rows = await pool.fetch(_TURNS_SQL, run_id)
 
     legacy = not turn_rows and run["result_json"] is not None and run["status"] in TERMINAL_STATUSES
-    latest_turn = max((t["turn_idx"] for t in turn_rows), default=0)
+    # Курсор двигают только ЗАВЕРШЁННЫЕ турны (ok/failed). Running-турн в latest_turn
+    # не входит: его снапшота ещё нет, и потребитель, взяв его idx как курсор,
+    # навсегда перепрыгнул бы содержимое этого турна.
+    latest_turn = max(
+        (t["turn_idx"] for t in turn_rows if t["status"] in ("ok", "failed")), default=0
+    )
     if since > latest_turn:
         raise ValueError(
             f"since={since} is ahead of latest_turn={latest_turn} for run {run_id}; "
