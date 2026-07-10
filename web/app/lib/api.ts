@@ -29,12 +29,104 @@ export const TERMINAL_STATUSES: RunStatus[] = [
 ];
 export const isTerminal = (s: string): boolean => (TERMINAL_STATUSES as string[]).includes(s);
 
+// ── профили этапов и прогресс ────────────────────────────────────────────────
+export interface Profile {
+  preset: string;          // fast | default | full | custom
+  stages: string[];        // включённые ОПЦИОНАЛЬНЫЕ этапы
+}
+
+export const PRESET_LABEL: Record<string, string> = {
+  fast: "Быстрый",
+  default: "Стандарт",
+  full: "Полный",
+  custom: "Кастомный",
+};
+
+// Порядок = порядок исполнения пайплайна.
+export const ALL_STAGES = [
+  "main", "family_expansion", "low_confidence", "kit_contents",
+  "price_fallback", "difference", "phase2",
+] as const;
+
+export const STAGE_LABEL: Record<string, string> = {
+  main: "Основной поиск",
+  family_expansion: "Семейство кроссов",
+  low_confidence: "Сомнительные номера",
+  kit_contents: "Состав набора",
+  price_fallback: "Цены US",
+  difference: "Нюансы и замены",
+  phase2: "Свободный добор",
+};
+
+// Исход этапа: ok | pending | running | not_applicable | skipped_by_profile | "failed: <текст>"
+export type StageOutcomes = Record<string, string>;
+
+export interface TurnRow {
+  turn_idx: number;
+  stage: string;
+  status: "running" | "ok" | "failed";
+  started_at: string | null;
+  finished_at: string | null;
+  duration_s: number | null;
+  error: string | null;
+  summary: string | null;   // русская сводка «что нового» (у ok-турнов)
+}
+
+export interface TurnsPayload {
+  run_id: number;
+  task_id: number;
+  article: string;
+  status: RunStatus;
+  is_final: boolean;
+  error: string | null;
+  profile: Profile | null;
+  stage_outcomes: StageOutcomes | null;
+  progress: { current_stage: string | null; turns_done: number; queue_position: number | null };
+  latest_turn: number;
+  legacy_run: boolean;
+  turns: TurnRow[];
+  delta: { changed: Record<string, unknown>; summary: string } | null;
+  snapshot: StructuredSnapshot | null;
+}
+
+// Форма result_json/снапшота (StructuredResult) — только то, что рендерит UI.
+export interface StructuredSnapshot {
+  task_part_number?: string;
+  name?: string | null;
+  name_en?: string | null;
+  brand_oem?: string[];
+  vehicle_classes?: string[];
+  description?: string | null;
+  description_en?: string | null;
+  weight?: { kg: number; source_url: string; evidence: string } | null;
+  models?: { text: string; source_urls: string[]; evidence: string } | null;
+  is_kit?: boolean;
+  kit_contents?: {
+    article: string | null; name: string; name_en: string | null; quantity: number | null;
+    description: string | null; description_en: string | null; source_url: string; evidence: string;
+  }[];
+  part_of_kits?: { kit_article: string | null; kit_name: string | null; source_url: string; evidence: string }[];
+  numbers?: {
+    article?: { article: string; source_url: string; evidence: string }[];
+    article_low_confidence?: { article: string; source_url: string; evidence: string; why_low_confidence: string }[];
+    irrelevant?: { article: string; source_url: string; evidence: string; why_irrelevant: string }[];
+  };
+  us_prices?: {
+    site: string; price: number; currency: string | null; url: string;
+    article: string; in_stock: boolean | null; evidence: string;
+  }[];
+  nuances?: Nuance[];
+  supersession?: SupersessionEdge[];
+}
+
 export interface TaskCard {
   task_id: number;
   article: string;
   run_id: number;
   status: RunStatus;
   error: string | null;
+  profile: Profile | null;
+  current_stage: string | null;   // running-этап (для чипа прогресса)
   created_at: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -102,7 +194,9 @@ export interface RunDetail {
   article: string;
   status: RunStatus;
   error: string | null;
-  result_json: unknown;
+  profile: Profile | null;
+  stage_outcomes: StageOutcomes | null;
+  result_json: StructuredSnapshot | null;
   created_at: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -157,13 +251,19 @@ async function jget<T>(url: string): Promise<T> {
 
 export const getQueue = () => jget<QueueData>("/api/queue");
 export const getRun = (id: number) => jget<RunDetail>(`/api/runs/${id}`);
+// Живой прогресс: снапшот всегда полный (UI не ведёт курсор — простая замена состояния).
+export const getRunTurns = (id: number) =>
+  jget<TurnsPayload>(`/api/runs/${id}/turns?since=0&mode=snapshot`);
 export const getSessions = () => jget<{ sessions: SessionSummary[] }>("/api/curator/sessions");
 
-export async function submitArticles(articles: string[]): Promise<{ worker_alive: boolean; results: SubmitResult[] }> {
+export async function submitArticles(
+  articles: string[],
+  profile?: Profile | string | null,
+): Promise<{ worker_alive: boolean; results: SubmitResult[] }> {
   const r = await fetch("/api/tasks", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ articles }),
+    body: JSON.stringify(profile != null ? { articles, profile } : { articles }),
   });
   if (!r.ok) throw new Error(`/api/tasks → ${r.status} ${await r.text()}`);
   return r.json();

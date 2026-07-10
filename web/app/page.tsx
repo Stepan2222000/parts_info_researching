@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getQueue, submitArticles, STATUS_LABEL, STATUS_ORDER, type QueueData, type RunStatus, type TaskCard as TaskCardData } from "@/lib/api";
+import { getQueue, submitArticles, STATUS_LABEL, STATUS_ORDER, type Profile, type QueueData, type RunStatus, type TaskCard as TaskCardData } from "@/lib/api";
 import { Rail, WorkerStatus } from "@/components/Rail";
 import { AddTasks } from "@/components/AddTasks";
 import { TaskCard } from "@/components/TaskCard";
@@ -54,8 +54,9 @@ export default function Dashboard() {
   }, []);
 
   // Ретрай: повторный submit того же артикула → submit_article создаёт новый run.
-  const retry = useCallback(async (article: string) => {
-    try { await submitArticles([article]); setErr(null); }
+  // Профиль наследуется от исходного рана («повторить то же исследование»).
+  const retry = useCallback(async (article: string, profile: Profile | null) => {
+    try { await submitArticles([article], profile ?? undefined); setErr(null); }
     catch (e) { setErr(String(e)); }
     refresh();
   }, [refresh]);
@@ -65,6 +66,19 @@ export default function Dashboard() {
     timer.current = setInterval(refresh, 2000);
     return () => { if (timer.current) clearInterval(timer.current); };
   }, [refresh]);
+
+  // Deep-link на ран: ?run=123 открывает панель (можно шарить ссылку/возвращаться
+  // с другого компа). URL обновляем без перезагрузки и без записи в history.
+  useEffect(() => {
+    const fromUrl = new URLSearchParams(window.location.search).get("run");
+    if (fromUrl && /^\d+$/.test(fromUrl)) setOpenRun(Number(fromUrl));
+  }, []);
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (openRun != null) url.searchParams.set("run", String(openRun));
+    else url.searchParams.delete("run");
+    window.history.replaceState(null, "", url);
+  }, [openRun]);
 
   const counts = data?.counts ?? {};
   const total = Object.values(counts).reduce((a, b) => a + b, 0);

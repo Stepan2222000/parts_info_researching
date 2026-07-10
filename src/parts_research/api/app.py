@@ -26,7 +26,9 @@ from ..config import settings
 from ..curator.agent_factory import build_curator_system_prompt, make_curator_agent
 from ..db.pool import create_pool
 from ..db.tasks import count_live_workers, submit_article
+from ..research.profiles import resolve_profile
 from ..research.validation import pre_validate_article
+from .progress import load_turns_payload
 from .queries import load_queue, load_run_detail
 from .sse import curator_event_stream
 
@@ -71,6 +73,9 @@ app.add_middleware(
 # ── модели запросов ──────────────────────────────────────────────────────────
 class TasksBody(BaseModel):
     articles: list[str]
+    # Пресет ('fast'|'default'|'full') либо {"stages": [...]}; None = default.
+    # Ретрай из UI передаёт профиль исходного рана — «повторить то же исследование».
+    profile: str | dict | None = None
 
 
 class CuratorMessageBody(BaseModel):
@@ -91,8 +96,14 @@ async def post_tasks(body: TasksBody) -> dict:
 
     Ничего не ждёт (в отличие от cli.research) — прогресс UI читает через polling
     /queue и /runs/{id}. Невалидный/финализированный артикул не валит остальных.
+    Reuse готовых done-ранов тут НЕТ намеренно: постановку из UI делает человек,
+    повторный submit = осознанный пере-ресерч.
     """
     pool = app.state.pool
+    try:
+        profile = resolve_profile(body.profile)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     results: list[dict] = []
     for raw in body.articles:
         try:
@@ -109,7 +120,7 @@ async def post_tasks(body: TasksBody) -> dict:
                             "task_id": None, "run_id": None, "reused": False})
             continue
 
-        sub = await submit_article(pool, article)
+        sub = await submit_article(pool, article, profile)
         results.append({"article": article, "status": "queued", "error": None,
                         "task_id": sub["task_id"], "run_id": sub["run_id"], "reused": sub["reused"]})
 
@@ -133,6 +144,19 @@ async def get_run(run_id: int) -> dict:
     if detail is None:
         raise HTTPException(status_code=404, detail=f"run {run_id} not found")
     return detail
+
+
+# ── прогресс run'а по турнам (живой таймлайн + дельты; тот же payload, что в
+#    публичном /research/{run_id}/turns) ─────────────────────────────────────────
+@app.get("/runs/{run_id}/turns")
+async def get_run_turns(run_id: int, since: int = 0, mode: str = "delta") -> dict:
+    try:
+        payload = await load_turns_payload(app.state.pool, run_id, since=since, mode=mode)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+    return payload
 
 
 # ── сессии куратора ───────────────────────────────────────────────────────────
