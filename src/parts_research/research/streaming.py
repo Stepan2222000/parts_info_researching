@@ -17,10 +17,12 @@ from typing import Any
 import asyncpg
 import httpx
 from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
+from pydantic import ValidationError
 
 from agents import Runner
 from agents.memory.session import SessionABC
 
+from .errors import StructuredOutputInvalid
 from .schema import StructuredResult
 
 TURN_NETWORK_RETRIES = 2
@@ -41,24 +43,30 @@ def _parse_structured_result(raw: Any) -> StructuredResult:
     """Финальный вывод модели -> StructuredResult. Эндпоинт не применяет
     response_format, поэтому модель отдаёт JSON (часто в markdown-обёртке) как текст.
 
-    ВАЖНО: текущая модель **gpt-5.5** регулярно приклеивает в конце ЛИШНИЙ мусор —
+    ВАЖНО: текущая модель **gpt-5.6-terra** регулярно приклеивает в конце ЛИШНИЙ мусор —
     чаще всего лишнюю закрывающую `}` (хвосты вида `}]} }` / `}]}}\\n`), иногда текст.
     Поэтому НЕ берём «от первой { до последней }» (rfind захватывал бы эту лишнюю
     скобку -> pydantic json_invalid: trailing characters -> потеря валидного run'а).
     Вместо этого: снимаем ```-обёртку, находим первую `{` и парсим ПЕРВЫЙ полный
     JSON-объект через raw_decode — всё после него игнорируем. Чистим NUL, валидируем.
-    Реально битый JSON -> JSONDecodeError(ValueError)/ValidationError -> failed_validation."""
+
+    Битый JSON / несоответствие схеме -> StructuredOutputInvalid (подкласс ValueError,
+    статус failed_validation прежний); отдельный тип позволяет repair-циклу в run.py
+    отличить «модель ответила невалидно» от инфраструктурных ValueError."""
     if isinstance(raw, StructuredResult):
         return raw
     text = (str(raw) if raw is not None else "").replace("\x00", "").strip()
     m = _FENCED_JSON.search(text)
     candidate = m.group(1) if m else text
-    i = candidate.find("{")
-    if i < 0:
-        return StructuredResult.model_validate_json(candidate)  # нет объекта -> явная ошибка
-    # raw_decode: первый полный объект от позиции i; trailing-мусор gpt-5.5 (лишняя }) игнорируем
-    obj, _ = json.JSONDecoder().raw_decode(candidate, i)
-    return StructuredResult.model_validate(obj)
+    try:
+        i = candidate.find("{")
+        if i < 0:
+            return StructuredResult.model_validate_json(candidate)  # нет объекта -> явная ошибка
+        # raw_decode: первый полный объект от позиции i; trailing-мусор gpt-5.6-terra (лишняя }) игнорируем
+        obj, _ = json.JSONDecoder().raw_decode(candidate, i)
+        return StructuredResult.model_validate(obj)
+    except (json.JSONDecodeError, ValidationError) as e:
+        raise StructuredOutputInvalid(f"{type(e).__name__}: {e}") from e
 
 
 def log(msg: str) -> None:

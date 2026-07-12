@@ -33,7 +33,7 @@ from ..db.pool import strip_nul
 from ..db.session import PostgresSession
 from .agent_factory import make_research_agent
 from .context import EBAY_PLUGIN_NAME, SMART_PLUGIN_NAME, load_context
-from .errors import NoExactDataError
+from .errors import NoExactDataError, StructuredOutputInvalid
 from .exa_client import cached_exa_call, pick_fetch, pick_search
 from .profiles import ALL_STAGES, resolve_profile, stage_enabled
 from .prompts import (
@@ -50,6 +50,7 @@ from .prompts import (
     build_phase2_user_message,
     build_price_query,
     build_price_user_message,
+    build_repair_user_message,
     build_system_prompt,
     build_user_preamble,
 )
@@ -87,12 +88,13 @@ async def _finish(pool: asyncpg.Pool, run_id: int, status: str, error: str | Non
 
 # ── бухгалтерия прогрессивной выдачи (run_turns + stage_outcomes) ───────────────
 async def _load_profile(pool: asyncpg.Pool, run_id: int) -> dict:
-    """Профиль рана из task_runs.profile. NULL (ран поставлен до деплоя профилей) ->
-    резолвим дефолт и записываем обратно, чтобы ран был самоописанным. Мусор в
-    колонке НЕ глотаем — ValueError уронит ран с текстом (failed_crashed)."""
+    """Профиль рана из task_runs.profile. NULL (ран поставлен до деплоя профилей)
+    или профиль без ключа repair (ран поставлен до repair-флага) -> резолвим
+    (repair берёт env-дефолт) и записываем обратно, чтобы ран был самоописанным.
+    Мусор в колонке НЕ глотаем — ValueError уронит ран с текстом (failed_crashed)."""
     raw = await pool.fetchval("SELECT profile FROM task_runs WHERE id = $1", run_id)
     profile = resolve_profile(raw)
-    if raw is None:
+    if raw is None or (isinstance(raw, dict) and "repair" not in raw):
         await pool.execute("UPDATE task_runs SET profile = $1 WHERE id = $2", profile, run_id)
     return profile
 
@@ -390,6 +392,17 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
                 allowed_vehicle_classes=context.allowed_vehicle_classes,
             )
 
+        repair_enabled = bool(profile["repair"])
+
+        async def repair_turn(turn_idx: int, error_msg: str) -> StructuredResult:
+            """Repair: продолжение ТОЙ ЖЕ session (невалидный ответ агента уже в истории)
+            коротким сообщением с полным текстом ошибки — без повторных Exa-поисков.
+            Базовый agent без тулов: исправление JSON — текстовая задача."""
+            return await run_streamed_and_persist(
+                agent, build_repair_user_message(error_msg), session, pool, run_id,
+                turn_idx, preamble=preamble,
+            )
+
         async def run_stage(
             stage: str,
             fn: Callable[[int], Awaitable[StructuredResult]],
@@ -399,28 +412,65 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
             """Один этап с бухгалтерией: run_turns (running -> ok+snapshot / failed+error)
             и stage_outcomes. persist-then-validate: снапшот и result_json пишутся ДО
             post_validate, провал валидации помечает этап failed (снапшот остаётся видим).
-            best_effort=True — провал не валит ран, но исход виден как 'failed: ...'."""
+            best_effort=True — провал не валит ран, но исход виден как 'failed: ...'.
+
+            repair (profile.repair=true): если модель ОТВЕТИЛА, но ответ не прошёл
+            (StructuredOutputInvalid — битый/несхемный JSON; ValidationError/ValueError
+            из post_validate) — 1 repair-попытка: текст ошибки возвращается агенту тем же
+            session'ом, исправленный результат идёт через тот же validate. Ошибки ДО
+            ответа модели (Exa, NoExactDataError, транспорт) не ремонтируются."""
             nonlocal current, turn
             turn += 1
             await _turn_start(pool, run_id, turn, stage)
             await _set_outcome(pool, run_id, stage, "running")
             log(f"[{stage}] turn {turn}")
+            model_answered = False
             try:
                 result = await fn(turn)
+                model_answered = True
                 await _turn_ok(pool, run_id, turn, result)
                 await _write_result(pool, run_id, result)
                 validate(result)
-                current = result
-                await _set_outcome(pool, run_id, stage, "ok")
-                return True
             except Exception as e:  # noqa: BLE001 — исход этапа фиксируем всегда
                 msg = f"{type(e).__name__}: {e}"
                 await _turn_failed(pool, run_id, turn, msg)
-                await _set_outcome(pool, run_id, stage, f"failed: {msg}")
-                if not best_effort:
-                    raise
-                log(f"[{stage}] failed (non-fatal, keeping prior result): {msg}")
-                return False
+                repairable = isinstance(e, StructuredOutputInvalid) or (
+                    model_answered and isinstance(e, (ValidationError, ValueError))
+                )
+                if not (repair_enabled and repairable):
+                    await _set_outcome(pool, run_id, stage, f"failed: {msg}")
+                    if not best_effort:
+                        raise
+                    log(f"[{stage}] failed (non-fatal, keeping prior result): {msg}")
+                    return False
+
+                log(f"[{stage}] validation failed, sending error back to agent: {msg}")
+                await _set_outcome(pool, run_id, stage, f"repairing: {msg}")
+                turn += 1
+                await _turn_start(pool, run_id, turn, stage)
+                try:
+                    result = await repair_turn(turn, msg)
+                    await _turn_ok(pool, run_id, turn, result)
+                    await _write_result(pool, run_id, result)
+                    validate(result)
+                except Exception as e2:  # noqa: BLE001 — исход repair фиксируем всегда
+                    msg2 = f"{type(e2).__name__}: {e2}"
+                    await _turn_failed(pool, run_id, turn, msg2)
+                    await _set_outcome(
+                        pool, run_id, stage,
+                        f"failed: {msg2} (после repair-попытки; исходная ошибка: {msg})",
+                    )
+                    if not best_effort:
+                        raise
+                    log(f"[{stage}] repair failed (non-fatal, keeping prior result): {msg2}")
+                    return False
+                current = result
+                await _set_outcome(pool, run_id, stage, "ok (repaired)")
+                log(f"[{stage}] repaired OK")
+                return True
+            current = result
+            await _set_outcome(pool, run_id, stage, "ok")
+            return True
 
         # ── main (ядро, всегда) ────────────────────────────────────────────────
         async def stage_main(turn_idx: int) -> StructuredResult:

@@ -349,6 +349,19 @@ def build_price_user_message(article: str, raw_json: str, current_json: str) -> 
     )
 
 
+def build_repair_user_message(error_text: str) -> str:
+    """Repair-turn: возвращаем агенту ПОЛНЫЙ текст упавшей валидации его последнего
+    ответа (сам ответ уже лежит в session-истории) и требуем исправленный ПОЛНЫЙ JSON."""
+    return (
+        "Твой предыдущий ответ НЕ прошёл валидацию. Полный текст ошибки:\n\n"
+        f"{error_text}\n\n"
+        "Исправь и верни ЗАНОВО ПОЛНЫЙ JSON-объект по той же схеме — весь объект "
+        "целиком, не фрагмент и не диф. Не меняй фактические данные, которых ошибка "
+        "не касается; исправь ровно то, на что указывает валидация. "
+        "Ответ — только валидный JSON по схеме."
+    )
+
+
 def build_phase2_user_message(article: str, current_json: str, limit: int) -> str:
     return (
         f"Текущий JSON:\n{current_json}\n\n"

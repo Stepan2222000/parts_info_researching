@@ -7,13 +7,19 @@ price_fallback -> difference -> phase2. Difference идёт ДО phase2; phase2 
 умолчанию выключен (пресет default).
 
 Профиль фиксируется на ране (task_runs.profile) в канонической форме
-{"preset": <имя|custom>, "stages": [<включённые опциональные этапы>]}.
+{"preset": <имя|custom>, "stages": [<включённые опциональные этапы>],
+"repair": <bool>}. repair — политика упавшей валидации этапа: true = вернуть
+текст ошибки агенту на исправление (1 попытка, та же сессия), false = сразу
+фейл (историческое поведение). Дефолт repair, когда submit не передал его
+явно, — env RESEARCH_REPAIR_VALIDATION (settings.research_repair_validation).
 NULL в БД = legacy-ран (до профилей): гнался полным пайплайном, при
 reuse-проверках трактуется как full.
 
-Ошибки не скрываем: неизвестный пресет/этап -> ValueError с перечнем допустимых."""
+Ошибки не скрываем: неизвестный пресет/этап/не-bool repair -> ValueError."""
 
 from __future__ import annotations
+
+from ..config import settings
 
 CORE_STAGES = ("main", "kit_contents")
 # Порядок здесь = порядок исполнения в пайплайне.
@@ -33,11 +39,22 @@ PRESETS: dict[str, tuple[str, ...]] = {
 DEFAULT_PRESET = "default"
 
 
+def _resolve_repair(raw: dict) -> bool:
+    """Ключ repair из входа: явный bool либо env-дефолт. Не-bool -> ValueError."""
+    if "repair" not in raw:
+        return settings.research_repair_validation
+    repair = raw["repair"]
+    if not isinstance(repair, bool):
+        raise ValueError(f"profile.repair must be a boolean, got {repair!r}")
+    return repair
+
+
 def resolve_profile(raw: str | dict | None) -> dict:
-    """Вход API/CLI -> каноничный профиль {"preset", "stages"}.
+    """Вход API/CLI -> каноничный профиль {"preset", "stages", "repair"}.
 
     Принимает: None (дефолт), имя пресета строкой, {"preset": <имя>} либо
-    {"stages": [<опциональные этапы>]}. Неизвестное имя/этап -> ValueError.
+    {"stages": [<опциональные этапы>]}; опционально "repair": bool (без него —
+    env-дефолт). Неизвестное имя/этап/не-bool repair -> ValueError.
     """
     if raw is None:
         raw = DEFAULT_PRESET
@@ -45,6 +62,8 @@ def resolve_profile(raw: str | dict | None) -> dict:
         raw = {"preset": raw}
     if not isinstance(raw, dict):
         raise ValueError(f"profile must be a preset name or object, got {type(raw).__name__}")
+
+    repair = _resolve_repair(raw)
 
     if "stages" in raw:
         stages = raw["stages"]
@@ -59,16 +78,17 @@ def resolve_profile(raw: str | dict | None) -> dict:
         # канонический порядок — как в OPTIONAL_STAGES
         canonical = [s for s in OPTIONAL_STAGES if s in set(stages)]
         preset = next((name for name, ps in PRESETS.items() if list(ps) == canonical), "custom")
-        return {"preset": preset, "stages": canonical}
+        return {"preset": preset, "stages": canonical, "repair": repair}
 
     preset = raw.get("preset", DEFAULT_PRESET)
     if preset not in PRESETS:
         raise ValueError(f"unknown profile preset {preset!r}; allowed: {list(PRESETS)}")
-    return {"preset": preset, "stages": list(PRESETS[preset])}
+    return {"preset": preset, "stages": list(PRESETS[preset]), "repair": repair}
 
 
 def full_profile() -> dict:
-    return {"preset": "full", "stages": list(OPTIONAL_STAGES)}
+    return {"preset": "full", "stages": list(OPTIONAL_STAGES),
+            "repair": settings.research_repair_validation}
 
 
 def covers(existing: dict | None, requested: dict) -> bool:

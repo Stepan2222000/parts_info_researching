@@ -33,6 +33,7 @@ export const isTerminal = (s: string): boolean => (TERMINAL_STATUSES as string[]
 export interface Profile {
   preset: string;          // fast | default | full | custom
   stages: string[];        // включённые ОПЦИОНАЛЬНЫЕ этапы
+  repair?: boolean;        // упавшую валидацию этапа возвращаем агенту на исправление
 }
 
 export const PRESET_LABEL: Record<string, string> = {
@@ -58,7 +59,8 @@ export const STAGE_LABEL: Record<string, string> = {
   phase2: "Свободный добор",
 };
 
-// Исход этапа: ok | pending | running | not_applicable | skipped_by_profile | "failed: <текст>"
+// Исход этапа: ok | "ok (repaired)" | pending | running | "repairing: <текст>" |
+// not_applicable | skipped_by_profile | "failed: <текст>"
 export type StageOutcomes = Record<string, string>;
 
 export interface TurnRow {

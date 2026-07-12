@@ -211,7 +211,8 @@ function liveDetail(d: Detail, snap: StructuredSnapshot): Detail {
 // ── таймлайн этапов ──────────────────────────────────────────────────────────────
 type TimelineRow = {
   stage: string;
-  state: "ok" | "failed" | "running" | "pending" | "not_applicable" | "skipped_by_profile";
+  state: "ok" | "failed" | "running" | "repairing" | "pending" | "not_applicable" | "skipped_by_profile";
+  repaired: boolean; // ok после repair-попытки ("ok (repaired)")
   error: string | null;
   duration_s: number | null;
   summary: string | null;
@@ -232,10 +233,17 @@ function timelineRows(
         ? "pending" : "skipped_by_profile");
     const t = lastTurnByStage.get(stage);
     let state: TimelineRow["state"];
+    let repaired = false;
     let error: string | null = null;
     if (raw === "ok" || raw === "running" || raw === "pending"
       || raw === "not_applicable" || raw === "skipped_by_profile") {
       state = raw;
+    } else if (raw === "ok (repaired)") {
+      state = "ok";
+      repaired = true;
+    } else if (raw.startsWith("repairing")) {
+      state = "repairing";
+      error = raw.replace(/^repairing:\s*/, "");
     } else if (raw.startsWith("failed")) {
       state = "failed";
       error = raw.replace(/^failed:\s*/, "");
@@ -245,6 +253,7 @@ function timelineRows(
     return {
       stage,
       state,
+      repaired,
       error,
       duration_s: t?.duration_s ?? null,
       summary: t?.status === "ok" ? t.summary : null,
@@ -256,6 +265,7 @@ const TL_STATE_LABEL: Record<TimelineRow["state"], string> = {
   ok: "",
   failed: "этап упал",
   running: "идёт сейчас",
+  repairing: "ошибка валидации — агент исправляет",
   pending: "впереди",
   not_applicable: "не потребовался",
   skipped_by_profile: "выключен профилем",
@@ -287,7 +297,10 @@ function StageTimeline({ rows, queuePosition }: { rows: TimelineRow[]; queuePosi
               <div className="tl-head">
                 <span className="tl-stage">{STAGE_LABEL[r.stage] ?? r.stage}</span>
                 <span className="tl-note">
-                  {r.state === "ok" ? fmtDuration(r.duration_s) : TL_STATE_LABEL[r.state]}
+                  {r.state === "ok"
+                    ? [r.repaired ? "исправлено агентом" : null, fmtDuration(r.duration_s)]
+                        .filter(Boolean).join(" · ")
+                    : TL_STATE_LABEL[r.state]}
                 </span>
               </div>
               {r.summary && r.summary !== "без содержательных изменений" && (

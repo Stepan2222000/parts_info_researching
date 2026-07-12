@@ -190,7 +190,7 @@ End-to-end Python.
 
 - Base URL: `http://2.27.20.221:8317/v1`
 - API key: `cliproxy-e2602729e9e53a01885c91350fb852f735ce` (Bearer-токен)
-- Модель research-агента: `cursor-gpt55(high)` (gpt-5.5 с high reasoning)
+- Модель research-агента: `cursor-gpt55(high)` (gpt-5.6-terra с high reasoning)
 - Модель куратора: `cursor-gpt55(high)`
 
 Параметры берутся из env-переменных (`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL_RESEARCH`, `LLM_MODEL_CURATOR`), чтобы менять без правки кода.

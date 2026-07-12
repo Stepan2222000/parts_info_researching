@@ -18,6 +18,19 @@ def _require(name: str) -> str:
     return value
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    """Строгий парсинг булевого флага: непонятное значение — ошибка старта, не дефолт."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "on", "yes"):
+        return True
+    if value in ("0", "false", "off", "no"):
+        return False
+    raise RuntimeError(f"env var {name} must be boolean (1/0/true/false/on/off/yes/no), got {raw!r}")
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url: str
@@ -32,6 +45,10 @@ class Settings:
     # сбор бэклога правил) | 'hard' (критич.фейл на NO_RULE тоже). NOT_CANONICAL валит
     # ВСЕГДА в обоих режимах (доказанно грязная форма).
     format_validation_mode: str
+    # Дефолт repair-флага профиля: упавшую валидацию этапа возвращаем агенту на
+    # исправление (1 попытка, тем же session'ом) вместо немедленного фейла рана.
+    # Дефолт применяется при resolve_profile, когда submit не передал "repair" явно.
+    research_repair_validation: bool
     # Потолок числа деталей, которые curator-тул get_context разворачивает за один вызов
     # (защита от раздувания контекста). Превышение -> усечение с пометкой truncated.
     curator_get_context_max_parts: int
@@ -49,6 +66,7 @@ def load_settings() -> Settings:
         worker_concurrency=int(os.environ.get("WORKER_CONCURRENCY", "30")),
         worker_stale_minutes=int(os.environ.get("WORKER_STALE_MINUTES", "30")),
         format_validation_mode=(os.environ.get("FORMAT_VALIDATION_MODE") or "soft").lower(),
+        research_repair_validation=_bool_env("RESEARCH_REPAIR_VALIDATION", False),
         curator_get_context_max_parts=int(os.environ.get("CURATOR_GET_CONTEXT_MAX_PARTS", "25")),
     )
 
