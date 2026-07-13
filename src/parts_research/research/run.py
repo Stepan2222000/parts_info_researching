@@ -1,10 +1,12 @@
 """execute_run — полный research-pipeline одного run'а по профилю этапов:
 
     main -> family_expansion -> low_confidence -> kit_contents ->
-    price_fallback -> difference -> phase2 (опционален, по умолчанию выключен)
+    part_of_kits -> price_fallback -> difference -> phase2
 
 Ядро (main + kit_contents + валидации) не отключается; опциональные этапы
-включает task_runs.profile (см. research/profiles.py). Каждый этап ведёт
+включает task_runs.profile (см. research/profiles.py). Kit-этап для наборов
+ищет в обе стороны (состав с под-наборами is_kit + родительские наборы);
+part_of_kits — «вверх»-поиск для НЕ-наборов, по умолчанию выключен. Каждый этап ведёт
 бухгалтерию прогрессивной выдачи: строка в run_turns на старте (running),
 снапшот StructuredResult при успехе (ok) либо текст ошибки (failed), плюс
 исход в task_runs.stage_outcomes — ошибки этапов не скрываем, best-effort
@@ -34,7 +36,7 @@ from ..db.session import PostgresSession
 from .agent_factory import make_research_agent
 from .context import EBAY_PLUGIN_NAME, SMART_PLUGIN_NAME, load_context
 from .errors import NoExactDataError, StructuredOutputInvalid
-from .exa_client import cached_exa_call, pick_fetch, pick_search
+from .exa_client import cached_exa_call, pick_fetch, pick_search, pick_search_text
 from .profiles import ALL_STAGES, resolve_profile, stage_enabled
 from .prompts import (
     build_difference_query,
@@ -47,6 +49,8 @@ from .prompts import (
     build_low_confidence_user_message,
     build_main_query,
     build_main_user_message,
+    build_part_of_query,
+    build_part_of_user_message,
     build_phase2_user_message,
     build_price_query,
     build_price_user_message,
@@ -239,14 +243,14 @@ async def _parse_to_draft(
                     key = f"unknown_{unknown}"
                 comp_rows.append(
                     (draft_part_id, key, c.article, c.name, c.quantity, c.description, c.source_url, c.evidence,
-                     c.name_en, c.description_en)
+                     c.name_en, c.description_en, c.is_kit)
                 )
             if comp_rows:
                 await conn.executemany(
                     "INSERT INTO draft_kit_components "
                     "(draft_part_id, component_key, article, name, quantity, description, source_url, evidence, "
-                    " name_en, description_en) "
-                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                    " name_en, description_en, is_kit) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
                     comp_rows,
                 )
 
@@ -534,19 +538,33 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
                 await run_stage("low_confidence", stage_low_conf, best_effort=False)
 
         # ── kit_contents (ядро; гонится только для наборов) ───────────────────
+        # Для набора ищем в ОБЕ стороны одним ходом: состав (вниз, включая
+        # под-наборы -> is_kit у компонентов) + родительские наборы (вверх ->
+        # part_of_kits). Оба запроса с полным текстом страниц (contents=text):
+        # составные таблицы и сервисные chart'ы в highlights почти не попадают.
         if not current.is_kit:
             await _set_outcome(pool, run_id, "kit_contents", "not_applicable")
         else:
             async def stage_kit(turn_idx: int) -> StructuredResult:
                 confirmed = [a.article for a in current.numbers.article]
-                raw = await cached_exa_call(
+                raw_down = await cached_exa_call(
                     pool, exa, "web_search_exa",
-                    {"query": build_kit_contents_query(article, confirmed), "num_results": 10},
+                    {"query": build_kit_contents_query(article, confirmed), "num_results": 10,
+                     "contents": "text"},
                     run_id=run_id, phase="kit_contents",
                 )
-                picked = json.dumps(pick_search(raw), ensure_ascii=False)
-                substring_check(article, picked)
-                msg = build_kit_contents_user_message(picked, current.model_dump_json(indent=2))
+                raw_up = await cached_exa_call(
+                    pool, exa, "web_search_exa",
+                    {"query": build_part_of_query(article, confirmed), "num_results": 10,
+                     "contents": "text"},
+                    run_id=run_id, phase="kit_contents",
+                )
+                picked_down = json.dumps(pick_search_text(raw_down), ensure_ascii=False)
+                picked_up = json.dumps(pick_search_text(raw_up), ensure_ascii=False)
+                substring_check(article, picked_down + picked_up)
+                msg = build_kit_contents_user_message(
+                    picked_down, picked_up, current.model_dump_json(indent=2)
+                )
                 return await run_streamed_and_persist(
                     agent, msg, session, pool, run_id, turn_idx, preamble=preamble
                 )
@@ -558,6 +576,32 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
             raise ValueError(
                 "kit without contents: is_kit=true, but kit_contents is empty after kit_contents stage"
             )
+
+        # ── part_of_kits (опционален; «вверх»-поиск для НЕ-наборов) ────────────
+        # В какие наборы входит одиночная деталь. Наборам не нужен — их «вверх»
+        # уже искал ядровой kit-этап. substring_check не зовём: релевантная
+        # страница набора может писать номер детали в составной таблице любым
+        # представлением либо вовсе перечислять только наборы. Best-effort:
+        # пустой part_of_kits — нормальный итог, провал этапа не валит ран.
+        if stage_enabled(profile, "part_of_kits"):
+            if current.is_kit:
+                await _set_outcome(pool, run_id, "part_of_kits", "not_applicable")
+            else:
+                async def stage_part_of(turn_idx: int) -> StructuredResult:
+                    confirmed = [a.article for a in current.numbers.article]
+                    raw = await cached_exa_call(
+                        pool, exa, "web_search_exa",
+                        {"query": build_part_of_query(article, confirmed), "num_results": 10,
+                         "contents": "text"},
+                        run_id=run_id, phase="part_of_kits",
+                    )
+                    picked = json.dumps(pick_search_text(raw), ensure_ascii=False)
+                    msg = build_part_of_user_message(picked, current.model_dump_json(indent=2))
+                    return await run_streamed_and_persist(
+                        agent, msg, session, pool, run_id, turn_idx, preamble=preamble
+                    )
+
+                await run_stage("part_of_kits", stage_part_of, best_effort=True)
 
         # ── price_fallback (если включён и turn-цены пусты) ────────────────────
         # Отдельный ценовой turn: фокусный US-запрос с полным текстом страниц

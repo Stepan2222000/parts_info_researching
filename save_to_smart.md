@@ -32,6 +32,7 @@
 - `name_en`, `description_en` — английские версии (пишутся в `smart.parts_en`). Без `name_en` строка `parts_en` не создаётся (там `name NOT NULL`); `null` == не трогать (как и остальные поля).
 - `brands` — массив строк (например `["MERCRUISER"]`). Имена должны быть в `smart.brands`.
 - `components` — массив компонентов (если kit). Отсутствие или `[]` — состав не трогаем.
+- `part_of` — массив связей «вверх» (эта запчасть — компонент родительских НАБОРОВ): `{smart_id, kit_article, kit_name, quantity}`. Отсутствие или `[]` — связи вверх не трогаем. Семантика — раздел «part_of» ниже.
 - `prices` — массив US-офферов за оригинал `{site, price, currency, url, article, in_stock, evidence}`. Пишутся в `parts_prices` через FDW (`market.sites`/`market.observations`) **в той же транзакции/SAVEPOINT, что и публикация part'а** — атомарно: если запись цен упала, весь part (smart + цены) откатывается по своему SAVEPOINT, соседние parts сохраняются. `created_by='parts_research'` проставляется тулом; число записанных — `prices_recorded` в ответе.
 
 Поля одного `component` (run_id наследуется от parent'а):
@@ -81,6 +82,20 @@ Backend читает запись компонента:
 - `articles`: `NULL` или пустой массив `'{}'`.
 - `brands`: нет ни одной строки `part_brands` с этим `part_id`.
 
+### part_of — связь «вверх» (запчасть входит в набор)
+
+В smart связь «входит в набор» — та же строка `part_components(parent_id, child_id)`, где публикуемая запись — `child_id`. На каждый элемент `part_of` backend в том же SAVEPOINT part'а:
+
+1. **`smart_id` задан** → проверка существования → связка с этим родителем. Родителя бери из `smart_match` элемента `part_of_kits` в `get_context`.
+2. **`smart_id` нет, есть `kit_article`** → поиск `SELECT id FROM smart.parts WHERE kit_article = ANY(articles)`. Реестр smart `part_articles` (PK по артикулу) гарантирует максимум одного кандидата:
+   - найден → связка с ним;
+   - не найден → создаётся **тонкий draft-родитель**: `name = kit_name` (**обязателен**, без него отказ part'а), `articles = [kit_article]`, `vehicle_classes` наследуются от публикуемой записи, `is_draft=true, is_unverified=true`. Запись дозаполнится собственным ресёрчем набора (его `smart_match` найдёт её по номеру).
+3. `quantity` — сколько таких деталей в наборе; `null` → 1.
+
+Защиты (сама smart, тексты её ошибок отдаются модели, part откатывается по SAVEPOINT): связка сама с собой (`no_self_reference`), циклы состава (`check_components_cycle`), замороженный состав родителя (`kit_freeze` при `is_unverified=false` — сверенный человеком набор тулом не меняется). Поведение merge-only: существующие upward-связи никогда не удаляются (это состав ЧУЖИХ наборов — в отличие от overwrite собственных `components`); уже существующая связка — no-op (`"linked": "already"`).
+
+**Транзитивный дубль — на кураторе:** если деталь уже достижима от родителя через под-набор (видно в рекурсивном составе `smart_match`), прямую связку НЕ создавать — иначе при разворачивании состава деталь посчитается дважды.
+
 ### Порядок `articles` и факты-нюансы (difference-turn) — автоматически
 
 - **Порядок `articles`**: тул выставляет его сам — эталон из `draft_part_articles` run'а (research-порядок «новые→старые»), уточнённый доказанными парами замен `draft_supersession` (новейший номер первым). Куратору выверять порядок в payload не нужно; состав не меняется.
@@ -98,10 +113,15 @@ Backend читает запись компонента:
     "smart_id": "smart_xxx",
     "components": [
       { "index": 0, "status": "ok", "smart_id": "smart_yyy", "linked": true }
+    ],
+    "part_of": [
+      { "kit_article": "43-883476A3", "smart_id": "smart_zzz", "created_parent": true, "linked": true }
     ]
   }
 ]
 ```
+
+В `part_of[*]`: `smart_id` — родитель-набор (найденный или созданный), `created_parent` — создан ли тонкий draft-родитель этим вызовом, `linked` — `true` (связка создана) либо `"already"` (уже существовала, no-op).
 
 Был ли это INSERT или UPDATE — курсор знает по своему payload (если передавал `smart_id` — UPDATE). На каждый успешный part пишется ОДНА строка в `parts_research.publications(run_id, curator_session_id, smart_id, published_at)`. Поле `action` не пишется (тул всегда означает «применён», без под-настроек).
 
@@ -193,7 +213,19 @@ Payload с любым `components` (включая `[]`) возвращает:
   "components": [ { "index": 0, "status": "ok", "smart_id": "smart_36555915", "linked": true } ] } ]
 ```
 
-### 6. Партия — несколько parts одним вызовом
+### 6. Одиночная деталь, входящая в набор (part_of, find-or-create родителя)
+
+```json
+{ "parts": [ {
+  "run_id": 21, "name": "Подшипник упорный", "articles": ["31-861787"],
+  "vehicle_classes": ["boat"], "brands": ["MERCRUISER"],
+  "part_of": [ { "kit_article": "43-883476A3", "kit_name": "Верхний редукторный ремкомплект Bravo", "quantity": 2 } ]
+} ] }
+```
+
+Backend: INSERT детали → поиск `43-883476A3` в `smart.parts.articles`. Нет → INSERT тонкого draft-родителя (`name` = `kit_name`, классы от детали) → INSERT связки `part_components(родитель, деталь, 2)`. Есть → просто связка с существующим. Если родитель уже существует и его состав сверен (`is_unverified=false`) — part падает с текстом freeze-триггера (сверенные составы тул не меняет). Если родитель уже содержит эту деталь через под-набор (видно в `smart_match`) — связь в payload НЕ класть (транзитивный дубль).
+
+### 7. Партия — несколько parts одним вызовом
 
 ```json
 { "parts": [

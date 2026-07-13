@@ -233,17 +233,26 @@ async def _gc_build_part(conn, ruleset, task_id: int, task_article: str, latest_
         formats.append({"article": a, "status": v.status, "expected_canonical": v.expected,
                         "rule_name": v.rule_name, "ok": v.status == OK})
     comps = await conn.fetch(
-        "SELECT component_key, article, name, name_en, quantity, description, description_en, source_url, evidence "
-        "FROM draft_kit_components WHERE draft_part_id = $1 ORDER BY id", dp["id"])
+        "SELECT component_key, article, name, name_en, quantity, description, description_en, source_url, evidence, "
+        "is_kit FROM draft_kit_components WHERE draft_part_id = $1 ORDER BY id", dp["id"])
     comp_out = []
     for c in comps:
         cm = await _gc_smart_match(conn, [c["article"].upper()]) if c["article"] else []
         comp_out.append({**{k: c[k] for k in ("component_key", "article", "name", "name_en", "quantity",
-                                              "description", "description_en", "source_url", "evidence")},
+                                              "description", "description_en", "source_url", "evidence",
+                                              "is_kit")},
                          "smart_match": cm})
-    pofk = await conn.fetch(
+    # part_of_kits — связи «вверх»; каждой даём smart_match по номеру набора, чтобы
+    # куратор видел, существует ли родитель в smart (передать smart_id в part_of),
+    # и мог отрезать транзитивный дубль (родитель уже содержит под-набор с деталью).
+    pofk_rows = await conn.fetch(
         "SELECT kit_article, kit_name, source_url, evidence FROM draft_part_of_kits WHERE draft_part_id = $1 ORDER BY id",
         dp["id"])
+    pofk = []
+    for p in pofk_rows:
+        pm = await _gc_smart_match(conn, [p["kit_article"].upper()]) if p["kit_article"] else []
+        pofk.append({**{k: p[k] for k in ("kit_article", "kit_name", "source_url", "evidence")},
+                     "smart_match": pm})
     prices = await conn.fetch(
         "SELECT article, site, price, currency, url, in_stock, evidence FROM draft_prices WHERE run_id = $1 ORDER BY id",
         latest_run)
@@ -272,7 +281,7 @@ async def _gc_build_part(conn, ruleset, task_id: int, task_article: str, latest_
         "confirmed_articles": confirmed,
         "article_formats": formats,
         "components": comp_out,
-        "part_of_kits": [dict(p) for p in pofk],
+        "part_of_kits": pofk,
         "prices": [dict(p) for p in prices],
         "smart_match": smart_match,
     }
@@ -381,8 +390,10 @@ async def get_context(wrapper: RunContextWrapper[CuratorRunContext],
 
     Per part: full draft card (name/EN, brands, vehicle_classes, weight, models, description/EN),
     every draft number with confidence/source/evidence, confirmed_articles, article_formats
-    (canonical verdict — fix BEFORE save_to_smart rejects it), kit components (each with smart_match),
-    part_of_kits, draft prices, already_published (task-level), run_status + needs_review_reason
+    (canonical verdict — fix BEFORE save_to_smart rejects it), kit components (each with smart_match
+    and is_kit — true means the component is itself a kit: link it by smart_id, don't flatten),
+    part_of_kits (each with smart_match of the parent kit — decides smart_id vs create in part_of),
+    draft prices, already_published (task-level), run_status + needs_review_reason
     (research) + curator_note (parking reason), and smart_match: existing smart.parts overlapping
     this part's confirmed set, each with EN, brands, RECURSIVE composition and recorded prices —
     so you don't create duplicates but ENRICH the existing record.
@@ -577,6 +588,17 @@ class SaveComponent(BaseModel):
     quantity: int | None
 
 
+class PartOfLink(BaseModel):
+    """Связь «вверх»: публикуемая запись — компонент родительского НАБОРА.
+    Родитель задаётся либо smart_id (существующая запись), либо kit_article
+    (find-or-create: реестр smart part_articles гарантирует <=1 кандидата;
+    нет кандидата -> создаётся тонкий draft-родитель, тогда kit_name обязателен)."""
+    smart_id: str | None
+    kit_article: str | None
+    kit_name: str | None
+    quantity: int | None  # сколько таких деталей в наборе; null -> 1
+
+
 class SavePart(BaseModel):
     run_id: int
     # Прочие раны ТОЙ ЖЕ физической детали (дубли по другим номерам, сведённые в эту запись из
@@ -594,6 +616,7 @@ class SavePart(BaseModel):
     description_en: str | None
     brands: list[str] | None
     components: list[SaveComponent] | None
+    part_of: list[PartOfLink] | None  # наборы, в которые ВХОДИТ эта запись (связь вверх)
     prices: list[PriceOffer] | None  # US-цены за оригинал; пишутся после публикации
 
 
@@ -721,6 +744,65 @@ async def _save_component(conn, parent_id, comp: SaveComponent) -> dict:
         "INSERT INTO smart.part_components (parent_id, child_id, quantity, can_be_sold_separately) "
         "VALUES ($1, $2, $3, false)", parent_id, cid, qty)
     return {"status": "ok", "smart_id": cid, "linked": True}
+
+
+async def _link_part_of(conn, child_id: str, links: list[PartOfLink]) -> list[dict]:
+    """Связи «вверх» для опубликованной записи child_id: find-or-create родителя-набора
+    и INSERT smart.part_components(parent, child). Merge-only: существующие upward-связи
+    НЕ удаляем (это состав ЧУЖИХ наборов, в отличие от overwrite собственных components);
+    уже существующая связка — no-op (postgres_fdw не умеет ON CONFLICT — предпроверка).
+
+    Поиск по kit_article отдаёт максимум одного кандидата: реестр smart part_articles
+    держит PK по артикулу. Защиты самой smart не дублируем — self-link (CHECK
+    no_self_reference), циклы (триггер check_components_cycle) и замороженный состав
+    родителя (kit_freeze при is_unverified=false) отбиваются базой с внятным текстом;
+    ошибка валит part (его SAVEPOINT откатывается), текст уходит модели."""
+    out: list[dict] = []
+    for link in links:
+        created = False
+        if link.smart_id is not None:
+            parent_id = link.smart_id
+            if await conn.fetchval("SELECT 1 FROM smart.parts WHERE id=$1", parent_id) is None:
+                raise ValueError(f"part_of: smart_id={parent_id} not found")
+        else:
+            if not link.kit_article:
+                raise ValueError("part_of: either smart_id or kit_article is required")
+            cands = await conn.fetch(
+                "SELECT id FROM smart.parts WHERE $1 = ANY(articles)", link.kit_article)
+            if len(cands) > 1:  # при живом реестре part_articles невозможно; не угадываем
+                raise ValueError(
+                    f"part_of: article {link.kit_article!r} matches multiple smart parts "
+                    f"{[r['id'] for r in cands]}; pass smart_id explicitly")
+            if cands:
+                parent_id = cands[0]["id"]
+            else:
+                if not link.kit_name:
+                    raise ValueError(
+                        f"part_of: kit {link.kit_article!r} is absent from smart and kit_name "
+                        "is empty — provide kit_name to create the thin draft parent")
+                # Тонкий draft-родитель: имя+артикул, классы наследуем от child;
+                # дозаполнится собственным ресёрчем набора (smart_match найдёт по номеру).
+                child_classes = list(await conn.fetchval(
+                    "SELECT vehicle_classes FROM smart.parts WHERE id=$1", child_id) or [])
+                parent_id = await _insert_part(
+                    conn, name=link.kit_name, name_en=None, vehicle_classes=child_classes,
+                    articles=[link.kit_article], model=None, weight_kg=None,
+                    description=None, description_en=None)
+                created = True
+        qty = link.quantity if link.quantity is not None else 1
+        exists = await conn.fetchval(
+            "SELECT 1 FROM smart.part_components WHERE parent_id=$1 AND child_id=$2",
+            parent_id, child_id)
+        if exists:
+            out.append({"kit_article": link.kit_article, "smart_id": parent_id,
+                        "created_parent": created, "linked": "already"})
+            continue
+        await conn.execute(
+            "INSERT INTO smart.part_components (parent_id, child_id, quantity, can_be_sold_separately) "
+            "VALUES ($1, $2, $3, false)", parent_id, child_id, qty)
+        out.append({"kit_article": link.kit_article, "smart_id": parent_id,
+                    "created_parent": created, "linked": True})
+    return out
 
 
 async def _confirmed_article_order(conn, run_id: int) -> list[str]:
@@ -929,6 +1011,10 @@ async def _save_one_part(conn, part: SavePart, session_id: int) -> dict:
             r["index"] = j
             comp_results.append(r)
 
+    # Связи «вверх» (эта запись — компонент других наборов): find-or-create родителя
+    # и связка. В той же транзакции part'а; merge-only (см. _link_part_of).
+    part_of_results = await _link_part_of(conn, parent_id, part.part_of) if part.part_of else []
+
     await _check_title_budget(conn, parent_id)
     # Цены — в ТОЙ ЖЕ транзакции (через FDW parts_prices): атомарно с публикацией part'а.
     prices_recorded = await _record_prices(conn, parent_id, part.prices) if part.prices else 0
@@ -940,6 +1026,7 @@ async def _save_one_part(conn, part: SavePart, session_id: int) -> dict:
         "INSERT INTO publications (run_id, curator_session_id, smart_id) VALUES ($1, $2, $3)",
         [(rid, session_id, parent_id) for rid in pub_run_ids])
     return {"status": "ok", "smart_id": parent_id, "components": comp_results,
+            "part_of": part_of_results,
             "prices_recorded": prices_recorded, "facts_recorded": facts_recorded,
             "published_run_ids": pub_run_ids}
 
@@ -1005,6 +1092,13 @@ async def save_to_smart(wrapper: RunContextWrapper[CuratorRunContext], parts: li
     per-part transaction — a facts failure rolls back that part's publish. Prior research-sourced
     facts of the same part/numbers are deactivated first; manual facts are never touched.
     `facts_recorded` in the result shows how many facts were written.
+
+    Optional `part_of` links the published part UPWARD as a component of parent kits
+    (smart.part_components): pass the parent's smart_id when it exists (see part_of_kits
+    smart_match in get_context), else kit_article (+kit_name) — an absent parent is created
+    as a thin draft record and will be enriched by that kit's own research later. Existing
+    upward links are never deleted (merge-only); duplicates are no-ops. Do NOT add a direct
+    link when the part is already reachable through a sub-kit of that parent (transitive dup).
 
     Args:
         parts: parts to publish (each a single part or a kit with components).

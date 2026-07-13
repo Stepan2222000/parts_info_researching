@@ -113,10 +113,22 @@ def build_low_confidence_query(article: str, articles: list[str]) -> str:
 
 
 def build_kit_contents_query(article: str, articles: list[str]) -> str:
+    # Вниз: состав набора, включая ПОД-НАБОРЫ (kit-in-kit: gear set / sub-kit /
+    # assembly со своим номером внутри большого набора).
     joined = " ".join([article, *articles])
     return (
         f"{joined} kit contents includes components part numbers quantity "
-        "contents list parts included exploded diagram"
+        "contents list parts included exploded diagram gear set sub-kit assembly"
+    )
+
+
+def build_part_of_query(article: str, articles: list[str]) -> str:
+    # Вверх: в какие наборы/комплекты входит деталь (для наборов — в какие
+    # НАД-наборы). Страницы: сервисные chart'ы, "included in kit", каталоги.
+    joined = " ".join([article, *articles])
+    return (
+        f"{joined} part of kit included in kit which kit includes this part "
+        "sold as part of set assembly repair kit contents chart"
     )
 
 
@@ -146,10 +158,23 @@ SCHEMA_REMINDER = """\
 
 Жёсткие правила структуры:
 - kit_contents — массив объектов (НЕ объект-словарь). Каждый объект:
-  {"article": string|null, "name": string, "quantity": int|null,
-   "description": string|null, "source_url": string, "evidence": string}.
-  Поля "key" нет.
+  {"article": string|null, "name": string, "is_kit": boolean|null,
+   "quantity": int|null, "description": string|null, "source_url": string,
+   "evidence": string}. Поля "key" нет.
+- is_kit у КОМПОНЕНТА: true = компонент сам является набором (kit/set со своим
+  номером внутри этого набора), false = одиночная деталь, null = не выяснено.
+  Состав такого под-набора в этом ране НЕ раскрывай — только его номер. Если
+  перечисляешь под-набор компонентом, НЕ дублируй его внутренности отдельными
+  компонентами: отдельными строками идут только детали, лежащие в наборе ПОМИМО
+  под-набора.
 - Если is_kit=false — kit_contents=[] (пустой массив).
+- part_of_kits — наборы, в которые деталь входит: указывай БЛИЖАЙШЕГО известного
+  родителя (если деталь входит в большой набор только через под-набор — пиши
+  под-набор, а не большой набор).
+- Набор — кросс другого набора ТОЛЬКО при эквивалентном составе (полная замена).
+  Если один набор входит в другой, состав различается или номера покрывают разные
+  серийные диапазоны/годы — это НЕ кросс: связь выражай через kit_contents (вниз)
+  или part_of_kits (вверх), в numbers.article такой номер НЕ клади.
 - numbers.article, numbers.article_low_confidence, numbers.irrelevant — массивы объектов.
 - task_part_number обязан присутствовать в numbers.article.
 - Каждый номер — РОВНО в одном из numbers.article / numbers.article_low_confidence / numbers.irrelevant, без дублей между массивами (особенно нельзя класть один номер и в article, и в irrelevant).
@@ -323,14 +348,39 @@ def build_low_confidence_user_message(raw_json: str, current_json: str) -> str:
     )
 
 
-def build_kit_contents_user_message(raw_json: str, current_json: str) -> str:
+def build_kit_contents_user_message(raw_down_json: str, raw_up_json: str, current_json: str) -> str:
     return (
-        f"Свежий Exa-поиск по составу набора:\n{raw_json}\n\n"
+        f"Свежий Exa-поиск ПО СОСТАВУ набора (вниз):\n{raw_down_json}\n\n"
+        f"Свежий Exa-поиск ПО РОДИТЕЛЬСКИМ наборам (вверх):\n{raw_up_json}\n\n"
         f"Твой текущий JSON:\n{current_json}\n\n"
-        "Обнови kit_contents (массив объектов; article: string|null). "
-        "Остальные поля сохрани. Никогда не клади собственный артикул задачи "
-        "или артикул из numbers.article как компонент набора. "
+        "Обнови ДВА поля:\n"
+        "1) kit_contents — состав набора (массив объектов; article: string|null; "
+        "is_kit: boolean|null). Если компонент САМ является набором (kit/set/gear set "
+        "со своим номером) — пометь его is_kit=true и укажи только его номер, состав "
+        "под-набора не раскрывай и его внутренности отдельными компонентами не дублируй "
+        "(отдельными строками — только детали ПОМИМО под-набора).\n"
+        "2) part_of_kits — наборы, в которые ВХОДИТ сам артикул задачи (ближайший "
+        "известный родитель), с source_url и evidence.\n"
+        "Никогда не клади собственный артикул задачи или артикул из numbers.article "
+        "ни компонентом в kit_contents, ни родителем в part_of_kits. Набор с ДРУГИМ "
+        "составом (другой серийный диапазон/годы, входит один в другой) — не кросс: "
+        "в numbers.article его не добавляй. Остальные поля сохрани. "
         "Ответ — только валидный JSON по схеме."
+    )
+
+
+def build_part_of_user_message(raw_json: str, current_json: str) -> str:
+    return (
+        f"Свежий Exa-поиск по наборам, в которые входит деталь:\n{raw_json}\n\n"
+        f"Твой текущий JSON:\n{current_json}\n\n"
+        "Обнови ТОЛЬКО part_of_kits: наборы/комплекты, в которые входит эта деталь "
+        "({kit_article: string|null, kit_name: string|null, source_url, evidence}). "
+        "Указывай БЛИЖАЙШЕГО известного родителя: если деталь входит в большой набор "
+        "только через под-набор — пиши под-набор, а не большой набор. Номер набора "
+        "неизвестен — kit_article: null и объяснение в evidence. Родителем нельзя "
+        "класть артикул задачи или номер из numbers.article. Нет пруфа в этой выдаче — "
+        "оставь part_of_kits как есть (пустой список — нормальный итог, не выдумывай). "
+        "Все остальные поля сохрани БЕЗ изменений. Ответ — только валидный JSON по схеме."
     )
 
 

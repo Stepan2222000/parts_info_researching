@@ -141,7 +141,7 @@ async def load_run_detail(pool: asyncpg.Pool, run_id: int) -> dict | None:
                 dpid,
             )
             components = await conn.fetch(
-                "SELECT component_key, article, name, quantity, description, source_url, evidence "
+                "SELECT component_key, article, name, quantity, description, source_url, evidence, is_kit "
                 "FROM draft_kit_components WHERE draft_part_id = $1 ORDER BY id",
                 dpid,
             )
@@ -205,6 +205,7 @@ async def load_run_detail(pool: asyncpg.Pool, run_id: int) -> dict | None:
                 "component_key": c["component_key"],
                 "article": c["article"],
                 "name": c["name"],
+                "is_kit": c["is_kit"],
                 "quantity": c["quantity"],
                 "description": c["description"],
                 "source_url": c["source_url"],

@@ -92,6 +92,10 @@ class KitComponent(BaseModel):
     article: NonEmptyStr | None  # null, если артикул компонента не найден
     name: NonEmptyStr
     name_en: NonEmptyStr | None  # английское имя компонента (-> smart.parts_en)
+    # Компонент САМ является набором (kit-in-kit): true/false, null = не выяснено.
+    # Состав под-набора в этом ране не раскрывается — только его номер; внутренности
+    # под-набора не дублируются отдельными компонентами.
+    is_kit: bool | None
     quantity: int | None
     description: NonEmptyStr | None
     description_en: NonEmptyStr | None

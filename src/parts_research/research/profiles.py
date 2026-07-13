@@ -3,8 +3,14 @@
 Ядро (main + kit_contents + валидации) не отключается: main создаёт базовый JSON,
 а kit_contents обязателен, потому что «is_kit без состава» — критический фейл рана.
 Порядок исполнения: main -> family_expansion -> low_confidence -> kit_contents ->
-price_fallback -> difference -> phase2. Difference идёт ДО phase2; phase2 по
-умолчанию выключен (пресет default).
+part_of_kits -> price_fallback -> difference -> phase2. Difference идёт ДО phase2;
+phase2 по умолчанию выключен (пресет default).
+
+part_of_kits — «вверх»-поиск для НЕ-наборов (в какие наборы входит одиночная
+деталь). Для наборов направление «вверх» ищется в ядровом kit_contents-этапе
+(вместе с составом и под-наборами), поэтому им этот этап не нужен. По умолчанию
+(default) выключен — «всем подряд не гоняем»; включается пресетом full или
+кастомным списком stages.
 
 Профиль фиксируется на ране (task_runs.profile) в канонической форме
 {"preset": <имя|custom>, "stages": [<включённые опциональные этапы>],
@@ -23,16 +29,18 @@ from ..config import settings
 
 CORE_STAGES = ("main", "kit_contents")
 # Порядок здесь = порядок исполнения в пайплайне.
-OPTIONAL_STAGES = ("family_expansion", "low_confidence", "price_fallback", "difference", "phase2")
+OPTIONAL_STAGES = ("family_expansion", "low_confidence", "part_of_kits",
+                   "price_fallback", "difference", "phase2")
 ALL_STAGES = ("main", "family_expansion", "low_confidence", "kit_contents",
-              "price_fallback", "difference", "phase2")
+              "part_of_kits", "price_fallback", "difference", "phase2")
 
 PRESETS: dict[str, tuple[str, ...]] = {
     # только ядро: быстрый ран ~2-3 мин
     "fast": (),
-    # всё, кроме phase2 (глобальный дефолт)
+    # всё, кроме phase2 и part_of_kits (глобальный дефолт; «вверх»-поиск
+    # одиночным деталям по умолчанию не гоняем)
     "default": ("family_expansion", "low_confidence", "price_fallback", "difference"),
-    # всё, включая агентский phase2
+    # всё, включая part_of_kits и агентский phase2
     "full": OPTIONAL_STAGES,
 }
 

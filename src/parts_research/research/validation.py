@@ -135,5 +135,19 @@ def post_validate(
                 f"kit component {comp.article!r} duplicates the task article / numbers.article"
             )
 
+    # Зеркально для связи «вверх»: родительский набор не может быть самим артикулом
+    # задачи или его подтверждённым кроссом. Наборы с разным составом (в т.ч. когда
+    # один входит в другой) — не кроссы; конфликт значит, что агент перепутал
+    # взаимозаменяемость с вхождением в состав.
+    for parent in result.part_of_kits:
+        if parent.kit_article is None:
+            continue
+        if parent.kit_article == expected_part_number or parent.kit_article in article_set:
+            raise ValueError(
+                f"part_of_kits entry {parent.kit_article!r} duplicates the task article / "
+                "numbers.article — a containing kit is not a cross of its component; "
+                "keep it only in part_of_kits and out of numbers.article"
+            )
+
     # name/name_en: EN обязателен, длина под бюджет title фида.
     _validate_name_budget_and_en(result)

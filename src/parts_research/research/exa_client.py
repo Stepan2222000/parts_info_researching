@@ -156,6 +156,16 @@ def pick_search(response: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def pick_search_text(response: dict[str, Any]) -> list[dict[str, Any]]:
+    """Pick из search-ответа с contents=text: url/title/highlights/ПОЛНЫЙ text
+    (без обрезки — kit-этапу нужны составные таблицы целиком, окно модели большое)."""
+    return [
+        {"url": r.get("url"), "title": r.get("title"),
+         "highlights": r.get("highlights"), "text": r.get("text")}
+        for r in response.get("results", [])
+    ]
+
+
 def pick_fetch(response: dict[str, Any], max_characters: int) -> list[dict[str, Any]]:
     """Компактный pick из contents-ответа: url/title/text (обрезанный)."""
     out: list[dict[str, Any]] = []

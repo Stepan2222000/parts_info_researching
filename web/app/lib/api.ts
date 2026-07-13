@@ -46,7 +46,7 @@ export const PRESET_LABEL: Record<string, string> = {
 // Порядок = порядок исполнения пайплайна.
 export const ALL_STAGES = [
   "main", "family_expansion", "low_confidence", "kit_contents",
-  "price_fallback", "difference", "phase2",
+  "part_of_kits", "price_fallback", "difference", "phase2",
 ] as const;
 
 export const STAGE_LABEL: Record<string, string> = {
@@ -54,6 +54,7 @@ export const STAGE_LABEL: Record<string, string> = {
   family_expansion: "Семейство кроссов",
   low_confidence: "Сомнительные номера",
   kit_contents: "Состав набора",
+  part_of_kits: "Входит в наборы",
   price_fallback: "Цены US",
   difference: "Нюансы и замены",
   phase2: "Свободный добор",
@@ -104,7 +105,8 @@ export interface StructuredSnapshot {
   models?: { text: string; source_urls: string[]; evidence: string } | null;
   is_kit?: boolean;
   kit_contents?: {
-    article: string | null; name: string; name_en: string | null; quantity: number | null;
+    article: string | null; name: string; name_en: string | null; is_kit?: boolean | null;
+    quantity: number | null;
     description: string | null; description_en: string | null; source_url: string; evidence: string;
   }[];
   part_of_kits?: { kit_article: string | null; kit_name: string | null; source_url: string; evidence: string }[];
@@ -184,6 +186,7 @@ export interface ComponentRow {
   component_key: string;
   article: string | null;
   name: string | null;
+  is_kit?: boolean | null; // компонент сам является набором (kit-in-kit)
   quantity: number | null;
   description: string | null;
   source_url: string;

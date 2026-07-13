@@ -195,6 +195,7 @@ function liveDetail(d: Detail, snap: StructuredSnapshot): Detail {
       component_key: c.article ?? `unknown_${++unknown}`,
       article: c.article,
       name: c.name,
+      is_kit: c.is_kit ?? null,
       quantity: c.quantity,
       description: c.description,
       source_url: c.source_url,
@@ -469,6 +470,7 @@ export function RunDetail({ runId, onClose, onRetry }: {
                       <div className="ev" key={i}>
                         <div className="ev-top">
                           <span className="ev-art">{c.article ?? c.component_key}</span>
+                          {c.is_kit === true && <span className="badge">набор</span>}
                           {c.quantity != null && <span className="muted">× {c.quantity}</span>}
                         </div>
                         <div className="ev-text">{c.name}{c.description ? ` — ${c.description}` : ""}</div>
