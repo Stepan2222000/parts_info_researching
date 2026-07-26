@@ -49,6 +49,10 @@ class Settings:
     # исправление (1 попытка, тем же session'ом) вместо немедленного фейла рана.
     # Дефолт применяется при resolve_profile, когда submit не передал "repair" явно.
     research_repair_validation: bool
+    # Дефолт auto_publish-флага профиля: done-ран сразу публикуется в smart без
+    # куратора (только однозначные случаи — «зелёный коридор», см. auto_publish.py;
+    # остальное остаётся куратору). Применяется, когда submit не передал флаг явно.
+    research_auto_publish: bool
     # Потолок числа деталей, которые curator-тул get_context разворачивает за один вызов
     # (защита от раздувания контекста). Превышение -> усечение с пометкой truncated.
     curator_get_context_max_parts: int
@@ -67,6 +71,7 @@ def load_settings() -> Settings:
         worker_stale_minutes=int(os.environ.get("WORKER_STALE_MINUTES", "30")),
         format_validation_mode=(os.environ.get("FORMAT_VALIDATION_MODE") or "soft").lower(),
         research_repair_validation=_bool_env("RESEARCH_REPAIR_VALIDATION", False),
+        research_auto_publish=_bool_env("RESEARCH_AUTO_PUBLISH", False),
         curator_get_context_max_parts=int(os.environ.get("CURATOR_GET_CONTEXT_MAX_PARTS", "25")),
     )
 

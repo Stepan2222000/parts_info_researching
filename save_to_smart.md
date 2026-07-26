@@ -123,7 +123,9 @@ Backend читает запись компонента:
 
 В `part_of[*]`: `smart_id` — родитель-набор (найденный или созданный), `created_parent` — создан ли тонкий draft-родитель этим вызовом, `linked` — `true` (связка создана) либо `"already"` (уже существовала, no-op).
 
-Был ли это INSERT или UPDATE — курсор знает по своему payload (если передавал `smart_id` — UPDATE). На каждый успешный part пишется ОДНА строка в `parts_research.publications(run_id, curator_session_id, smart_id, published_at)`. Поле `action` не пишется (тул всегда означает «применён», без под-настроек).
+Был ли это INSERT или UPDATE — курсор знает по своему payload (если передавал `smart_id` — UPDATE). На каждый успешный part пишется ОДНА строка в `parts_research.publications(run_id, curator_session_id, smart_id, published_by, published_at)`. Поле `action` не пишется (тул всегда означает «применён», без под-настроек).
+
+Машинерия публикации (модели payload, SAVEPOINT-семантика, порядок articles, факты, цены) живёт в общем модуле `src/parts_research/publisher.py`: её делят тул куратора (`published_by='curator'`) и авто-режим воркера (`published_by='auto'`, без сессии; включается `profile.auto_publish`, публикует только однозначный «зелёный коридор» — см. `auto_publish.py`, исход в `task_runs.auto_publish_outcome`).
 
 При ошибке на parent — `components` нет, остальные поля кроме `error` тоже отсутствуют:
 

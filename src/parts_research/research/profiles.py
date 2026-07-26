@@ -14,14 +14,16 @@ part_of_kits — «вверх»-поиск для НЕ-наборов (в как
 
 Профиль фиксируется на ране (task_runs.profile) в канонической форме
 {"preset": <имя|custom>, "stages": [<включённые опциональные этапы>],
-"repair": <bool>}. repair — политика упавшей валидации этапа: true = вернуть
-текст ошибки агенту на исправление (1 попытка, та же сессия), false = сразу
-фейл (историческое поведение). Дефолт repair, когда submit не передал его
-явно, — env RESEARCH_REPAIR_VALIDATION (settings.research_repair_validation).
-NULL в БД = legacy-ран (до профилей): гнался полным пайплайном, при
-reuse-проверках трактуется как full.
+"repair": <bool>, "auto_publish": <bool>}. repair — политика упавшей валидации
+этапа: true = вернуть текст ошибки агенту на исправление (1 попытка, та же
+сессия), false = сразу фейл (историческое поведение). auto_publish — done-ран
+сразу публикуется в smart без куратора (только однозначный «зелёный коридор»,
+см. auto_publish.py; неоднозначное остаётся куратору с причиной в
+task_runs.auto_publish_outcome). Дефолты, когда submit не передал флаг явно, —
+env RESEARCH_REPAIR_VALIDATION / RESEARCH_AUTO_PUBLISH. NULL в БД = legacy-ран
+(до профилей): гнался полным пайплайном, при reuse-проверках трактуется как full.
 
-Ошибки не скрываем: неизвестный пресет/этап/не-bool repair -> ValueError."""
+Ошибки не скрываем: неизвестный пресет/этап/не-bool флаг -> ValueError."""
 
 from __future__ import annotations
 
@@ -47,22 +49,23 @@ PRESETS: dict[str, tuple[str, ...]] = {
 DEFAULT_PRESET = "default"
 
 
-def _resolve_repair(raw: dict) -> bool:
-    """Ключ repair из входа: явный bool либо env-дефолт. Не-bool -> ValueError."""
-    if "repair" not in raw:
-        return settings.research_repair_validation
-    repair = raw["repair"]
-    if not isinstance(repair, bool):
-        raise ValueError(f"profile.repair must be a boolean, got {repair!r}")
-    return repair
+def _resolve_flag(raw: dict, key: str, default: bool) -> bool:
+    """Булев ключ профиля (repair / auto_publish): явный bool либо дефолт из env.
+    Не-bool -> ValueError."""
+    if key not in raw:
+        return default
+    value = raw[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"profile.{key} must be a boolean, got {value!r}")
+    return value
 
 
 def resolve_profile(raw: str | dict | None) -> dict:
-    """Вход API/CLI -> каноничный профиль {"preset", "stages", "repair"}.
+    """Вход API/CLI -> каноничный профиль {"preset", "stages", "repair", "auto_publish"}.
 
     Принимает: None (дефолт), имя пресета строкой, {"preset": <имя>} либо
-    {"stages": [<опциональные этапы>]}; опционально "repair": bool (без него —
-    env-дефолт). Неизвестное имя/этап/не-bool repair -> ValueError.
+    {"stages": [<опциональные этапы>]}; опционально "repair"/"auto_publish": bool
+    (без них — env-дефолты). Неизвестное имя/этап/не-bool флаг -> ValueError.
     """
     if raw is None:
         raw = DEFAULT_PRESET
@@ -71,7 +74,8 @@ def resolve_profile(raw: str | dict | None) -> dict:
     if not isinstance(raw, dict):
         raise ValueError(f"profile must be a preset name or object, got {type(raw).__name__}")
 
-    repair = _resolve_repair(raw)
+    repair = _resolve_flag(raw, "repair", settings.research_repair_validation)
+    auto_publish = _resolve_flag(raw, "auto_publish", settings.research_auto_publish)
 
     if "stages" in raw:
         stages = raw["stages"]
@@ -86,17 +90,19 @@ def resolve_profile(raw: str | dict | None) -> dict:
         # канонический порядок — как в OPTIONAL_STAGES
         canonical = [s for s in OPTIONAL_STAGES if s in set(stages)]
         preset = next((name for name, ps in PRESETS.items() if list(ps) == canonical), "custom")
-        return {"preset": preset, "stages": canonical, "repair": repair}
+        return {"preset": preset, "stages": canonical, "repair": repair, "auto_publish": auto_publish}
 
     preset = raw.get("preset", DEFAULT_PRESET)
     if preset not in PRESETS:
         raise ValueError(f"unknown profile preset {preset!r}; allowed: {list(PRESETS)}")
-    return {"preset": preset, "stages": list(PRESETS[preset]), "repair": repair}
+    return {"preset": preset, "stages": list(PRESETS[preset]), "repair": repair,
+            "auto_publish": auto_publish}
 
 
 def full_profile() -> dict:
     return {"preset": "full", "stages": list(OPTIONAL_STAGES),
-            "repair": settings.research_repair_validation}
+            "repair": settings.research_repair_validation,
+            "auto_publish": settings.research_auto_publish}
 
 
 def covers(existing: dict | None, requested: dict) -> bool:

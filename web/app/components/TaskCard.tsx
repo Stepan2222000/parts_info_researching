@@ -23,10 +23,10 @@ export function TaskCard({
       </div>
       <div className="card-name">{card.name ?? <span className="muted">— без названия —</span>}</div>
       <div className="card-meta">
-        {card.brand_oem.map((b) => (
+        {(card.brand_oem ?? []).map((b) => (
           <span className="chip" key={b}>{b}</span>
         ))}
-        {card.vehicle_classes.map((vc) => (
+        {(card.vehicle_classes ?? []).map((vc) => (
           <span className="chip" key={vc}>{vc}</span>
         ))}
       </div>
@@ -44,7 +44,7 @@ export function TaskCard({
           <span className="badge published"><IconCheck width={12} height={12} /> В Smart</span>
         )}
         {preset && preset !== "default" && (
-          <span className="chip" title={`Профиль этапов: ${card.profile!.stages.join(", ") || "только ядро"}`}>
+          <span className="chip" title={`Профиль этапов: ${(card.profile?.stages ?? []).join(", ") || "только ядро"}`}>
             {PRESET_LABEL[preset] ?? preset}
           </span>
         )}

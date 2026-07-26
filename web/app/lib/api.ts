@@ -32,8 +32,9 @@ export const isTerminal = (s: string): boolean => (TERMINAL_STATUSES as string[]
 // ── профили этапов и прогресс ────────────────────────────────────────────────
 export interface Profile {
   preset: string;          // fast | default | full | custom
-  stages: string[];        // включённые ОПЦИОНАЛЬНЫЕ этапы
+  stages?: string[];       // включённые ОПЦИОНАЛЬНЫЕ этапы (у fast может не быть)
   repair?: boolean;        // упавшую валидацию этапа возвращаем агенту на исправление
+  auto_publish?: boolean;
 }
 
 export const PRESET_LABEL: Record<string, string> = {

@@ -55,6 +55,30 @@ price_fallback → difference → phase2`. Ядро (`main`, `kit_contents`, в�
 - **`refused`** (артикул финализирован человеком в Smart): ресерч не запускается,
   но к отказу прикладывается `last_run` с последним раном, если он был.
 
+## Авто-публикация в smart (`auto_publish`)
+
+`"auto_publish": true` в теле submit-запроса (верхнеуровневое поле или ключ в
+объекте `profile`) — done-ран **сразу публикуется в smart без куратора**.
+Публикуются только однозначные случаи («зелёный коридор»): нет пересечений
+confirmed-номеров с другими неопубликованными ранами (возможные дубли), не
+больше одной подходящей draft-записи в smart, бренды известны smart, title фида
+влезает в лимит. Всё неоднозначное **не публикуется** — ран остаётся в очереди
+куратора, причина видна в ответе.
+
+В ответах появляются два поля:
+
+- `auto_publish_outcome` — исход попытки (null = авто-режим не включался):
+  - `{"decision": "published", "smart_id": "...", "mode": "insert"|"update",
+     "prices_recorded": N, "facts_recorded": N, ...}`
+  - `{"decision": "skipped", "reason": "почему отложено куратору"}`
+  - `{"decision": "error", "error": "текст ошибки публикации"}`
+- `publication` — фактическая публикация задачи (кем бы она ни была сделана):
+  `{"smart_id", "published_by": "curator"|"auto", "published_at"}` | null.
+
+Флаг работает и при reuse готового done-рана: неопубликованная задача
+публикуется прямо в момент запроса (быстро, без LLM). Активный ран (`queued`/
+`running`) флаг запроса не меняет — его профиль уже зафиксирован.
+
 ---
 
 ## `POST /research/submit` — поставить и не ждать (основной путь для программ)
@@ -77,7 +101,8 @@ price_fallback → difference → phase2`. Ядро (`main`, `kit_contents`, в�
       "covers_requested": true, "force_ignored": false,
       "status": "queued", "is_final": false,
       "result_json": null, "error": null, "needs_review_reason": null,
-      "worker_alive": true, "timed_out": false
+      "worker_alive": true, "timed_out": false,
+      "auto_publish_outcome": null, "publication": null
     }
   ]
 }

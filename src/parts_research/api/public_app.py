@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from ..auto_publish import auto_publish_run
 from ..db.pool import create_pool
 from ..db.tasks import (
     ACTIVE_STATUSES,
@@ -69,6 +70,10 @@ class ResearchBody(BaseModel):
     articles: list[str]
     # Пресет ('fast'|'default'|'full') либо {"stages": [...]}; None = default.
     profile: str | dict | None = None
+    # Авто-публикация в smart сразу после ресёрча, без куратора (только однозначный
+    # «зелёный коридор», см. auto_publish.py; остальное остаётся куратору, причина —
+    # в auto_publish_outcome). Верхнеуровневый флаг; None = env-дефолт / ключ профиля.
+    auto_publish: bool | None = None
     # Принудительный пере-ресерч, если последний ран терминален. Активный ран
     # force НЕ дублирует (см. модульный docstring).
     force: bool = False
@@ -78,8 +83,16 @@ class ResearchBody(BaseModel):
     wait: bool = True
 
 
-def _resolve_profile_or_400(raw: str | dict | None) -> dict:
+def _resolve_profile_or_400(raw: str | dict | None, auto_publish: bool | None = None) -> dict:
+    """resolve_profile + верхнеуровневый флаг auto_publish (перекрывает ключ профиля)."""
     try:
+        if auto_publish is not None:
+            if raw is None:
+                raw = {"auto_publish": auto_publish}
+            elif isinstance(raw, str):
+                raw = {"preset": raw, "auto_publish": auto_publish}
+            elif isinstance(raw, dict):
+                raw = {**raw, "auto_publish": auto_publish}
         return resolve_profile(raw)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -91,6 +104,7 @@ def _base_entry(article: str) -> dict:
         "profile": None, "covers_requested": None, "force_ignored": False,
         "status": None, "is_final": False, "result_json": None, "error": None,
         "needs_review_reason": None, "worker_alive": None, "timed_out": False,
+        "auto_publish_outcome": None, "publication": None,
     }
 
 
@@ -102,6 +116,8 @@ def _apply_row(entry: dict, row, *, worker_alive: bool, timed_out: bool = False)
     entry["result_json"] = row["result_json"]
     entry["worker_alive"] = worker_alive
     entry["timed_out"] = timed_out
+    if "auto_publish_outcome" in dict(row):
+        entry["auto_publish_outcome"] = row["auto_publish_outcome"]
     # Для needs_human_review причина лежит в task_runs.error — разносим явно.
     if status == "needs_human_review":
         entry["needs_review_reason"] = row["error"]
@@ -109,6 +125,30 @@ def _apply_row(entry: dict, row, *, worker_alive: bool, timed_out: bool = False)
     else:
         entry["needs_review_reason"] = None
         entry["error"] = row["error"]
+
+
+async def _attach_publication(pool, entry: dict) -> None:
+    """Последняя публикация ЗАДАЧИ этого рана (куратором либо авто) — {smart_id,
+    published_by, published_at} | None. Уровень задачи, не рана: публикация могла
+    быть со старого рана, для потребителя важно «куда легла деталь в smart»."""
+    if entry.get("run_id") is None:
+        return
+    row = await pool.fetchrow(
+        "SELECT p.smart_id, p.published_by, p.published_at FROM publications p "
+        "JOIN task_runs r ON r.id = p.run_id "
+        "WHERE r.task_id = (SELECT task_id FROM task_runs WHERE id = $1) "
+        "ORDER BY p.id DESC LIMIT 1", entry["run_id"])
+    if row is not None:
+        entry["publication"] = {
+            "smart_id": row["smart_id"], "published_by": row["published_by"],
+            "published_at": row["published_at"].isoformat(),
+        }
+
+
+async def _task_published(pool, task_id: int) -> bool:
+    return bool(await pool.fetchval(
+        "SELECT 1 FROM publications p JOIN task_runs r ON r.id = p.run_id "
+        "WHERE r.task_id = $1 LIMIT 1", task_id))
 
 
 async def _submit_entry(pool, raw_article: str, requested_profile: dict, force: bool) -> dict:
@@ -163,6 +203,15 @@ async def _submit_entry(pool, raw_article: str, requested_profile: dict, force: 
             profile=latest["profile"], status="done", is_final=True,
             covers_requested=True, result_json=latest["result_json"],
         )
+        # Флаг auto_publish действует и при reuse: неопубликованный done-ран
+        # публикуется прямо здесь (детерминированно, без LLM — быстро). Уже
+        # опубликованную задачу не трогаем — publication и так вернётся ниже.
+        if requested_profile["auto_publish"] and not await _task_published(pool, latest["task_id"]):
+            entry["auto_publish_outcome"] = await auto_publish_run(pool, latest["run_id"], article)
+        else:
+            entry["auto_publish_outcome"] = await pool.fetchval(
+                "SELECT auto_publish_outcome FROM task_runs WHERE id = $1", latest["run_id"])
+        await _attach_publication(pool, entry)
         return entry
 
     sub = await submit_article(pool, article, requested_profile)
@@ -214,18 +263,20 @@ async def get_research(run_id: int) -> dict:
     pool = app.state.pool
     row = await pool.fetchrow(
         "SELECT r.id, r.status::text AS status, r.error, r.result_json, r.profile, "
-        "r.stage_outcomes, t.article, r.task_id "
+        "r.stage_outcomes, r.auto_publish_outcome, t.article, r.task_id "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE r.id = $1",
         run_id,
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"run {run_id} not found")
     live = await count_live_workers(pool)
-    entry: dict = {"article": row["article"], "task_id": row["task_id"], "run_id": run_id}
+    entry: dict = {"article": row["article"], "task_id": row["task_id"], "run_id": run_id,
+                   "auto_publish_outcome": None, "publication": None}
     _apply_row(entry, row, worker_alive=live > 0)
     entry["profile"] = row["profile"]
     entry["stage_outcomes"] = row["stage_outcomes"]
     entry["progress"] = await load_progress(pool, run_id, status=row["status"])
+    await _attach_publication(pool, entry)
     return entry
 
 
@@ -255,7 +306,7 @@ async def post_research_submit(body: ResearchBody) -> dict:
     Семантика reuse/force — см. модульный docstring. Невалидный артикул не валит
     остальных (status=invalid у конкретной записи)."""
     pool = app.state.pool
-    requested = _resolve_profile_or_400(body.profile)
+    requested = _resolve_profile_or_400(body.profile, body.auto_publish)
     entries = [await _submit_entry(pool, raw, requested, body.force) for raw in body.articles]
     worker_alive = await count_live_workers(pool) > 0
     for e in entries:
@@ -279,7 +330,7 @@ async def post_research(body: ResearchBody) -> dict:
     сразу отдаём queued + worker_alive=false.
     """
     pool = app.state.pool
-    requested = _resolve_profile_or_400(body.profile)
+    requested = _resolve_profile_or_400(body.profile, body.auto_publish)
 
     entries: list[dict] = []
     run_to_entries: dict[int, list[dict]] = {}
@@ -301,7 +352,7 @@ async def post_research(body: ResearchBody) -> dict:
             # обрабатывать некому — отдаём текущий статус сразу, не виснем.
             for run_id, es in run_to_entries.items():
                 row = await pool.fetchrow(
-                    "SELECT status, error, result_json FROM task_runs WHERE id = $1", run_id)
+                    "SELECT status, error, result_json, auto_publish_outcome FROM task_runs WHERE id = $1", run_id)
                 for e in es:
                     _apply_row(e, row, worker_alive=worker_alive)
         else:
@@ -309,7 +360,7 @@ async def post_research(body: ResearchBody) -> dict:
             deadline = time.monotonic() + WAIT_TIMEOUT_SECONDS
             while pending:
                 rows = await pool.fetch(
-                    "SELECT id, status, error, result_json FROM task_runs WHERE id = ANY($1::bigint[])",
+                    "SELECT id, status, error, result_json, auto_publish_outcome FROM task_runs WHERE id = ANY($1::bigint[])",
                     list(pending))
                 for row in rows:
                     if row["status"] in TERMINAL_STATUSES:
@@ -321,17 +372,23 @@ async def post_research(body: ResearchBody) -> dict:
                 if await count_live_workers(pool) == 0:
                     for run_id in pending:
                         row = await pool.fetchrow(
-                            "SELECT status, error, result_json FROM task_runs WHERE id = $1", run_id)
+                            "SELECT status, error, result_json, auto_publish_outcome FROM task_runs WHERE id = $1", run_id)
                         for e in run_to_entries[run_id]:
                             _apply_row(e, row, worker_alive=False)
                     break
                 if time.monotonic() >= deadline:
                     for run_id in pending:
                         row = await pool.fetchrow(
-                            "SELECT status, error, result_json FROM task_runs WHERE id = $1", run_id)
+                            "SELECT status, error, result_json, auto_publish_outcome FROM task_runs WHERE id = $1", run_id)
                         for e in run_to_entries[run_id]:
                             _apply_row(e, row, worker_alive=True, timed_out=True)
                     break
                 await asyncio.sleep(POLL_SECONDS)
+
+    # Публикация терминальных записей (куратором либо авто) — в ответ; reuse-ветка
+    # _submit_entry уже приложила свою, не перезапрашиваем.
+    for e in entries:
+        if e["is_final"] and e["publication"] is None:
+            await _attach_publication(pool, e)
 
     return {"worker_alive": worker_alive, "requested_profile": requested, "results": entries}

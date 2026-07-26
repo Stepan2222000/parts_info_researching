@@ -30,6 +30,7 @@ from pydantic import ValidationError
 from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError
 
 from ..article_format import NOT_CANONICAL, OK, load_ruleset
+from ..auto_publish import auto_publish_run
 from ..config import settings
 from ..db.pool import strip_nul
 from ..db.session import PostgresSession
@@ -93,12 +94,13 @@ async def _finish(pool: asyncpg.Pool, run_id: int, status: str, error: str | Non
 # ── бухгалтерия прогрессивной выдачи (run_turns + stage_outcomes) ───────────────
 async def _load_profile(pool: asyncpg.Pool, run_id: int) -> dict:
     """Профиль рана из task_runs.profile. NULL (ран поставлен до деплоя профилей)
-    или профиль без ключа repair (ран поставлен до repair-флага) -> резолвим
-    (repair берёт env-дефолт) и записываем обратно, чтобы ран был самоописанным.
-    Мусор в колонке НЕ глотаем — ValueError уронит ран с текстом (failed_crashed)."""
+    или профиль без ключа repair/auto_publish (ран поставлен до этих флагов) ->
+    резолвим (флаги берут env-дефолт) и записываем обратно, чтобы ран был
+    самоописанным. Мусор в колонке НЕ глотаем — ValueError уронит ран с текстом
+    (failed_crashed)."""
     raw = await pool.fetchval("SELECT profile FROM task_runs WHERE id = $1", run_id)
     profile = resolve_profile(raw)
-    if raw is None or (isinstance(raw, dict) and "repair" not in raw):
+    if raw is None or (isinstance(raw, dict) and ("repair" not in raw or "auto_publish" not in raw)):
         await pool.execute("UPDATE task_runs SET profile = $1 WHERE id = $2", profile, run_id)
     return profile
 
@@ -694,6 +696,14 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
             log(f"[fail] run {run_id} -> failed_validation (format): {msg}")
             return "failed_validation"
         status = "needs_human_review" if reason else "done"
+        # Авто-публикация (profile.auto_publish): сразу в smart без куратора, только
+        # однозначный «зелёный коридор» (см. auto_publish.py). ДО выставления статуса:
+        # потребитель, увидев терминальный done, видит и auto_publish_outcome.
+        # Сбой публикации ран не валит (research уже успешен) — исход в outcome.
+        if status == "done" and profile["auto_publish"]:
+            outcome = await auto_publish_run(pool, run_id, article)
+            log(f"[auto_publish] run {run_id} -> {outcome.get('decision')}: "
+                f"{outcome.get('smart_id') or outcome.get('reason') or outcome.get('error')}")
         await _finish(pool, run_id, status, error=reason)
         log(f"[done] run {run_id} -> {status}" + (f" ({reason})" if reason else ""))
         return status

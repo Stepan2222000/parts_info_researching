@@ -152,7 +152,7 @@ async def load_run_detail(pool: asyncpg.Pool, run_id: int) -> dict | None:
             )
 
         publications = await conn.fetch(
-            "SELECT id, smart_id, curator_session_id, published_at "
+            "SELECT id, smart_id, curator_session_id, published_by, published_at "
             "FROM publications WHERE run_id = $1 ORDER BY id",
             run_id,
         )
@@ -227,6 +227,7 @@ async def load_run_detail(pool: asyncpg.Pool, run_id: int) -> dict | None:
                 "id": p["id"],
                 "smart_id": p["smart_id"],
                 "curator_session_id": p["curator_session_id"],
+                "published_by": p["published_by"],
                 "published_at": _iso(p["published_at"]),
             }
             for p in publications

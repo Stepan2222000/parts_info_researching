@@ -39,6 +39,7 @@ def _apply_status(entry: dict, row, *, worker_alive: bool) -> None:
     entry["status"] = status
     entry["worker_alive"] = worker_alive
     entry["result_json"] = row["result_json"]
+    entry["auto_publish_outcome"] = row["auto_publish_outcome"]
     # Для needs_human_review причина лежит в task_runs.error — разносим явно.
     if status == "needs_human_review":
         entry["needs_review_reason"] = row["error"]
@@ -97,7 +98,7 @@ async def _amain(articles: list[str]) -> None:
                 log("[no live worker] задачи в очереди — обработаются при запуске воркера")
                 for run_id, es in run_to_entries.items():
                     row = await pool.fetchrow(
-                        "SELECT status, error, result_json FROM task_runs WHERE id = $1",
+                        "SELECT status, error, result_json, auto_publish_outcome FROM task_runs WHERE id = $1",
                         run_id,
                     )
                     for e in es:
@@ -106,7 +107,7 @@ async def _amain(articles: list[str]) -> None:
                 pending = set(run_to_entries)
                 while pending:
                     rows = await pool.fetch(
-                        "SELECT id, status, error, result_json FROM task_runs "
+                        "SELECT id, status, error, result_json, auto_publish_outcome FROM task_runs "
                         "WHERE id = ANY($1::bigint[])",
                         list(pending),
                     )
@@ -121,7 +122,7 @@ async def _amain(articles: list[str]) -> None:
                         log("[worker disappeared] живые воркеры исчезли во время ожидания")
                         for run_id in pending:
                             row = await pool.fetchrow(
-                                "SELECT status, error, result_json FROM task_runs WHERE id = $1",
+                                "SELECT status, error, result_json, auto_publish_outcome FROM task_runs WHERE id = $1",
                                 run_id,
                             )
                             for e in run_to_entries[run_id]:
