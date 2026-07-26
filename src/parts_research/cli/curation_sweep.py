@@ -67,7 +67,10 @@ async def _amain(dry_run: bool, limit: int | None) -> None:
         for i, r in enumerate(runs, 1):
             rid, article = r["run_id"], r["article"]
             if dry_run:
-                outcome, detail = await _dry_run_one(pool, rid)
+                try:
+                    outcome, detail = await _dry_run_one(pool, rid)
+                except Exception as e:  # noqa: BLE001 — один битый ран не валит весь прогон
+                    outcome, detail = "error", f"{type(e).__name__}: {e}"
                 stats[outcome] += 1
                 if outcome == "skipped":
                     reasons[classify_skip_reason(detail)] += 1
