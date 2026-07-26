@@ -24,6 +24,9 @@ parts-research = "parts_research.cli.research:main"
 parts-research-worker = "parts_research.cli.worker:main"
 parts-research-curator = "parts_research.cli.curator:main"
 parts-research-api = "parts_research.cli.api:main"
+parts-research-backfill-classes = "parts_research.cli.backfill_classes:main"
+parts-research-curation-sweep = "parts_research.cli.curation_sweep:main"
+parts-research-curate-hard-list = "parts_research.cli.curate_hard_list:main"
 
 [build-system]
 requires = ["setuptools>=61"]

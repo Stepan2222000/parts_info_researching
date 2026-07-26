@@ -32,6 +32,10 @@ part_of-связи «вверх» — best-effort: непубликуемая с
 нет kit_name / состав родителя заморожен / транзитивный дубль через под-набор)
 отбрасывается с пометкой в outcome, НЕ валя публикацию детали.
 
+После успешного INSERT (вне транзакции публикации) — воронка похожести
+(similar.annotate_similar): шорт-лист + LLM-судья, гипотезы дублей в
+dedup_candidates и в outcome.similar; публикацию не блокирует и не отменяет.
+
 Публикация — общий publisher.save_parts (та же машинерия и защиты, что у тула
 куратора), published_by='auto', curator_session_id NULL. Весь шаг сериализован
 глобальным advisory-lock'ом (xact-scoped): параллельные воркеры не могут
@@ -57,6 +61,7 @@ from .publisher import (
     _supersession_edges,
     save_parts,
 )
+from .similar import annotate_similar
 
 # Своё пространство рядом с WORKER_LIVENESS_KEY=8273461 (db/tasks.py) — не пересекается.
 AUTO_PUBLISH_LOCK_KEY = 8273462
@@ -73,12 +78,43 @@ class _Skip(Exception):
     """Гейт не прошёл: публикацию откладываем куратору с этой причиной."""
 
 
+# Типизация причин skip для hard list (порядок важен: первый матч по подстроке).
+# frozen_or_final разбирает ЧЕЛОВЕК (замки не снимаем автоматически), остальное — LLM-куратор.
+_REASON_TYPES: list[tuple[str, str]] = [
+    ("possible duplicate group", "group"),
+    ("smart_match ambiguous", "ambiguous_smart_match"),
+    ("matches multiple smart records", "ambiguous_smart_match"),
+    ("is_draft=false", "frozen_or_final"),
+    ("is_unverified=false", "frozen_or_final"),
+    ("conflict: existing smart", "data_conflict"),
+    ("brands not in smart.brands", "brand_missing"),
+    ("feed title too long", "title_too_long"),
+    ("EN feed title too long", "title_too_long"),
+    ("smart format regex", "bad_article_format"),
+    ("empty vehicle_classes", "no_classes"),
+    ("no confirmed articles", "incomplete_draft"),
+    ("draft has no name", "incomplete_draft"),
+    ("no draft row", "incomplete_draft"),
+    ("already published", "already_published"),
+]
+
+
+def classify_skip_reason(reason: str | None) -> str:
+    """Причина _Skip (текст из auto_publish_outcome.reason) -> тип для hard list."""
+    if not reason:
+        return "other"
+    for needle, kind in _REASON_TYPES:
+        if needle in reason:
+            return kind
+    return "other"
+
+
 async def auto_publish_run(pool: asyncpg.Pool, run_id: int, article: str) -> dict:
     """Пытается авто-опубликовать done-ран. Никогда не кидает исключение (research
     уже успешен — публикация его не валит); исход всегда записан в
     task_runs.auto_publish_outcome и возвращён."""
     try:
-        return await _attempt(pool, run_id)
+        outcome = await _attempt(pool, run_id)
     except Exception as e:  # noqa: BLE001 — сбой публикации не валит ран; текст наружу
         outcome = {"decision": "error", "error": f"{type(e).__name__}: {e}"}
         try:
@@ -87,6 +123,20 @@ async def auto_publish_run(pool: asyncpg.Pool, run_id: int, article: str) -> dic
         except Exception as e2:  # noqa: BLE001 — даже запись исхода не удалась; отдаём оба текста
             outcome["outcome_write_error"] = f"{type(e2).__name__}: {e2}"
         return outcome
+    if outcome.get("decision") == "published" and outcome.get("mode") == "insert":
+        # Воронка похожести — ПОСЛЕ коммита публикации: LLM-вызов судьи не должен
+        # держать глобальный advisory-lock. Сбой воронки публикацию не отменяет,
+        # но виден текстом в outcome (ошибок не скрываем).
+        try:
+            outcome["similar"] = await annotate_similar(pool, run_id, outcome["smart_id"])
+        except Exception as e:  # noqa: BLE001 — аннотация вспомогательная, текст наружу
+            outcome["similar"] = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            await pool.execute(
+                "UPDATE task_runs SET auto_publish_outcome = $1 WHERE id = $2", outcome, run_id)
+        except Exception as e2:  # noqa: BLE001
+            outcome["outcome_write_error"] = f"{type(e2).__name__}: {e2}"
+    return outcome
 
 
 async def _attempt(pool: asyncpg.Pool, run_id: int) -> dict:

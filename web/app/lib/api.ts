@@ -141,6 +141,10 @@ export interface TaskCard {
   is_kit: boolean | null;
   brand_oem: string[];
   published: boolean;
+  // Исход автопрохода («зелёного коридора»): published | skipped | error | null.
+  auto_publish_decision: string | null;
+  // Причина skip — почему ран ушёл в hard list.
+  auto_publish_reason: string | null;
 }
 
 export interface QueueData {
@@ -149,6 +153,8 @@ export interface QueueData {
   worker_alive: boolean;
   // Бэклог куратора: done-раны без публикации в Smart («ещё не обработано»).
   pending_publication: number;
+  // Hard list авто-курации: done-раны, от которых автопроход отказался с причиной.
+  hard_list: number;
 }
 
 export interface SubmitResult {

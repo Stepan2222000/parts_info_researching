@@ -39,6 +39,8 @@ SELECT * FROM (
         dp.vehicle_classes,
         dp.is_kit,
         dp.brand_oem,
+        r.auto_publish_outcome->>'decision' AS auto_publish_decision,
+        r.auto_publish_outcome->>'reason'   AS auto_publish_reason,
         EXISTS (SELECT 1 FROM publications p WHERE p.run_id = r.id) AS published,
         (SELECT rt.stage FROM run_turns rt
          WHERE rt.run_id = r.id AND rt.status = 'running'
@@ -64,13 +66,28 @@ WHERE s.status = 'done'
   AND NOT EXISTS (SELECT 1 FROM publications p WHERE p.run_id = s.id)
 """
 
+# Hard list авто-курации: done-раны, от которых автопроход отказался с причиной
+# (auto_publish_outcome.decision='skipped'). Не новый статус — фильтр по пометке.
+_HARD_LIST_SQL = """
+SELECT count(*) AS n
+FROM (
+    SELECT DISTINCT ON (task_id) id, status, auto_publish_outcome
+    FROM task_runs
+    ORDER BY task_id, id DESC
+) s
+WHERE s.status = 'done'
+  AND s.auto_publish_outcome->>'decision' = 'skipped'
+  AND NOT EXISTS (SELECT 1 FROM publications p WHERE p.run_id = s.id)
+"""
+
 
 async def load_queue(pool: asyncpg.Pool) -> dict:
-    counts_rows, card_rows, pending_publication = await _gather(pool)
+    counts_rows, card_rows, pending_publication, hard_list = await _gather(pool)
     return {
         "counts": {r["status"]: r["n"] for r in counts_rows},
         "cards": [_card(r) for r in card_rows],
         "pending_publication": pending_publication,
+        "hard_list": hard_list,
     }
 
 
@@ -79,7 +96,8 @@ async def _gather(pool: asyncpg.Pool):
         counts_rows = await conn.fetch(_COUNTS_SQL)
         card_rows = await conn.fetch(_CARDS_SQL)
         pending_publication = await conn.fetchval(_PENDING_PUBLICATION_SQL)
-    return counts_rows, card_rows, pending_publication
+        hard_list = await conn.fetchval(_HARD_LIST_SQL)
+    return counts_rows, card_rows, pending_publication, hard_list
 
 
 def _card(r: asyncpg.Record) -> dict:
@@ -100,6 +118,8 @@ def _card(r: asyncpg.Record) -> dict:
         "is_kit": r["is_kit"],
         "brand_oem": list(r["brand_oem"]) if r["brand_oem"] is not None else [],
         "published": r["published"],
+        "auto_publish_decision": r["auto_publish_decision"],
+        "auto_publish_reason": r["auto_publish_reason"],
     }
 
 

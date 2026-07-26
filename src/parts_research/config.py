@@ -38,6 +38,9 @@ class Settings:
     llm_api_key: str
     llm_model_research: str
     llm_model_curator: str
+    # Дешёвая модель «судьи» воронки похожести (анти-дубли) и разового бэкфилла
+    # классов: примитивная классификация без web, дорогая модель не нужна.
+    llm_model_judge: str
     exa_api_key: str
     worker_concurrency: int
     worker_stale_minutes: int
@@ -56,6 +59,14 @@ class Settings:
     # Потолок числа деталей, которые curator-тул get_context разворачивает за один вызов
     # (защита от раздувания контекста). Превышение -> усечение с пометкой truncated.
     curator_get_context_max_parts: int
+    # LLM-судья воронки похожести после авто-INSERT: on -> шорт-лист прогоняется через
+    # llm_model_judge, вердикты same/likely_same пишутся в dedup_candidates. off -> LLM
+    # не вызывается вообще (детерминированный шорт-лист в outcome остаётся — он бесплатный).
+    # Судья ничего не блокирует, флаг можно переключать в любой момент.
+    research_dedup_judge: bool
+    # Размер шорт-листа воронки похожести (замер 2026-07-26: recall настоящих дублей
+    # в топ-80 = 98%, в топ-40 = 96.7%).
+    dedup_shortlist_k: int
 
 
 def load_settings() -> Settings:
@@ -66,6 +77,9 @@ def load_settings() -> Settings:
         llm_model_research=_require("LLM_MODEL_RESEARCH"),
         # Куратор по умолчанию использует ту же модель, что и research.
         llm_model_curator=os.environ.get("LLM_MODEL_CURATOR") or _require("LLM_MODEL_RESEARCH"),
+        # Судья по умолчанию падает на модель куратора; в .env ставим дешёвую (gpt-5.6-luna).
+        llm_model_judge=os.environ.get("LLM_MODEL_JUDGE")
+        or os.environ.get("LLM_MODEL_CURATOR") or _require("LLM_MODEL_RESEARCH"),
         exa_api_key=_require("EXA_API_KEY"),
         worker_concurrency=int(os.environ.get("WORKER_CONCURRENCY", "30")),
         worker_stale_minutes=int(os.environ.get("WORKER_STALE_MINUTES", "30")),
@@ -73,6 +87,8 @@ def load_settings() -> Settings:
         research_repair_validation=_bool_env("RESEARCH_REPAIR_VALIDATION", False),
         research_auto_publish=_bool_env("RESEARCH_AUTO_PUBLISH", False),
         curator_get_context_max_parts=int(os.environ.get("CURATOR_GET_CONTEXT_MAX_PARTS", "25")),
+        research_dedup_judge=_bool_env("RESEARCH_DEDUP_JUDGE", True),
+        dedup_shortlist_k=int(os.environ.get("DEDUP_SHORTLIST_K", "80")),
     )
 
 

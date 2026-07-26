@@ -1,7 +1,7 @@
 """@function_tool куратора (Этап 3). Все тулы живут в процессе куратора, без MCP.
 
 - execute_sql — сырой SQL по parts_research (+ smart.* / brand_mapping.* через FDW), лог в agent_sql_log.
-- save_to_smart — публикация в smart_test через FDW по save_to_smart.md (SAVEPOINT на каждый part);
+- save_to_smart — публикация в прод-smart через FDW по save_to_smart.md (SAVEPOINT на каждый part);
   сама машинерия публикации — в общем модуле publisher.py (её же использует авто-режим).
 - mark_needs_review — пометить run.
 - web_search_exa / web_fetch_exa — прямой Exa БЕЗ кэша (кэш только в research-процессе).
@@ -25,6 +25,7 @@ from ..article_format import OK, load_ruleset
 from ..config import settings
 from ..publisher import SavePart, save_parts
 from ..research.exa_client import _to_jsonable, pick_fetch, pick_search
+from ..similar import build_shortlist, load_catalog
 
 
 @dataclass
@@ -210,7 +211,7 @@ async def _gc_confirmed(conn, run_id: int) -> set[str]:
 
 async def _gc_build_part(conn, ruleset, task_id: int, task_article: str, latest_run: int,
                          run_status: str, curator_note: str | None,
-                         matched_inputs: list[dict]) -> dict | None:
+                         matched_inputs: list[dict], catalog: list[dict]) -> dict | None:
     dp = await conn.fetchrow(
         "SELECT id, name, name_en, brand_oem, vehicle_classes, product_type, is_kit, weight_kg, "
         "weight_source_url, weight_evidence, models_text, models_source_urls, models_evidence, "
@@ -257,6 +258,17 @@ async def _gc_build_part(conn, ruleset, task_id: int, task_article: str, latest_
         "SELECT p.smart_id, p.published_at FROM publications p JOIN task_runs r ON r.id = p.run_id "
         "WHERE r.task_id = $1 ORDER BY p.id DESC LIMIT 1", task_id)
     smart_match = await _gc_smart_match(conn, [a.upper() for a in confirmed])
+    # Похожие по имени/моделям записи smart БЕЗ общих номеров (воронка similar.py):
+    # кандидаты «возможно тот же товар» — сигнал против дублей, НЕ основание мержить.
+    matched_ids = {m["id"] for m in smart_match}
+    sim_draft = {"name": dp["name"], "name_en": dp["name_en"], "models": dp["models_text"],
+                 "description": dp["description"], "brands": list(dp["brand_oem"] or []),
+                 "classes": list(dp["vehicle_classes"] or [])}
+    similar_by_name = [
+        {"smart_id": c["id"], "score": c["score"], "name": c["name"],
+         "name_en": c["name_en"], "articles": c["articles"]}
+        for c in build_shortlist(sim_draft, catalog, k=5, exclude_ids=matched_ids)
+        if c["score"] >= 0.25]
     return {
         "task_article": task_article, "run_id": latest_run, "run_status": run_status,
         "curator_note": curator_note,  # причина mark_needs_review (task_runs.error), если ран припаркован
@@ -280,6 +292,7 @@ async def _gc_build_part(conn, ruleset, task_id: int, task_article: str, latest_
         "part_of_kits": pofk,
         "prices": [dict(p) for p in prices],
         "smart_match": smart_match,
+        "similar_by_name": similar_by_name,
     }
 
 
@@ -392,7 +405,9 @@ async def get_context(wrapper: RunContextWrapper[CuratorRunContext],
     draft prices, already_published (task-level), run_status + needs_review_reason
     (research) + curator_note (parking reason), and smart_match: existing smart.parts overlapping
     this part's confirmed set, each with EN, brands, RECURSIVE composition and recorded prices —
-    so you don't create duplicates but ENRICH the existing record.
+    so you don't create duplicates but ENRICH the existing record. similar_by_name lists smart
+    records with NO shared numbers that look like the same part (name/model funnel) — dedup
+    hypotheses to check, never grounds for an automatic merge.
 
     Cap: total parts returned ≤ settings.curator_get_context_max_parts. Groups are kept whole —
     a group that doesn't fit goes to `deferred` (request it next call); a single group larger
@@ -415,6 +430,7 @@ async def get_context(wrapper: RunContextWrapper[CuratorRunContext],
         async with ctx.pool.acquire() as conn:
             ruleset = await load_ruleset(conn)
             pool, conf = await _gc_candidate_pool(conn)
+            catalog = await load_catalog(conn)  # один раз на вызов — для similar_by_name карточек
             no_research: list[dict] = []
 
             if norm:
@@ -499,7 +515,8 @@ async def get_context(wrapper: RunContextWrapper[CuratorRunContext],
                 for m in sorted(members, reverse=True):  # свежий ран первым
                     matched_inputs = [{"article": a} for a in norm if a in conf.get(m, set())] if norm else []
                     card = await _gc_build_part(conn, ruleset, pool[m]["task_id"], pool[m]["article"],
-                                                m, pool[m]["status"], pool[m]["error"], matched_inputs)
+                                                m, pool[m]["status"], pool[m]["error"], matched_inputs,
+                                                catalog)
                     if card is None:
                         no_research.append({"article": pool[m]["article"], "status": "no_draft",
                                             "detail": f"run {m} has no draft", "smart": None})
@@ -561,7 +578,7 @@ async def web_fetch_exa(wrapper: RunContextWrapper[CuratorRunContext], urls: lis
 # воркера (auto_publish.py). Здесь — только тонкая @function_tool-обёртка.
 @function_tool
 async def save_to_smart(wrapper: RunContextWrapper[CuratorRunContext], parts: list[SavePart]) -> str:
-    """Publish parts to smart_test (via FDW). Each part is its own SAVEPOINT — if one fails the
+    """Publish parts to prod smart (via FDW). Each part is its own SAVEPOINT — if one fails the
     others still persist. INSERT vs UPDATE is decided by presence of smart_id. One publications
     row is written per successful part. Full semantics: save_to_smart.md.
 

@@ -25,6 +25,7 @@ function matchesQuery(card: TaskCardData, query: string): boolean {
     STATUS_LABEL[card.status] ?? card.status,
     card.is_kit ? "набор" : "",
     card.published ? "в smart" : "",
+    card.auto_publish_reason ?? "",
   ].join(" ").toLowerCase();
   // Форма без разделителей — чтобы «807252-t5» / «807252 t5» находило «807252T5».
   const alnum = text.replace(/[^a-z0-9]/gi, "");
@@ -42,6 +43,8 @@ export default function Dashboard() {
   const [openRun, setOpenRun] = useState<number | null>(null);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<RunStatus | null>(null);
+  // Hard list — не статус, а пометка автопрохода; отдельный фильтр поверх statusFilter.
+  const [hardListOnly, setHardListOnly] = useState(false);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const refresh = useCallback(async () => {
@@ -83,10 +86,14 @@ export default function Dashboard() {
   const counts = data?.counts ?? {};
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   const cards = data?.cards ?? [];
+  const isHardList = (c: TaskCardData) =>
+    c.status === "done" && !c.published && c.auto_publish_decision === "skipped";
   const filtered = cards.filter(
-    (c) => matchesQuery(c, query) && (statusFilter === null || c.status === statusFilter),
+    (c) => matchesQuery(c, query)
+      && (statusFilter === null || c.status === statusFilter)
+      && (!hardListOnly || isHardList(c)),
   );
-  const filtering = query.trim().length > 0 || statusFilter !== null;
+  const filtering = query.trim().length > 0 || statusFilter !== null || hardListOnly;
 
   return (
     <div className="app">
@@ -137,7 +144,7 @@ export default function Dashboard() {
                 <button className="search-clear" onClick={() => setQuery("")} aria-label="Очистить поиск">×</button>
               )}
             </div>
-            <BacklogChips data={data} />
+            <BacklogChips data={data} hardListActive={hardListOnly} onToggleHardList={() => setHardListOnly((v) => !v)} />
             <button className="icon-btn" onClick={refresh} aria-label="Обновить"><IconRefresh /></button>
           </div>
         </div>

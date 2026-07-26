@@ -43,6 +43,11 @@ export function TaskCard({
         {card.published && (
           <span className="badge published"><IconCheck width={12} height={12} /> В Smart</span>
         )}
+        {card.status === "done" && !card.published && card.auto_publish_decision === "skipped" && (
+          <span className="chip" title={`Автопроход отказался: ${card.auto_publish_reason ?? "причина не записана"}`}>
+            hard list
+          </span>
+        )}
         {preset && preset !== "default" && (
           <span className="chip" title={`Профиль этапов: ${(card.profile?.stages ?? []).join(", ") || "только ядро"}`}>
             {PRESET_LABEL[preset] ?? preset}

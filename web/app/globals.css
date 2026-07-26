@@ -249,6 +249,9 @@ button { font-family: inherit; }
   border-radius: 999px; padding: 6px 13px;
 }
 .backlog-chip .n { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text-strong); }
+.backlog-chip.clickable { cursor: pointer; font: inherit; }
+.backlog-chip.clickable:hover { background: var(--hover-2); }
+.backlog-chip.clickable.active { background: var(--hover-2); color: var(--text-strong); border-color: var(--text-soft); }
 
 .search { position: relative; display: inline-flex; align-items: center; }
 .search-input {
