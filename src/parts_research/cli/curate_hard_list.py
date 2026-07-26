@@ -82,10 +82,11 @@ def log(msg: str) -> None:
 async def _load_hard_list(pool: asyncpg.Pool) -> list[dict]:
     rows = await pool.fetch("""
         SELECT DISTINCT ON (r.task_id) r.id AS run_id, t.article,
-               r.auto_publish_outcome->>'reason' AS reason
+               COALESCE(r.auto_publish_outcome->>'reason',
+                        r.auto_publish_outcome->>'error') AS reason
         FROM task_runs r JOIN tasks t ON t.id = r.task_id
         WHERE r.status = 'done'
-          AND r.auto_publish_outcome->>'decision' = 'skipped'
+          AND r.auto_publish_outcome->>'decision' IN ('skipped', 'error')
           AND NOT EXISTS (SELECT 1 FROM publications p WHERE p.run_id = r.id)
         ORDER BY r.task_id, r.id DESC""")
     return [{"run_id": r["run_id"], "article": r["article"], "reason": r["reason"],

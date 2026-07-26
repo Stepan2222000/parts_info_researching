@@ -87,7 +87,8 @@ export default function Dashboard() {
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   const cards = data?.cards ?? [];
   const isHardList = (c: TaskCardData) =>
-    c.status === "done" && !c.published && c.auto_publish_decision === "skipped";
+    c.status === "done" && !c.published
+    && (c.auto_publish_decision === "skipped" || c.auto_publish_decision === "error");
   const filtered = cards.filter(
     (c) => matchesQuery(c, query)
       && (statusFilter === null || c.status === statusFilter)

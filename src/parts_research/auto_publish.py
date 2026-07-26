@@ -91,6 +91,8 @@ _REASON_TYPES: list[tuple[str, str]] = [
     ("feed title too long", "title_too_long"),
     ("EN feed title too long", "title_too_long"),
     ("smart format regex", "bad_article_format"),
+    ("not canonical", "bad_article_format"),
+    ("violates check constraint", "bad_article_format"),
     ("empty vehicle_classes", "no_classes"),
     ("no confirmed articles", "incomplete_draft"),
     ("draft has no name", "incomplete_draft"),

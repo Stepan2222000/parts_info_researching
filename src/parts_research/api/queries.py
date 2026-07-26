@@ -40,7 +40,8 @@ SELECT * FROM (
         dp.is_kit,
         dp.brand_oem,
         r.auto_publish_outcome->>'decision' AS auto_publish_decision,
-        r.auto_publish_outcome->>'reason'   AS auto_publish_reason,
+        COALESCE(r.auto_publish_outcome->>'reason',
+                 r.auto_publish_outcome->>'error') AS auto_publish_reason,
         EXISTS (SELECT 1 FROM publications p WHERE p.run_id = r.id) AS published,
         (SELECT rt.stage FROM run_turns rt
          WHERE rt.run_id = r.id AND rt.status = 'running'
@@ -67,7 +68,8 @@ WHERE s.status = 'done'
 """
 
 # Hard list авто-курации: done-раны, от которых автопроход отказался с причиной
-# (auto_publish_outcome.decision='skipped'). Не новый статус — фильтр по пометке.
+# (decision='skipped') либо публикация упала на записи (decision='error' — напр.
+# EN-title существующей записи длиннее лимита). Не новый статус — фильтр по пометке.
 _HARD_LIST_SQL = """
 SELECT count(*) AS n
 FROM (
@@ -76,7 +78,7 @@ FROM (
     ORDER BY task_id, id DESC
 ) s
 WHERE s.status = 'done'
-  AND s.auto_publish_outcome->>'decision' = 'skipped'
+  AND s.auto_publish_outcome->>'decision' IN ('skipped', 'error')
   AND NOT EXISTS (SELECT 1 FROM publications p WHERE p.run_id = s.id)
 """
 
