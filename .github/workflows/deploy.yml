@@ -70,13 +70,18 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      packages: read
     steps:
       - name: SSH deploy on server
         uses: appleboy/ssh-action@v1
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: GHCR_TOKEN
           script: |
             set -euo pipefail
             # Разовый вывод из эксплуатации старого кустарного деплоя (локальные образы
@@ -89,6 +94,9 @@ jobs:
             git reset --hard origin/main
             export GHCR_OWNER=stepan2222000
             export TAG=latest
+            # ghcr-логин эфемерным GITHUB_TOKEN прогона (packages:read) — не протухает,
+            # в отличие от PAT: выдаётся заново на каждый деплой.
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u stepan2222000 --password-stdin
             docker compose pull
             docker compose up -d --remove-orphans worker api public-api app
             docker image prune -f
