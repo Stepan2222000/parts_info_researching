@@ -9,12 +9,19 @@
   1. Мягкий скор (имя RU/EN, модели, описание, бонусы за бренд/класс; БЕЗ жёстких
      вето — они убивают настоящие дубли) ранжирует каталог, берём топ-K.
      Recall настоящего дубля в топ-80 — 98%, в топ-40 — 96.7%.
-  2. LLM-судья (дешёвая модель, strict-схема) смотрит карточки и решает:
-     same / likely_same / unsure / different. Родовое имя без спек — unsure;
-     конфликт размеров/шага/вращения — different (проверено на стресс-кейсах:
-     винты по шагу и стороне вращения различает, сальники не склеивает).
-  3. Вердикты same/likely_same пишутся в dedup_candidates; слияние — ТОЛЬКО
-     LLM-куратор с пруф-URL. Публикацию воронка никогда не блокирует.
+  2. LLM-судья (дешёвая модель, strict-схема) смотрит карточки ДО публикации
+     новой записи и решает: same / unsure / different. same требует совпадения
+     самой детали И применяемости (модели, если указаны у обеих сторон, обязаны
+     пересекаться). Родовое имя без спек — unsure; конфликт размеров/шага/
+     вращения — different (проверено на стресс-кейсах: винты по шагу и стороне
+     вращения различает, сальники не склеивает).
+  3. same придерживает публикацию: ран уходит в hard list с пометкой похожести,
+     куратор с web-пруфом либо вливает его в существующую запись (save_to_smart
+     со smart_id), либо публикует новой. unsure/different не блокируют.
+     Автослияний и авто-отказов по имени нет ни при каком пороге.
+
+Оркестровка пре-чека — в auto_publish._similar_precheck (гейты и advisory-lock
+живут там); здесь — данные, скоринг и судья.
 
 Извлечение спек: размерные цепочки (30x60x37, 14x19), резьбы (M8x1.25), дюймовые
 дроби (1-1/16) из имени и описания — подсветка для судьи, не критерий отбора.
@@ -183,7 +190,7 @@ _JUDGE_SCHEMA = {
                 "properties": {
                     "candidate_id": {"type": "string"},
                     "verdict": {"type": "string",
-                                "enum": ["same", "likely_same", "unsure", "different"]},
+                                "enum": ["same", "unsure", "different"]},
                     "reason": {"type": "string"},
                 },
                 "required": ["candidate_id", "verdict", "reason"],
@@ -196,10 +203,14 @@ _JUDGE_SCHEMA = {
 }
 
 _JUDGE_SYS = """Ты — эксперт по каталогу запчастей для лодочных моторов, гидроциклов, снегоходов, квадроциклов, мотоциклов и авто.
-Дана карточка только что опубликованной детали и записи каталога, похожие на неё по имени. У них НЕТ общих артикулов — иначе они бы сматчились раньше. По каждой записи реши, ЭТО ТА ЖЕ ДЕТАЛЬ (дубль в каталоге) или нет:
-- same: уверен, что тот же товар (та же деталь, то же применение, совпадают размеры/спеки если указаны)
-- likely_same: скорее всего тот же, но данных мало
-- unsure: невозможно решить по данным (типовая деталь без размеров: сальник, кольцо, прокладка без спек)
+Дана карточка новой детали и записи каталога, похожие на неё по имени. У них НЕТ общих артикулов — иначе они бы сматчились раньше. По каждой записи реши, ЭТО ТА ЖЕ ДЕТАЛЬ (дубль в каталоге) или нет:
+- same: уверен, что тот же товар — описывается одна и та же запчасть И применяемость сходится.
+  Если модели указаны у обеих сторон, они обязаны пересекаться; указаны и НЕ пересекаются —
+  это НЕ same (скорее different: похожая деталь для другой техники). Если у кандидата модели
+  не указаны — решай по остальному (имя, размеры, бренд, описание) и ставь same только при
+  полной уверенности.
+- unsure: невозможно решить по данным (типовая деталь без размеров: сальник, кольцо, прокладка
+  без спек; или данных мало, чтобы утверждать «тот же товар»)
 - different: другая деталь (другой размер/шаг/сторона вращения/другое применение/другой узел)
 ВАЖНО: одинаковое родовое название («сальник», «прокладка», «o-ring») само по себе НЕ значит тот же товар.
 Конфликт размеров/шага/вращения = different. Решай только по данным карточек, ничего не выдумывай."""
@@ -255,48 +266,3 @@ async def judge_shortlist(draft: dict, shortlist: list[dict]) -> list[dict]:
                            _JUDGE_SCHEMA, "verdicts")
     known = {c["id"] for c in shortlist}
     return [v for v in out["verdicts"] if v["candidate_id"] in known]
-
-
-# ── интеграция с авто-публикацией ─────────────────────────────────────────────
-async def annotate_similar(pool: asyncpg.Pool, run_id: int, smart_id: str) -> dict:
-    """Пост-шаг после успешного авто-INSERT (вне транзакции публикации: не держим
-    глобальный advisory-lock на время LLM-вызова). Строит шорт-лист, при включённом
-    судье получает вердикты, пишет same/likely_same в dedup_candidates и возвращает
-    сводку для auto_publish_outcome. Ошибки наружу — вызывающий пишет их в outcome."""
-    async with pool.acquire() as conn:
-        draft = await load_draft_card(conn, run_id)
-        if draft is None:
-            return {"skipped": "no draft card"}
-        catalog = await load_catalog(conn)
-        shortlist = build_shortlist(draft, catalog, exclude_ids={smart_id})
-    if not shortlist:
-        return {"shortlist": 0, "flagged": []}
-
-    summary: dict = {"shortlist": len(shortlist), "top_score": shortlist[0]["score"]}
-    if not settings.research_dedup_judge:
-        summary["judge"] = "off"
-        summary["flagged"] = []
-        return summary
-
-    verdicts = await judge_shortlist(draft, shortlist)
-    by_id = {c["id"]: c for c in shortlist}
-    flagged = [v for v in verdicts if v["verdict"] in ("same", "likely_same")]
-    async with pool.acquire() as conn:
-        pub_id = await conn.fetchval(
-            "SELECT id FROM publications WHERE run_id = $1 AND smart_id = $2 "
-            "ORDER BY id DESC LIMIT 1", run_id, smart_id)
-        if pub_id is None:
-            raise RuntimeError(f"no publications row for run {run_id} smart {smart_id}")
-        for v in flagged:
-            await conn.execute(
-                "INSERT INTO dedup_candidates (publication_id, run_id, smart_id, "
-                "candidate_smart_id, verdict, reason, score, judge_model) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
-                "ON CONFLICT (publication_id, candidate_smart_id) DO NOTHING",
-                pub_id, run_id, smart_id, v["candidate_id"], v["verdict"], v["reason"],
-                by_id[v["candidate_id"]]["score"], _model_base(settings.llm_model_judge))
-    summary["flagged"] = [
-        {"candidate_smart_id": v["candidate_id"], "verdict": v["verdict"],
-         "name": by_id[v["candidate_id"]]["name"]}
-        for v in flagged]
-    return summary

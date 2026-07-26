@@ -32,9 +32,15 @@ part_of-связи «вверх» — best-effort: непубликуемая с
 нет kit_name / состав родителя заморожен / транзитивный дубль через под-набор)
 отбрасывается с пометкой в outcome, НЕ валя публикацию детали.
 
-После успешного INSERT (вне транзакции публикации) — воронка похожести
-(similar.annotate_similar): шорт-лист + LLM-судья, гипотезы дублей в
-dedup_candidates и в outcome.similar; публикацию не блокирует и не отменяет.
+ДО публикации новой записи (INSERT) — пре-чек воронки похожести (similar.py):
+шорт-лист + LLM-судья ищут в каталоге тот же товар под другими номерами. Вердикт
+same придерживает публикацию: ран уходит в hard list с пометкой, на что похож
+(reason 'possible duplicate (judge): ...'), и куратор либо вливает его в
+существующую запись (save_to_smart со smart_id), либо публикует новой. unsure/
+different не блокируют; UPDATE судью не зовёт (артикульный матч исключает дубль).
+Судья недоступен -> fail-closed: новую запись НЕ публикуем, ран остаётся с
+пометкой 'dedup judge unavailable' до следующего прогона. LLM-вызов идёт ВНЕ
+транзакции с advisory-lock.
 
 Публикация — общий publisher.save_parts (та же машинерия и защиты, что у тула
 куратора), published_by='auto', curator_session_id NULL. Весь шаг сериализован
@@ -61,7 +67,8 @@ from .publisher import (
     _supersession_edges,
     save_parts,
 )
-from .similar import annotate_similar
+from .config import settings
+from .similar import build_shortlist, judge_shortlist, load_catalog, load_draft_card
 
 # Своё пространство рядом с WORKER_LIVENESS_KEY=8273461 (db/tasks.py) — не пересекается.
 AUTO_PUBLISH_LOCK_KEY = 8273462
@@ -81,6 +88,8 @@ class _Skip(Exception):
 # Типизация причин skip для hard list (порядок важен: первый матч по подстроке).
 # frozen_or_final разбирает ЧЕЛОВЕК (замки не снимаем автоматически), остальное — LLM-куратор.
 _REASON_TYPES: list[tuple[str, str]] = [
+    ("possible duplicate (judge)", "name_similar"),
+    ("dedup judge unavailable", "judge_error"),
     ("possible duplicate group", "group"),
     ("smart_match ambiguous", "ambiguous_smart_match"),
     ("matches multiple smart records", "ambiguous_smart_match"),
@@ -115,30 +124,80 @@ async def auto_publish_run(pool: asyncpg.Pool, run_id: int, article: str) -> dic
     """Пытается авто-опубликовать done-ран. Никогда не кидает исключение (research
     уже успешен — публикация его не валит); исход всегда записан в
     task_runs.auto_publish_outcome и возвращён."""
+    similar_note: dict | None = None
     try:
+        if settings.research_dedup_judge:
+            blocked, similar_note = await _similar_precheck(pool, run_id)
+            if blocked is not None:
+                await _write_outcome_pool(pool, run_id, blocked)
+                return blocked
         outcome = await _attempt(pool, run_id)
     except Exception as e:  # noqa: BLE001 — сбой публикации не валит ран; текст наружу
         outcome = {"decision": "error", "error": f"{type(e).__name__}: {e}"}
-        try:
-            await pool.execute(
-                "UPDATE task_runs SET auto_publish_outcome = $1 WHERE id = $2", outcome, run_id)
-        except Exception as e2:  # noqa: BLE001 — даже запись исхода не удалась; отдаём оба текста
-            outcome["outcome_write_error"] = f"{type(e2).__name__}: {e2}"
+        await _write_outcome_pool(pool, run_id, outcome)
         return outcome
-    if outcome.get("decision") == "published" and outcome.get("mode") == "insert":
-        # Воронка похожести — ПОСЛЕ коммита публикации: LLM-вызов судьи не должен
-        # держать глобальный advisory-lock. Сбой воронки публикацию не отменяет,
-        # но виден текстом в outcome (ошибок не скрываем).
-        try:
-            outcome["similar"] = await annotate_similar(pool, run_id, outcome["smart_id"])
-        except Exception as e:  # noqa: BLE001 — аннотация вспомогательная, текст наружу
-            outcome["similar"] = {"error": f"{type(e).__name__}: {e}"}
-        try:
-            await pool.execute(
-                "UPDATE task_runs SET auto_publish_outcome = $1 WHERE id = $2", outcome, run_id)
-        except Exception as e2:  # noqa: BLE001
-            outcome["outcome_write_error"] = f"{type(e2).__name__}: {e2}"
+    if similar_note and outcome.get("decision") == "published" and outcome.get("mode") == "insert":
+        # Судья дубля не нашёл — фиксируем его сводку в исходе (аудит: чем проверяли).
+        outcome["similar"] = similar_note
+        await _write_outcome_pool(pool, run_id, outcome)
     return outcome
+
+
+async def _write_outcome_pool(pool: asyncpg.Pool, run_id: int, outcome: dict) -> None:
+    try:
+        await pool.execute(
+            "UPDATE task_runs SET auto_publish_outcome = $1 WHERE id = $2", outcome, run_id)
+    except Exception as e:  # noqa: BLE001 — даже запись исхода не удалась; отдаём оба текста
+        outcome["outcome_write_error"] = f"{type(e).__name__}: {e}"
+
+
+async def _similar_precheck(pool: asyncpg.Pool, run_id: int) -> tuple[dict | None, dict | None]:
+    """Судья ДО публикации. Возвращает (blocked_outcome | None, сводка судьи | None).
+
+    Гейты гоняются вхолостую (откат): не прошли или это UPDATE — судья не нужен
+    (blocked=None, причину запишет _attempt). Для будущего INSERT: шорт-лист топ-K
+    -> LLM-судья; вердикт same -> публикацию придерживаем (hard list с пометкой,
+    на что похожа деталь). Сбой судьи -> fail-closed: blocked с текстом ошибки —
+    новая запись не публикуется, пока судья не отработает (следующим прогоном)."""
+    async with pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            part, _notes = await _gates_and_payload(conn, run_id)
+        except _Skip:
+            return None, None
+        finally:
+            await tr.rollback()
+        if part.smart_id is not None:
+            return None, None  # UPDATE: дубль исключён артикульным матчем
+        draft = await load_draft_card(conn, run_id)
+        if draft is None:
+            return None, None
+        catalog = await load_catalog(conn)
+    shortlist = build_shortlist(draft, catalog)
+    if not shortlist:
+        return None, {"shortlist": 0, "flagged": []}
+    try:
+        verdicts = await judge_shortlist(draft, shortlist)
+    except Exception as e:  # noqa: BLE001 — fail-closed: без судьи INSERT не публикуем
+        return {"decision": "skipped",
+                "reason": f"dedup judge unavailable: {type(e).__name__}: {e}"}, None
+    by_id = {c["id"]: c for c in shortlist}
+    flagged = [v for v in verdicts if v["verdict"] == "same"]
+    summary = {
+        "shortlist": len(shortlist), "top_score": shortlist[0]["score"],
+        "flagged": [{"candidate_smart_id": v["candidate_id"],
+                     "name": by_id[v["candidate_id"]]["name"], "reason": v["reason"]}
+                    for v in flagged],
+    }
+    if not flagged:
+        return None, summary
+    detail = "; ".join(
+        f"{v['candidate_id']} {by_id[v['candidate_id']]['name']!r}: {v['reason']}"
+        for v in flagged)
+    return {"decision": "skipped",
+            "reason": f"possible duplicate (judge): похожа на {detail}",
+            "similar": summary}, summary
 
 
 async def _attempt(pool: asyncpg.Pool, run_id: int) -> dict:
