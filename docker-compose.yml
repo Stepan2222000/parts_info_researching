@@ -1,7 +1,8 @@
 # ============================================================
 # parts_research — prod-сервисы (Этапы 2–4).
-# Postgres-контейнеры (parts_research / smart_test / brands_mapping) уже подняты
+# Postgres-контейнеры (parts_research / smart / brands_mapping) уже подняты
 # на сервере в сети db_default — здесь их НЕ поднимаем, только подключаемся.
+# FDW smart_fdw смотрит в prod smart (см. migrations/015_switch_fdw_to_prod_smart.sql).
 #
 #   docker compose build                # собрать локально
 #   docker compose up -d worker api app # поднять
@@ -16,6 +17,12 @@ x-python-image: &python-image
     context: .
     dockerfile: Dockerfile
   env_file: .env
+  # Авто-курация (auto_curation.md): включена с разбора завала 2026-07-27.
+  # Здесь, а не в серверном .env — едет с деплоем, перекрывает env_file.
+  environment:
+    RESEARCH_AUTO_PUBLISH: "on"
+    RESEARCH_DEDUP_JUDGE: "on"
+    LLM_MODEL_JUDGE: "gpt-5.6-luna"
   networks: [db_default]
   restart: unless-stopped
 
