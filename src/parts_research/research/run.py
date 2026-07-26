@@ -48,6 +48,7 @@ from .prompts import (
     build_kit_contents_user_message,
     build_low_confidence_query,
     build_low_confidence_user_message,
+    build_main_fallback_queries,
     build_main_query,
     build_main_user_message,
     build_part_of_query,
@@ -389,6 +390,9 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
 
         current: StructuredResult | None = None
         turn = 0
+        # Пометки к успешному исходу этапа (напр. "fallback: short" от лестницы
+        # main-запросов) — попадают в stage_outcomes как "ok (<note>)".
+        stage_notes: dict[str, str] = {}
 
         def validate(r: StructuredResult) -> None:
             post_validate(
@@ -471,22 +475,46 @@ async def execute_run(pool: asyncpg.Pool, run_id: int, article: str) -> str:
                     log(f"[{stage}] repair failed (non-fatal, keeping prior result): {msg2}")
                     return False
                 current = result
-                await _set_outcome(pool, run_id, stage, "ok (repaired)")
+                note = stage_notes.get(stage)
+                await _set_outcome(
+                    pool, run_id, stage,
+                    f"ok (repaired; {note})" if note else "ok (repaired)",
+                )
                 log(f"[{stage}] repaired OK")
                 return True
             current = result
-            await _set_outcome(pool, run_id, stage, "ok")
+            note = stage_notes.get(stage)
+            await _set_outcome(pool, run_id, stage, f"ok ({note})" if note else "ok")
             return True
 
         # ── main (ядро, всегда) ────────────────────────────────────────────────
         async def stage_main(turn_idx: int) -> StructuredResult:
-            raw = await cached_exa_call(
-                pool, exa, "web_search_exa",
-                {"query": build_main_query(article), "num_results": 10},
-                run_id=run_id, phase="main",
-            )
-            picked = json.dumps(pick_search(raw), ensure_ascii=False)
-            substring_check(article, picked)
+            # Лестница запросов: промах substring_check -> следующая формулировка.
+            # Агенту уходит выдача ТОЛЬКО успешной ступени: промахнувшиеся выдачи
+            # артикула не содержат — там похожие ЧУЖИЕ номера, их в контекст нельзя.
+            ladder = [("main", build_main_query(article)), *build_main_fallback_queries(article)]
+            picked: str | None = None
+            last_err: NoExactDataError | None = None
+            for rung, query in ladder:
+                raw = await cached_exa_call(
+                    pool, exa, "web_search_exa",
+                    {"query": query, "num_results": 20},
+                    run_id=run_id, phase="main",
+                )
+                candidate = json.dumps(pick_search(raw), ensure_ascii=False)
+                try:
+                    substring_check(article, candidate)
+                except NoExactDataError as e:
+                    last_err = e
+                    log(f"[main] substring miss ({rung}), trying next query")
+                    continue
+                picked = candidate
+                if rung != "main":
+                    stage_notes["main"] = f"fallback: {rung}"
+                break
+            if picked is None:
+                assert last_err is not None
+                raise last_err
             return await run_streamed_and_persist(
                 agent, build_main_user_message(article, picked), session, pool, run_id,
                 turn_idx, preamble=preamble,

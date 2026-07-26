@@ -73,8 +73,8 @@ RULES_PATH = Path(os.environ.get("RESEARCH_RULES_PATH", _DEFAULT_RULES_PATH))
 
 # ── Exa-запросы фазы 1 (детерминированные формулировки) ────────────────────────
 def build_main_query(article: str) -> str:
-    # Keyword-поиск Exa: номер доминирует. Нейронный режим тащил похожие номера,
-    # из-за чего точное вхождение не находилось и run уходил в failed_no_data.
+    # Auto-режим Exa (type не передаём). При промахе точного вхождения артикула
+    # main-этап идёт по фолбек-лестнице build_main_fallback_queries.
     # Единый запрос turn-1: кроссы + модели/применимость + цены на US-магазинах
     # (highlights нередко уже содержат цену; если нет — отдельный price-фолбэк).
     return (
@@ -83,6 +83,22 @@ def build_main_query(article: str) -> str:
         "compatible models engines years "
         "price buy for sale in stock USD at US online marine parts stores"
     )
+
+
+def build_main_fallback_queries(article: str) -> list[tuple[str, str]]:
+    """Фолбек-лестница main-этапа: промах substring_check -> следующая формулировка
+    (замер 2026-07-25 по 97 артикулам failed_no_data: main n=20 нашёл 25,
+    «товарный» +45, короткий +21, мимо всех ступеней 6). Порядок важен: короткий —
+    последним и намеренно куцым: в нейронном режиме Exa лишние слова размывают
+    запрос, и на упорных номерах срабатывает только доминирующий голый номер."""
+    return [
+        (
+            "shop",
+            f"{article} part number for sale new genuine OEM replacement "
+            "in stock free shipping price product page add to cart",
+        ),
+        ("short", f"{article} part number"),
+    ]
 
 
 def build_price_query(article: str, hint: str) -> str:
